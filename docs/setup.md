@@ -16,21 +16,6 @@ PostgreSQL servers and Toxiproxy run **in Docker**. You do not install them on y
 
 Hardware: plan for about 8 GB of free RAM for the full cluster (eight PostgreSQL containers plus services) and 20 GB of disk.
 
-## Why clang and libpq-dev are required
-
-`psycopg[c]` (the C speedup extension psycopg uses instead of the pure-Python fallback) has no prebuilt wheel for Python 3.14 on every platform, so the first `uv sync` compiles it from source. The build needs two things the minimal Ubuntu image does not have:
-
-- **a C compiler**: the build drives `clang`, so installing `gcc` alone is not enough on a bare system. Without it, `uv sync` fails with `command 'clang' failed: No such file or directory`.
-- **libpq headers** (`libpq-fe.h`, `pg_config`): psycopg links against libpq, the PostgreSQL client library. The runtime library `libpq5` is already present but is not enough; without the `-dev` package the build fails on a missing `libpq-fe.h`.
-
-CI installs the same pieces (`apt-get install libpq-dev` in `.github/workflows/ci.yml`, with clang preinstalled on the runner). On Ubuntu and WSL:
-
-```bash
-sudo apt-get install -y clang libpq-dev
-```
-
-On macOS the Xcode command line tools provide the compiler and Homebrew's `libpq` provides the headers; see the macOS section below.
-
 ## Ubuntu 24.04
 
 ```bash
@@ -79,7 +64,7 @@ docker run --rm hello-world && uv --version && node --version && psql --version
 ## macOS (differences only)
 
 ```bash
-brew install git uv nvm libpq
+brew install git uv nvm libpq          # libpq provides the headers for building psycopg[c]
 brew link --force libpq                 # puts psql, pg_dump and pg_config on PATH
 brew install --cask docker              # Docker Desktop (OrbStack also works)
 xcode-select --install                  # compiler for psycopg[c]
@@ -91,7 +76,7 @@ brew install toxiproxy                  # optional CLI
 
 ## Windows (differences only)
 
-Use **WSL 2 with Ubuntu 24.04** and follow the Ubuntu steps inside it. Native Windows is not supported: `psycopg[c]` needs a C toolchain and our shell scripts assume bash.
+Use **WSL 2 with Ubuntu 24.04** and follow the Ubuntu steps inside it. Native Windows is not supported: `psycopg[c]` needs the compiler and libpq headers from Ubuntu step 1, and our shell scripts assume bash.
 
 1. `wsl --install -d Ubuntu-24.04` (PowerShell as administrator), then reboot.
 2. Either install Docker Engine inside WSL (Ubuntu step 2), or install Docker Desktop and turn on WSL integration for the Ubuntu distro. Pick one, not both.
