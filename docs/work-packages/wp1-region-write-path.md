@@ -16,16 +16,16 @@ Five async functions (signatures in Section 5.2 of the architecture doc). Caller
 
 One transaction, in this order:
 
-1. Compare the caller's epoch with `node_state.epoch`. Different: raise `StaleEpoch`.
-2. Insert into `inbox` with `ON CONFLICT DO NOTHING`. If no row was inserted, this is a duplicate: return the stored outcome (the existing order, or the earlier refusal) and stop. No other side effects.
+1. Call `assert_epoch` with the caller's epoch. A mismatch raises SQLSTATE `ROS01`, which becomes `StaleEpochError`.
+2. Generate the `order_id` first, then insert into `inbox` (outcome `accepted`, with that `order_id`) using `ON CONFLICT DO NOTHING`. The table's check constraint runs before the conflict check, so the row must be complete. If no row was inserted, this is a duplicate: return the stored outcome (the existing order, or the earlier refusal) and stop. No other side effects.
 3. Look up each item: `products` then `product_dish` then `dishes.stock_mode`. An unknown product or a product marked unavailable refuses the order.
 4. Work out what the order consumes:
    - `per_ingredient`: for each row in `dish_ingredients`, `amount x multiplier x quantity` of that ingredient;
    - `per_item`: `multiplier x quantity` of the dish itself;
    - `none`: nothing.
 5. Lock the needed `stock` rows with `SELECT ... FOR UPDATE`, always in the same order (`item_kind`, `item_id`), so two orders cannot deadlock.
-6. If any row has too little: **refuse the whole order**. Set `inbox.outcome = 'refused'`, write nothing else, commit, return refused.
-7. Otherwise decrement stock, and mark products unavailable where a stock row just reached zero.
+6. If any row has too little: **refuse the whole order**. Update the inbox row to `outcome = 'refused'`, `order_id = NULL`, with a `refusal_reason`; write nothing else, commit, return refused.
+7. Otherwise decrement stock, and add a `product_availability` row (`reason = 'stock'`) for products that can no longer be made because a stock row just reached zero. A product with no row is available.
 8. Insert `orders` (status `received`, with `menu_version`) and `order_items`.
 9. Insert one `outbox` row (`order.created`). Commit.
 

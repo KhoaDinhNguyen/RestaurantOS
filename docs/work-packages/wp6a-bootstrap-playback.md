@@ -2,7 +2,7 @@
 
 **Goal:** turn an empty machine into a loaded cluster, then replay the real orders against it at any speed.
 
-**You own:** `src/restaurantos/sim/` (bootstrap, playback, oracle, the `rosctl` CLI), `tests/unit/sim/`, `tests/fixtures/mini/`.
+**You own:** `src/restaurantos/sim/` (bootstrap, playback, oracle, the `rosctl` CLI, and the proxy half of `toxiproxy.py`), `tests/unit/sim/`, `tests/fixtures/mini/`.
 
 **Read first:** `docs/architecture.md` Sections 4, 5.4, 7.1 and 7.2; the data reference in the Phase 2 working notes; the project note on replay and stock parameters.
 
@@ -10,9 +10,24 @@
 
 ## What to build
 
+### Toxiproxy client, proxy half: `sim/toxiproxy.py`
+
+Bootstrap has to create the proxies for any cluster size, so the client starts here. It is **our own small client** on `httpx` over the Toxiproxy HTTP API; do not add a third-party Toxiproxy library. Base URL comes from `Settings.toxiproxy_url`.
+
+| Method | HTTP call |
+| --- | --- |
+| `list_proxies()` | `GET /proxies` |
+| `create_proxy(proxy)` | `POST /proxies` with `name`, `listen`, `upstream`, `enabled` |
+| `set_enabled(name, enabled)` | `POST /proxies/{name}` with `{"enabled": ...}` |
+| `delete_proxy(name)` | `DELETE /proxies/{name}` |
+| `sync(cluster)` | make the server's proxy list equal `restaurantos.common.cluster.proxies(cluster)`: create missing ones, delete extras, re-enable disabled ones |
+| `reset()` | `POST /reset`: re-enable every proxy and remove every toxic |
+
+Take names, ports and upstreams only from `restaurantos.common.cluster`; never type a proxy name by hand. Keep the class small and typed; WP6b adds toxic methods to the same class. Unit-test it against `httpx.MockTransport`, no real server needed.
+
 ### Bootstrap: `rosctl bootstrap`
 
-1. Read `infra/cluster.toml` (regions, standbys, sync or async). Generate the Compose services and the Toxiproxy proxy list.
+1. Read `infra/cluster.toml` (regions, standbys, sync or async). Generate the Compose services and `infra/toxiproxy/proxies.json`, then call `sync(cluster)` once Toxiproxy is up so the running server matches.
 2. Start the nodes and apply `db/hq` and `db/region`.
 3. **Assign cells to regions:** count vendors per geohash cell from `vendors.csv`, sort the cells, cut them into N contiguous ranges with roughly equal vendor counts, write `shard_directory`. Do not use order data for this.
 4. Load reference data with `COPY`: everything into HQ and `baseline`; each region gets its vendor and product slice plus full copies of the small tables.
@@ -43,6 +58,7 @@ A plain-Python replay with no database: walk the same orders, apply the same sto
 ## Done when
 
 - `rosctl bootstrap` on a clean machine gives a running, loaded cluster for 1, 2 and 3 regions.
+- After bootstrap, `GET /proxies` on Toxiproxy lists exactly the proxies `common.cluster.proxies()` gives, all enabled.
 - Every vendor is in exactly one region; row counts match the manifest.
 - The same seed gives the same run log twice, including after a mid-run speed change.
 - A sequential single-region run matches the oracle exactly.

@@ -1,0 +1,128 @@
+# RestaurantOS base cluster: HQ + one region, each with a streaming standby,
+# and Toxiproxy in front of every database link.
+#
+#   docker compose -f infra/compose.yaml up -d
+#   docker compose -f infra/compose.yaml down -v     # also deletes the data
+#
+# Matches infra/cluster.toml with regions = 1. WP6a generates the services for
+# more regions; the application services (gateway, coordinator, relay, edge,
+# control, web) are added by their work packages.
+#
+# Passwords here are development defaults for a local simulation.
+
+name: restaurantos
+
+x-postgres-image: &pg-image ${ROS_POSTGRES_IMAGE:-postgres:18}   # pin an exact tag, e.g. postgres:18.x
+
+x-pg-env: &pg-env
+  POSTGRES_USER: ros
+  POSTGRES_PASSWORD: ros
+  POSTGRES_DB: restaurantos
+  ROS_REPL_PASSWORD: replicate
+
+x-pg-command: &pg-command
+  - postgres
+  - -c
+  - wal_level=replica
+  - -c
+  - max_wal_senders=10
+  - -c
+  - max_replication_slots=10
+  - -c
+  - hot_standby=on
+  - -c
+  - max_slot_wal_keep_size=2GB
+  - -c
+  - shared_buffers=256MB
+
+x-pg-health: &pg-health
+  test: ["CMD-SHELL", "pg_isready -U ros -d restaurantos"]
+  interval: 3s
+  timeout: 3s
+  retries: 40
+
+services:
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    command: ["-host=0.0.0.0", "-config=/config/proxies.json"]
+    volumes:
+      - ./toxiproxy/proxies.json:/config/proxies.json:ro
+    ports:
+      - "8474:8474"
+
+  hq-primary:
+    image: *pg-image
+    command: *pg-command
+    environment:
+      <<: *pg-env
+      ROS_NODE_KIND: hq
+    volumes:
+      - hq-primary-data:/var/lib/postgresql
+      - ../db:/ros/db:ro
+      - ./postgres/init-primary.sh:/docker-entrypoint-initdb.d/10-init-primary.sh:ro
+    healthcheck: *pg-health
+    ports:
+      - "5500:5432"
+
+  hq-standby:
+    image: *pg-image
+    entrypoint: ["bash", "/ros/infra/standby-entrypoint.sh"]
+    command: *pg-command
+    environment:
+      <<: *pg-env
+      ROS_PRIMARY_HOST: toxiproxy
+      ROS_PRIMARY_PORT: "21003"        # hq-standby__hq-primary
+      ROS_SLOT_NAME: hq_standby
+    volumes:
+      - hq-standby-data:/var/lib/postgresql
+      - ./postgres/standby-entrypoint.sh:/ros/infra/standby-entrypoint.sh:ro
+    depends_on:
+      hq-primary:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+    healthcheck: *pg-health
+    ports:
+      - "5501:5432"
+
+  r1-primary:
+    image: *pg-image
+    command: *pg-command
+    environment:
+      <<: *pg-env
+      ROS_NODE_KIND: region
+      ROS_REGION_ID: r1
+    volumes:
+      - r1-primary-data:/var/lib/postgresql
+      - ../db:/ros/db:ro
+      - ./postgres/init-primary.sh:/docker-entrypoint-initdb.d/10-init-primary.sh:ro
+    healthcheck: *pg-health
+    ports:
+      - "5510:5432"
+
+  r1-standby:
+    image: *pg-image
+    entrypoint: ["bash", "/ros/infra/standby-entrypoint.sh"]
+    command: *pg-command
+    environment:
+      <<: *pg-env
+      ROS_PRIMARY_HOST: toxiproxy
+      ROS_PRIMARY_PORT: "21016"        # r1-standby__r1-primary
+      ROS_SLOT_NAME: r1_standby
+    volumes:
+      - r1-standby-data:/var/lib/postgresql
+      - ./postgres/standby-entrypoint.sh:/ros/infra/standby-entrypoint.sh:ro
+    depends_on:
+      r1-primary:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+    healthcheck: *pg-health
+    ports:
+      - "5511:5432"
+
+volumes:
+  hq-primary-data:
+  hq-standby-data:
+  r1-primary-data:
+  r1-standby-data:

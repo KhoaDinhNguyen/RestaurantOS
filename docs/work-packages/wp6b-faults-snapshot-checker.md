@@ -2,7 +2,7 @@
 
 **Goal:** break the system on purpose, in a repeatable way, and prove afterwards that nothing was lost or duplicated.
 
-**You own:** `src/restaurantos/sim/` (faults, scenarios, snapshot, checker, control API), `tests/cluster/`.
+**You own:** `src/restaurantos/sim/` (faults, scenarios, snapshot, checker, control API, and the toxic half of `toxiproxy.py`), `tests/cluster/`.
 
 **Read first:** `docs/architecture.md` Sections 4 (proxy names and link groups), 6.3 and 7.3 to 7.5; Phase 2 Section 2.4 (Tables 8 and 9) and Section 4.
 
@@ -12,7 +12,15 @@
 
 ### Faults
 
-A small client for the Toxiproxy HTTP API (port 8474) that works on **link groups**, never on single proxy names:
+Extend **our own** Toxiproxy client in `sim/toxiproxy.py` (WP6a writes the proxy half; no third-party Toxiproxy library). Add the toxic calls:
+
+| Method | HTTP call |
+| --- | --- |
+| `add_toxic(proxy, type, attributes, stream="downstream", name=None)` | `POST /proxies/{proxy}/toxics` |
+| `list_toxics(proxy)` | `GET /proxies/{proxy}/toxics` |
+| `remove_toxic(proxy, name)` | `DELETE /proxies/{proxy}/toxics/{name}` |
+
+Then a fault layer on top that works on **link groups** (from `restaurantos.common.cluster.link_groups`), never on single proxy names. A fault on a group applies the same change to every proxy in it and gets one fault ID, so `heal` undoes exactly that change. For `silence`, `latency` and `reset`, add the toxic in both directions (`upstream` and `downstream`).
 
 | Fault | Toxiproxy action |
 | --- | --- |
@@ -21,7 +29,7 @@ A small client for the Toxiproxy HTTP API (port 8474) that works on **link group
 | `latency` | `latency` toxic (`latency`, `jitter` in ms) |
 | `reset` | `reset_peer` toxic |
 
-Plus `heal` for one fault and `heal-all`. Real crashes: `docker kill` and `docker start` on a node.
+Plus `heal` for one fault and `heal-all` (Toxiproxy `POST /reset`). Real crashes: `docker kill` and `docker start` on a node.
 
 ### Scenarios T1 to T6
 

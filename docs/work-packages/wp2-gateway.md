@@ -22,7 +22,7 @@ One FastAPI app with two modes, chosen by config:
 ### Routing
 
 - Keep two caches in memory: vendor to geohash cell (from `vendors`), and cell to region plus epoch plus primary node (from `shard_directory` and `region_state`).
-- Refresh the directory on a timer and whenever a region answers `StaleEpoch`.
+- Refresh the directory on a timer and whenever a region answers `StaleEpochError`.
 - One psycopg async pool per node, addressed by proxy name. Set short timeouts (suggest 1 s to connect, 2 s per statement). Without them a silenced link hangs the request forever.
 
 ### `POST /orders`
@@ -30,7 +30,7 @@ One FastAPI app with two modes, chosen by config:
 1. Stamp `received_at`.
 2. Vendor to cell to region.
 3. Call `region.place_order` on that region's primary with the cached epoch.
-4. `StaleEpoch`: refresh the directory, retry once.
+4. `StaleEpochError`: refresh the directory, retry once.
 5. Cannot connect, or timeout (gateway mode): insert the request into `holding_queue` at HQ and answer `202`.
 6. Stamp `acked_at` and answer `201` (new), `200` (duplicate) or `409` (refused).
 
@@ -43,7 +43,7 @@ Also add `GET /internal/probe/{node_id}`: run `SELECT 1` on that node and report
 ## Done when
 
 - An order for a vendor in each region lands on the right node, and nowhere else.
-- After a promotion, the first request gets `StaleEpoch`, the gateway refreshes, and the retry succeeds without the client noticing.
+- After a promotion, the first request gets `StaleEpochError`, the gateway refreshes, and the retry succeeds without the client noticing.
 - With a region's links cut, `POST /orders` answers `202` within the timeout and the row is in `holding_queue`.
 - Edge mode refuses vendors from other regions and keeps working with HQ unreachable.
 - Every order response carries `received_at`, `committed_at` and `acked_at`.

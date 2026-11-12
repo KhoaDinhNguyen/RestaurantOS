@@ -14,12 +14,12 @@
 
 Loop:
 
-1. Read `outbox` rows with `seq > outbox_cursor.last_acked_seq`, in `seq` order, up to a batch size.
+1. Read `outbox` rows where `relayed_at IS NULL`, in `seq` order, up to a batch size.
 2. In **one transaction at HQ** (through `relay-r<n>__hq-primary`): for each event, insert into `hq_inbox` with `ON CONFLICT DO NOTHING`; if it was new, apply it and stamp `hq_applied_at`.
    - `order.created`: insert into `analytics_orders` and `analytics_order_items`;
    - `order.status_changed`: update the status;
    - `exception.logged`: insert into `analytics_exceptions`.
-3. After HQ commits, update `outbox_cursor` in the region.
+3. After HQ commits, set `relayed_at` on those rows in the region.
 4. Sleep for the poll interval (config; it sets the floor for the HQ staleness metric).
 
 If the process dies between steps 2 and 3, it resends the batch and HQ skips every event it already has.
@@ -38,10 +38,11 @@ When a new row appears in `menu_versions`, send each region its slice with `regi
 - Kill the relay at random points during a drain (test T3): the final counts are still right.
 - After a region-to-HQ partition heals, the outbox empties upward and the holding queue empties downward.
 - A connection reset during menu publishing (test T6) leaves the region on a complete old or complete new version, never a mix.
-- Outbox backlog (`max(seq) - last_acked_seq`) is readable, for the admin page.
+- Outbox backlog (count of rows with `relayed_at IS NULL`) is readable, for the admin page.
 
 ## Watch out for
 
+- Do not replace the `relayed_at` flag with a "last seq sent" cursor: concurrent commits can land out of `seq` order and a cursor would skip rows.
 - Apply events in `seq` order. A status change must not reach HQ before its order.
 - Set connection and statement timeouts. A silenced link must make the worker back off and retry, not hang.
 - Keep batches modest so one bad event does not block a huge transaction.

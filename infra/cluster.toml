@@ -1,0 +1,14 @@
+# Shape of the cluster. Everything else (node IDs, Toxiproxy proxies, ports,
+# link groups) is derived from this file by restaurantos.common.cluster.
+#
+# After changing it:  uv run python -m restaurantos.common.cluster --write
+# The committed infra/compose.yaml describes regions = 1. WP6a generates the
+# Compose services for more regions.
+
+[cluster]
+regions = 1          # r1 .. rN
+standbys = true      # one streaming standby per primary (HQ included)
+synchronous = false  # false: async standbys (default). true: synchronous commit
+
+[toxiproxy]
+base_port = 21000    # HQ proxies from 21000, region n from 21000 + 10 * n

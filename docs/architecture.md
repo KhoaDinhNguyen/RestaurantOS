@@ -91,6 +91,7 @@ RestaurantOS/
 │   ├── api/                   exported OpenAPI JSON per service
 │   └── diagrams/
 ├── db/                        hand-written SQL (the schema contract)
+│   ├── shared/                reference tables + helpers, applied to every node
 │   ├── region/                DDL + functions for a region node
 │   ├── hq/                    DDL + functions for the HQ node
 │   └── queries/               named queries loaded by Python
@@ -134,8 +135,8 @@ Each row is a work package someone can claim. Each has a brief in `docs/work-pac
 | 3 | Query router | `gateway/router/`, `db/queries/` | Nearby query, city-wide scatter-gather, join strategies A/B/C, single-node baseline | WP0 |
 | 4 | Relay | `relay/` | Region to HQ outbox relay, HQ to region holding-queue drain, menu publisher | WP0; WP1 for the outbox |
 | 5 | Coordinator | `coordinator/`, `infra/postgres/` | Heartbeats, suspect/down, promotion, epoch bump, admin API | WP0 |
-| 6a | Bootstrap and playback | `sim/` | Cluster generation, partition ranges, data and stock loading, order replay with speed control, single-region mode | WP0 |
-| 6b | Faults, snapshot, checker | `sim/` | Toxiproxy wrapper, T1 to T6 scripts, snapshot/restore, invariant checker, control API | WP6a |
+| 6a | Bootstrap and playback | `sim/` | Cluster generation, Toxiproxy client (proxy setup), partition ranges, data and stock loading, order replay with speed control, single-region mode | WP0 |
+| 6b | Faults, snapshot, checker | `sim/` | Toxiproxy client (toxics, link groups), T1 to T6 scripts, snapshot/restore, invariant checker, control API | WP6a |
 | 7 | Web UI | `frontend/` | Four views (Section 8) | the API tables in Section 6; can start against mocked JSON |
 
 Everyone codes against the contracts in Sections 4 to 7, not against each other's internals.
@@ -198,7 +199,9 @@ One proxy per (client, target) pair, named `<client>__<target>`:
 | `r1-standby__r1-primary` | streaming replication |
 | `relay-r1__hq-primary` | outbox events going up |
 | `hq__r1-primary` | menu versions and holding-queue orders going down |
-| `gateway__hq-primary`, `coordinator__hq-primary`, `hq-standby__hq-primary` | HQ equivalents |
+| `gateway__hq-primary`, `coordinator__hq-primary`, `coordinator__hq-standby`, `hq-standby__hq-primary` | HQ equivalents |
+
+Names, ports and groups are produced by `restaurantos.common.cluster` from `infra/cluster.toml`; nobody types them by hand. HQ proxies listen from port 21000, region n from 21000 + 10n.
 
 Fault scenarios never name single proxies. They name **link groups** that the harness expands:
 
@@ -226,24 +229,23 @@ Note: the Phase 2 document (Table 12) says `recipe` and `recipe_ingredient`. The
 
 | Table | Key | Contents |
 | --- | --- | --- |
-| `chains`, `ingredients`, `dishes`, `dish_ingredients` | as in CSV | full copy |
+| `ingredients`, `dishes`, `dish_ingredients` | as in CSV | full copy |
 | `vendors`, `products`, `product_dish` | as in CSV | this region's slice only |
 | `node_state` | single row | `region_id`, `epoch`, `menu_version` |
 | `stock` | (`vendor_id`, `item_kind`, `item_id`) | `on_hand`, `par_level`. `item_kind` is `ingredient` (dishes with `stock_mode = per_ingredient`) or `dish` (`per_item`). Dishes with `stock_mode = none` have no row. |
-| `product_availability` | (`vendor_id`, `product_id`) | `available`, `reason` (`stock` or `manual`) |
-| `orders` | (`order_day`, `order_id`), partitioned by `order_day` | `order_id` uuid, `vendor_id`, `channel`, `external_order_id`, `customer_id`, `customer_geohash`, `order_time`, `status`, `menu_version`, `received_at`, `committed_at` |
-| `order_items` | (`order_day`, `order_id`, `line_no`) | `product_id`, `quantity`, `price_units` |
-| `inbox` | UNIQUE (`channel`, `external_order_id`) | `outcome` (`accepted` or `refused`), `order_id` when accepted; the idempotency guard, so a retried refused order is refused again without side effects |
+| `product_availability` | (`vendor_id`, `product_id`) | `available`, `reason` (`stock` or `manual`). A product with no row is available. |
+| `orders` | (`order_day`, `order_id`), partitioned by `order_day` | `order_id` uuid, `vendor_id`, `channel`, `external_order_id`, `customer_id`, `customer_geohash`, `order_time`, `status`, `status_changed_at`, `menu_version`, `epoch`, `received_at`, `committed_at` |
+| `order_items` | (`order_day`, `order_id`, `line_no`), partitioned by `order_day` | `vendor_id`, `product_id`, `quantity`, `price_units` |
+| `inbox` | (`channel`, `external_order_id`) | `outcome` (`accepted` or `refused`), `refusal_reason`, `order_day` and `order_id` when accepted; the idempotency guard, so a retried refused order is refused again without side effects |
 | `processed_events` | `event_id` | dedupes status events |
-| `outbox` | `seq` bigint, UNIQUE `event_id` | `event_type`, `payload` jsonb, `created_at` |
-| `outbox_cursor` | single row | `last_acked_seq` |
+| `outbox` | `seq` bigint, UNIQUE `event_id` | `event_type`, `order_day`, `payload` jsonb, `created_at`, `relayed_at` (NULL until HQ has confirmed the event) |
 | `exception_log` | `id` | rejected conflicting updates: both versions and timestamps |
 
 #### On HQ
 
 | Table | Key | Contents |
 | --- | --- | --- |
-| all seven reference tables | as in CSV | master copy, all vendors and products |
+| all six reference tables | as in CSV | master copy, all vendors and products |
 | `shard_directory` | `geohash` | `region_id` |
 | `region_state` | `region_id` | `epoch`, `primary_node`, `standby_node`, `menu_version` |
 | `menu_versions` | `version` | `created_at`, `note` |
@@ -265,7 +267,7 @@ Note: the Phase 2 document (Table 12) says `recipe` and `recipe_ingredient`. The
 | `restock(conn, vendor_id, epoch)` | reset `on_hand` to `par_level`, recompute availability | rows changed |
 | `apply_menu_version(conn, version, rows)` | replace this region's product slice atomically | none |
 
-A stale epoch raises `StaleEpoch`. The caller refreshes the shard directory and retries once.
+A stale epoch raises `StaleEpochError` (the SQL function `assert_epoch` raises SQLSTATE `ROS01`). The caller refreshes the shard directory and retries once.
 
 Status state machine: `received -> accepted -> preparing -> ready -> picked_up`, or `canceled` from any state before `picked_up`. First committed change wins.
 
@@ -278,12 +280,14 @@ Status state machine: `received -> accepted -> preparing -> ready -> picked_up`,
   "seq": 1042,
   "event_type": "order.created | order.status_changed | exception.logged",
   "order_day": 14,
-  "committed_at": "2026-11-20T18:03:11.482Z",
+  "created_at": "2026-11-20T18:03:11.482Z",
   "payload": { }
 }
 ```
 
-The relay sends events in `seq` order. HQ applies each event and its `hq_inbox` row in one transaction, stamps `hq_applied_at`, and returns the highest contiguous `seq`. The relay stores that in `outbox_cursor`.
+The relay takes the rows where `relayed_at IS NULL`, in `seq` order. HQ applies each event and its `hq_inbox` row in one transaction and stamps `hq_applied_at`. The relay then sets `relayed_at` on those rows.
+
+Why a per-row flag and not a "last sequence number sent" cursor: two orders committing at the same moment can commit in the opposite order to their `seq` numbers. A cursor that has already moved past the higher number would skip the lower one for ever. A per-row flag cannot skip anything. Payload shapes are the `*Payload` models in `common/models.py`.
 
 ### 5.4 Time
 
@@ -412,7 +416,7 @@ Playback also sends status events for each order, triggers restocks every R simu
 
 ### 7.3 Faults
 
-A thin wrapper over the Toxiproxy HTTP API, addressed by link group (Section 4):
+We talk to Toxiproxy through **our own small client** over its HTTP API (port 8474), built on `httpx`, in `src/restaurantos/sim/toxiproxy.py`. No third-party Toxiproxy library. WP6a writes the part bootstrap needs (list, create, update and delete proxies); WP6b adds toxics and link-group operations on top. Faults are addressed by link group (Section 4):
 
 | Fault | Toxiproxy action |
 | --- | --- |
@@ -469,6 +473,7 @@ Everything in the Phase 2 document and working notes, plus:
 | --- | --- |
 | Repository | public monorepo; one Python package + sibling `frontend/`; data git-ignored, never committed, no Git LFS |
 | Tooling | uv; **Python 3.14**; ruff (no black, no isort); hand-written SQL; async services; `pygeohash` for geohash maths |
+| Toxiproxy | driven by our own small `httpx` client over the HTTP API; no third-party client library. Proxy calls in WP6a, toxic calls in WP6b |
 | Frontend | npm, TypeScript, current Node LTS; live-update mechanism left to the UI owner |
 | D1 | every region runs its own API process (the gateway code in edge mode) |
 | D2 | build (b): the region asks HQ to add a product. (c) region-owned products is a stretch goal; `products.origin` is in the schema for it |

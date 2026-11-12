@@ -10,6 +10,7 @@ authors = [
     { name = "TODO", email = "TODO@asu.edu" },
 ]
 license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 
 # Runtime dependencies: everything a service container needs.
 # Lower bounds only; uv.lock holds the exact versions everyone runs.
@@ -85,6 +86,12 @@ max_line_length = 100
 [tool.sqlfluff.templater.placeholder]
 # psycopg named parameters: %(vendor_id)s
 param_style = "pyformat"
+
+# RF04: reference tables mirror the dataset CSVs column for column, and some
+# CSV columns (name, source, version) are unreserved SQL keywords. Ignore
+# exactly those words; the rule still flags keyword aliases everywhere else.
+[tool.sqlfluff.rules.references.keywords]
+ignore_words = "name,source,version"
 
 [tool.sqlfluff.rules.capitalisation.keywords]
 capitalisation_policy = "upper"

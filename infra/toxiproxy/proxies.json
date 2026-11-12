@@ -1,0 +1,68 @@
+[
+  {
+    "name": "gateway__hq-primary",
+    "listen": "0.0.0.0:21000",
+    "upstream": "hq-primary:5432",
+    "enabled": true
+  },
+  {
+    "name": "coordinator__hq-primary",
+    "listen": "0.0.0.0:21001",
+    "upstream": "hq-primary:5432",
+    "enabled": true
+  },
+  {
+    "name": "coordinator__hq-standby",
+    "listen": "0.0.0.0:21002",
+    "upstream": "hq-standby:5432",
+    "enabled": true
+  },
+  {
+    "name": "hq-standby__hq-primary",
+    "listen": "0.0.0.0:21003",
+    "upstream": "hq-primary:5432",
+    "enabled": true
+  },
+  {
+    "name": "gateway__r1-primary",
+    "listen": "0.0.0.0:21010",
+    "upstream": "r1-primary:5432",
+    "enabled": true
+  },
+  {
+    "name": "coordinator__r1-primary",
+    "listen": "0.0.0.0:21011",
+    "upstream": "r1-primary:5432",
+    "enabled": true
+  },
+  {
+    "name": "hq__r1-primary",
+    "listen": "0.0.0.0:21012",
+    "upstream": "r1-primary:5432",
+    "enabled": true
+  },
+  {
+    "name": "relay-r1__hq-primary",
+    "listen": "0.0.0.0:21013",
+    "upstream": "hq-primary:5432",
+    "enabled": true
+  },
+  {
+    "name": "gateway__r1-standby",
+    "listen": "0.0.0.0:21014",
+    "upstream": "r1-standby:5432",
+    "enabled": true
+  },
+  {
+    "name": "coordinator__r1-standby",
+    "listen": "0.0.0.0:21015",
+    "upstream": "r1-standby:5432",
+    "enabled": true
+  },
+  {
+    "name": "r1-standby__r1-primary",
+    "listen": "0.0.0.0:21016",
+    "upstream": "r1-primary:5432",
+    "enabled": true
+  }
+]
