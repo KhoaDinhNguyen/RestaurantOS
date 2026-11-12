@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: pre-commit (all files)
+        run: uv run pre-commit run --all-files --show-diff-on-failure
+        env:
+          # Frontend hooks run in the frontend job.
+          SKIP: frontend-eslint,frontend-prettier
+
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: restaurantos_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      ROS_TEST_DSN: postgresql://postgres:postgres@localhost:5432/restaurantos_test
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build tools for psycopg[c]
+        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Unit and integration tests
+        # "cluster" tests need the Compose cluster and Toxiproxy; run those locally.
+        run: uv run pytest -m "not cluster" --cov=restaurantos --cov-report=term-missing
+
+  frontend:
+    runs-on: ubuntu-latest
+    # Skipped until the UI owners add frontend/package.json.
+    if: ${{ hashFiles('frontend/package.json') != '' }}
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npx prettier --check .
+      - run: npm test -- --run
+      - run: npm run build

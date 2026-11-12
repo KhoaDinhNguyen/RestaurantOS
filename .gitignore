@@ -234,3 +234,15 @@ modern.jsonp
 resources/sass/.sass-cache/
 resources/.arch-internal-preview.css
 .arch-internal-preview.css
+
+# --- RestaurantOS project-specific ---
+
+# Cleaned DHRD dataset files (path set by ROS_DATA_DIR); must never be published.
+data/
+snapshots/
+runs/
+
+# Node / frontend
+node_modules/
+frontend/coverage/
+frontend/.vite/

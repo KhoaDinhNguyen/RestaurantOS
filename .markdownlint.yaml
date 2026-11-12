@@ -1,0 +1,7 @@
+# Long lines and tables are fine in our docs.
+MD013: false
+# Allow the same heading text under different parents (e.g. "Ubuntu" twice).
+MD024:
+  siblings_only: true
+# Allow inline HTML (diagrams, <details>).
+MD033: false
