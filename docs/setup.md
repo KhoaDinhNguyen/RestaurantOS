@@ -83,6 +83,14 @@ Use **WSL 2 with Ubuntu 24.04** and follow the Ubuntu steps inside it. Native Wi
 3. Clone the repository **inside the WSL file system** (`~/RestaurantOS`), not under `/mnt/c`. Bind mounts from `/mnt/c` are slow enough to distort every measurement.
 4. Give WSL enough memory: in `%UserProfile%\.wslconfig` set `[wsl2]` and `memory=10GB`.
 
+## Dataset
+
+The cleaned DHRD dataset lives in the course Google Drive folder (ASU accounts only): <https://drive.google.com/drive/folders/1l8tAMZtShxXXdluNqXpHsuTBVB1W-GZ0?usp=sharing>. Download the `*.csv` files and `MANIFEST.csv` into `data/` at the repository root. That directory is git-ignored and the dataset files must never be committed or published.
+
+Services and `rosctl` read the dataset from the path in `ROS_DATA_DIR`, which defaults to `data/`.
+
+CI and the test suite never use the real dataset. Tests run on the hand-made mini dataset in `tests/fixtures/mini/`.
+
 ## After the system components
 
 ```bash
