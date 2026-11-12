@@ -9,6 +9,7 @@ authors = [
     { name = "Mark Loo", email = "junzingl@asu.edu" },
     { name = "TODO", email = "TODO@asu.edu" },
 ]
+license = "AGPL-3.0-only"
 
 # Runtime dependencies: everything a service container needs.
 # Lower bounds only; uv.lock holds the exact versions everyone runs.
