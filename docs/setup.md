@@ -9,19 +9,34 @@ PostgreSQL servers and Toxiproxy run **in Docker**. You do not install them on y
 | Git | source control | any recent |
 | Docker Engine + Compose plugin | runs every PostgreSQL node, Toxiproxy and the services | Compose v2 |
 | uv | Python and Python packages | 0.13 or newer |
-| Build tools + libpq headers | `psycopg[c]` compiles against libpq | n/a |
+| clang + libpq-dev | `psycopg[c]` compiles its C extension against libpq | n/a |
 | Node.js + npm | frontend, eslint, prettier | the version in `frontend/.nvmrc` |
 | PostgreSQL client (`psql`, `pg_dump`) | debugging and snapshots | 18 |
 | Toxiproxy CLI (optional) | poking at proxies by hand | 2.12 |
 
 Hardware: plan for about 8 GB of free RAM for the full cluster (eight PostgreSQL containers plus services) and 20 GB of disk.
 
+## Why clang and libpq-dev are required
+
+`psycopg[c]` (the C speedup extension psycopg uses instead of the pure-Python fallback) has no prebuilt wheel for Python 3.14 on every platform, so the first `uv sync` compiles it from source. The build needs two things the minimal Ubuntu image does not have:
+
+- **a C compiler**: the build drives `clang`, so installing `gcc` alone is not enough on a bare system. Without it, `uv sync` fails with `command 'clang' failed: No such file or directory`.
+- **libpq headers** (`libpq-fe.h`, `pg_config`): psycopg links against libpq, the PostgreSQL client library. The runtime library `libpq5` is already present but is not enough; without the `-dev` package the build fails on a missing `libpq-fe.h`.
+
+CI installs the same pieces (`apt-get install libpq-dev` in `.github/workflows/ci.yml`, with clang preinstalled on the runner). On Ubuntu and WSL:
+
+```bash
+sudo apt-get install -y clang libpq-dev
+```
+
+On macOS the Xcode command line tools provide the compiler and Homebrew's `libpq` provides the headers; see the macOS section below.
+
 ## Ubuntu 24.04
 
 ```bash
 # 1. Base tools, compiler and libpq headers
 sudo apt-get update
-sudo apt-get install -y git curl ca-certificates build-essential libpq-dev python3-dev
+sudo apt-get install -y git curl ca-certificates build-essential clang libpq-dev python3-dev
 
 # 2. Docker Engine + Compose plugin (official Docker repository)
 sudo install -m 0755 -d /etc/apt/keyrings
