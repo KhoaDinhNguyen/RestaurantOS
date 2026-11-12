@@ -222,7 +222,7 @@ Reference tables mirror the cleaned CSV files **one to one** (same names, same c
 
 Note: the Phase 2 document (Table 12) says `recipe` and `recipe_ingredient`. The cleaned dataset calls them `dishes`, `dish_ingredients` and `product_dish`. The code uses the dataset names.
 
-**On every region node**
+#### On every region node
 
 | Table | Key | Contents |
 | --- | --- | --- |
@@ -239,7 +239,7 @@ Note: the Phase 2 document (Table 12) says `recipe` and `recipe_ingredient`. The
 | `outbox_cursor` | single row | `last_acked_seq` |
 | `exception_log` | `id` | rejected conflicting updates: both versions and timestamps |
 
-**On HQ**
+#### On HQ
 
 | Table | Key | Contents |
 | --- | --- | --- |
