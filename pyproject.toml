@@ -72,7 +72,10 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-ra --strict-markers"
+# importlib mode: same-basename test files in different component folders
+# (e.g. tests/unit/common/test_deadline.py and tests/cluster/test_deadline.py)
+# would otherwise import as one module.
+addopts = "-ra --strict-markers --import-mode=importlib"
 markers = [
     "integration: needs PostgreSQL (CI service container or `docker compose up`)",
     "cluster: needs the full Compose cluster with Toxiproxy; never run in CI",

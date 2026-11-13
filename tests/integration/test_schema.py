@@ -1,11 +1,13 @@
 """Applies the real schema files to PostgreSQL. Needs ROS_TEST_DSN."""
 
 import os
+from uuid import uuid4
 
 import psycopg
 import pytest
 
 from restaurantos.common.errors import STALE_EPOCH_SQLSTATE
+from restaurantos.common.models import RefusalReason
 from restaurantos.common.sqlfiles import schema_files
 
 pytestmark = pytest.mark.integration
@@ -71,3 +73,39 @@ def test_orders_land_in_their_day_partition(conn):
     )
     part = conn.execute("SELECT tableoid::regclass::text FROM orders").fetchone()[0]
     assert part.endswith("orders_d014")
+
+
+INSERT_INBOX = (
+    "INSERT INTO inbox (channel, external_order_id, outcome, order_day, order_id, refusal_reason)"
+    " VALUES ('dhrd', %s, %s, 14, %s, %s)"
+)
+
+
+def test_inbox_takes_the_rows_place_order_writes(conn):
+    apply(conn, "region")
+    # Inserted as accepted first, then flipped to refused if stock runs short.
+    conn.execute(INSERT_INBOX, ("1", "accepted", uuid4(), None))
+    conn.execute(
+        "UPDATE inbox SET outcome = 'refused', order_id = NULL, refusal_reason = %s"
+        " WHERE external_order_id = '1'",
+        (RefusalReason.OUT_OF_STOCK.value,),
+    )
+    # Every reason the models know is one the table accepts.
+    for reason in RefusalReason:
+        conn.execute(INSERT_INBOX, (f"r-{reason.value}", "refused", None, reason.value))
+
+
+@pytest.mark.parametrize(
+    ("outcome", "has_order", "reason"),
+    [
+        ("refused", False, None),  # refused, but no reason
+        ("accepted", True, "out_of_stock"),  # accepted, but carries a reason
+        ("accepted", False, None),  # accepted, but no order
+        ("refused", True, "out_of_stock"),  # refused, but points at an order
+        ("refused", False, "because"),  # not a RefusalReason
+    ],
+)
+def test_inbox_rejects_half_filled_rows(conn, outcome, has_order, reason):
+    apply(conn, "region")
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute(INSERT_INBOX, ("1", outcome, uuid4() if has_order else None, reason))

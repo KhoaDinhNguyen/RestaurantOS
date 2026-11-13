@@ -22,4 +22,12 @@ class UnknownVendorError(RestaurantOSError):
 
 
 class RegionUnreachableError(RestaurantOSError):
-    """The region's primary could not be reached in time."""
+    """The region's primary could not be reached in time.
+
+    `region_id` is filled in when the caller knows it, so that one exception
+    handler can build the 503 answer.
+    """
+
+    def __init__(self, message: str = "", *, region_id: str | None = None) -> None:
+        super().__init__(message)
+        self.region_id = region_id
