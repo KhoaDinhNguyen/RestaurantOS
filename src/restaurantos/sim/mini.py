@@ -16,9 +16,12 @@ Apply a schema first (``common.sqlfiles.schema_files``, as
     load_mini(conn, with_region_data=False)  # HQ kind: reference data only
     load_mini(conn, vendors=["v001"])        # one region's slice
 
-Passing ``vendors`` loads only those vendors and everything reachable from
-them, so two regions loaded with disjoint vendor slices hold the same rows
-as one baseline loaded with no slice.
+Passing ``vendors`` loads only those vendors' rows — vendors, products,
+product_dish, orders, order_items and stock — exactly as bootstrap does:
+a region holds all dishes and ingredients, but only the vendors and
+products that belong to it (`db/shared/010_reference.sql`). The small
+reference tables always load in full, so a slice's ingredients, dishes
+and dish_ingredients are the same as the whole's.
 """
 
 from __future__ import annotations
@@ -130,23 +133,48 @@ def _read(name: str) -> list[dict[str, str]]:
 
 
 def _reference_rows(vendors: frozenset[str] | None) -> dict[str, list[tuple[str, ...]]]:
-    """The six reference tables, sliced by vendor when a slice is given."""
+    """The six reference tables. A vendor slice cuts only the three tables
+    a region really slices (vendors, products, product_dish); the small
+    reference tables load in full either way (db/shared/010_reference.sql)."""
     rows = {name: [tuple(row.values()) for row in _read(name)] for name, _ in REFERENCE_FILES}
     if vendors is None:
         return rows
-    products = {r[0] for r in rows["products.csv"] if r[1] in vendors}
-    links = [r for r in rows["product_dish.csv"] if r[0] in products]
-    dishes = {r[2] for r in links}
-    dish_ing = [r for r in rows["dish_ingredients.csv"] if r[0] in dishes]
-    ingredients = {r[1] for r in dish_ing}
+    products = [r for r in rows["products.csv"] if r[1] in vendors]
+    product_ids = {r[0] for r in products}
     return {
-        "ingredients.csv": [r for r in rows["ingredients.csv"] if r[0] in ingredients],
-        "dishes.csv": [r for r in rows["dishes.csv"] if r[0] in dishes],
-        "dish_ingredients.csv": dish_ing,
+        "ingredients.csv": rows["ingredients.csv"],
+        "dishes.csv": rows["dishes.csv"],
+        "dish_ingredients.csv": rows["dish_ingredients.csv"],
         "vendors.csv": [r for r in rows["vendors.csv"] if r[0] in vendors],
-        "products.csv": [r for r in rows["products.csv"] if r[0] in products],
-        "product_dish.csv": links,
+        "products.csv": products,
+        "product_dish.csv": [r for r in rows["product_dish.csv"] if r[0] in product_ids],
     }
+
+
+# An empty field means "no value" and loads as NULL, and only for these two
+# columns (data dictionary, rule 4). An empty field anywhere else is a
+# broken file, so the loader says so instead of quietly storing ''.
+NULLABLE = {("vendors", "chain_id"), ("dishes", "dish_name")}
+
+
+def _apply_null_rule(
+    table: str, columns: tuple[str, ...], rows: Sequence[tuple[str, ...]]
+) -> list[tuple[str | None, ...]]:
+    out: list[tuple[str | None, ...]] = []
+    for row in rows:
+        fixed: list[str | None] = list(row)
+        for i, column in enumerate(columns):
+            if fixed[i] == "":
+                if (table, column) in NULLABLE:
+                    fixed[i] = None
+                else:
+                    raise ValueError(
+                        f"{table}.{column}: empty value, but the data dictionary "
+                        "allows empty fields only for vendors.chain_id and "
+                        "dishes.dish_name"
+                    )
+        out.append(tuple(fixed))
+    return out
 
 
 def _copy(
@@ -159,7 +187,7 @@ def _copy(
         return 0
     column_list = ", ".join(columns)
     with conn.cursor() as cur, cur.copy(f"COPY {table} ({column_list}) FROM STDIN") as copy:
-        for row in rows:
+        for row in _apply_null_rule(table, columns, rows):
             copy.write_row(row)
     return len(rows)
 

@@ -1,5 +1,5 @@
 dish_id,dish_name,scope,stock_mode,n_products,n_vendors,example_name
-d001,,chain:ch01,per_ingredient,1,1,
+d001,,chain:ch01,per_ingredient,1,1,Menu item 008
 d002,Sample dish 002,chain:ch02,per_ingredient,1,1,Sample Dish 002
 d003,Sample dish 003,chain:ch02,per_ingredient,1,1,Sample Dish 003
 d004,Sample dish 004,chain:ch04,per_ingredient,1,1,Sample Dish 004

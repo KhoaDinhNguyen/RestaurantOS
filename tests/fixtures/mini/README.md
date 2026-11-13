@@ -34,8 +34,9 @@ from the warm-up window, so there is no dataset file for it.
 ## What was sanitized
 
 - Every id (vendor, product, dish, order, customer, chain) was replaced by a
-  short synthetic id: `v001`, `p001`, `d001`, `o0001`, `c001`, `ch01`.
-  Leading zeros and mixed digits-with-letters shapes are preserved.
+  short synthetic id: `v001`, `p001`, `d001`, `o0001`, `c001`, `ch01`. One
+  product keeps an all-digit id with a leading zero (`0017`, ordered four
+  times): the shape that breaks a reader which guesses types.
 - Vendor names do not exist in the dataset, but product and dish names do:
   they were replaced with `Menu item NNN` and `Sample dish NNN`.
 - Kept as they are: geohash cells (coarse, and already public in the docs),
@@ -43,8 +44,9 @@ from the warm-up window, so there is no dataset file for it.
   (with chain ids remapped), prices, day-of-week and times.
 - `dishes.n_products` and `n_vendors` were recomputed from this slice, so
   they describe the fixture, not the full dataset.
-- All prices were rounded to 2 decimals so the arithmetic can be checked by
-  hand (the real files carry up to 19 decimals).
+- `price_units` is the price the system uses. `unit_price` was shortened to
+  4 decimals to keep the files readable; the real files carry up to 19, and
+  the system never calculates with it.
 
 ## Deliberate traps
 

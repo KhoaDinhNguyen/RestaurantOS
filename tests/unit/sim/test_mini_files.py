@@ -151,10 +151,36 @@ def test_traps_one_low_stock_counter(data):
     assert len(low) == 1
 
 
-def test_prices_are_hand_checkable(data):
+def test_no_empty_fields_outside_the_two_nullable_columns(data):
+    """Data dictionary rule 4: an empty field exists only in
+    vendors.chain_id and dishes.dish_name, and means NULL. The loader
+    refuses any other empty, so the files must not contain one."""
+    nullable = {("vendors.csv", "chain_id"), ("dishes.csv", "dish_name")}
+    for name, file_rows in data.items():
+        for row in file_rows:
+            for column, value in row.items():
+                if value == "" and (name, column) not in nullable:
+                    pytest.fail(f"{name}.{column}: unexpected empty value")
+
+
+def test_unit_price_kept_to_4_decimals(data):
+    """price_units is the price the system uses; unit_price is kept short
+    only so the files stay readable (the real files carry up to 19)."""
     for row in data["products.csv"]:
         decimals = row["unit_price"].split(".")[1] if "." in row["unit_price"] else ""
-        assert len(decimals) <= 2
+        assert len(decimals) <= 4
+
+
+def test_one_product_id_is_all_digits_with_a_leading_zero(data):
+    """The dictionary warns that some real ids are all digits, a few with
+    leading zeros, and that a reader which guesses types breaks every
+    join. The fixture keeps one such id, ordered four times."""
+    assert "0017" in {row["product_id"] for row in data["products.csv"]}
+    for name in ("products.csv", "product_dish.csv", "order_items.csv"):
+        values = [row["product_id"] for row in data[name]]
+        assert "0017" in values, f"{name} lost the all-digit id"
+    orders_of_it = [row for row in data["order_items.csv"] if row["product_id"] == "0017"]
+    assert len(orders_of_it) == 4
 
 
 def test_orders_cover_days_and_cells_for_query_tests(data):
@@ -166,11 +192,11 @@ def test_orders_cover_days_and_cells_for_query_tests(data):
     assert len(vendors) >= 3, "a region split needs more than one vendor"
 
 
-def test_ids_keep_their_text_shape(data):
-    """Some real ids are all digits with leading zeros; the fixture must
-    keep ids that would break a naive number cast."""
-    vendors = [row["vendor_id"] for row in data["vendors.csv"]]
-    assert any(v.startswith("v0") for v in vendors)
+def test_loader_reads_the_all_digit_id_as_text():
+    from restaurantos.sim.mini import _read
+
+    for name in ("products.csv", "product_dish.csv", "order_items.csv"):
+        assert any(row["product_id"] == "0017" for row in _read(name)), name
 
 
 def test_mini_dir_override_is_reported(monkeypatch, tmp_path):

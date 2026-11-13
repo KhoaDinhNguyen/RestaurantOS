@@ -97,12 +97,39 @@ def test_slices_add_up_to_the_whole(conn):
     counts_b = load_mini(conn, vendors=["v003", "v004"])
     apply_region(conn, "mini_all")
     whole = load_mini(conn, vendors=["v001", "v002", "v003", "v004"])
-    assert counts_a.orders + counts_b.orders == whole.orders == fixture_rows("orders.csv")
-    assert counts_a.products + counts_b.products == whole.products
-    assert counts_a.order_items + counts_b.order_items == whole.order_items
-    # the shared reference rows are sliced too: a slice holds only its own dishes
+    # a region slices only its own rows; the small reference tables load
+    # in full in every slice (db/shared/010_reference.sql)
+    for table in ("ingredients", "dishes", "dish_ingredients"):
+        assert getattr(counts_a, table) == getattr(whole, table)
+        assert getattr(counts_b, table) == getattr(whole, table)
+    for table in ("vendors", "products", "product_dish", "orders", "order_items", "stock"):
+        assert getattr(counts_a, table) + getattr(counts_b, table) == getattr(whole, table)
+    assert counts_a.orders + counts_b.orders == fixture_rows("orders.csv")
     assert counts_a.vendors == 2
-    assert counts_a.dishes < whole.dishes
+
+
+def test_empty_fields_load_as_null(conn):
+    apply_region(conn, "mini_null")
+    load_mini(conn)
+    null_chains = conn.execute("SELECT count(*) FROM vendors WHERE chain_id IS NULL").fetchone()[0]
+    blank_chains = conn.execute("SELECT count(*) FROM vendors WHERE chain_id = ''").fetchone()[0]
+    assert (null_chains, blank_chains) == (1, 0)
+    null_names = conn.execute("SELECT count(*) FROM dishes WHERE dish_name IS NULL").fetchone()[0]
+    blank_names = conn.execute("SELECT count(*) FROM dishes WHERE dish_name = ''").fetchone()[0]
+    assert (null_names, blank_names) == (1, 0)
+
+
+def test_all_digit_product_id_survives_the_load_and_joins(conn):
+    apply_region(conn, "mini_digits")
+    load_mini(conn)
+    stored = conn.execute("SELECT product_id FROM products WHERE product_id = '0017'").fetchall()
+    assert stored == [("0017",)]
+    joined = conn.execute(
+        "SELECT count(*) FROM order_items oi "
+        "JOIN products p ON p.product_id = oi.product_id "
+        "WHERE oi.product_id = '0017'"
+    ).fetchone()[0]
+    assert joined == 4
 
 
 def test_order_ids_match_across_a_region_and_a_baseline(conn):
