@@ -202,7 +202,7 @@ async def test_sync_recreates_proxies_whose_address_changed(cluster):
         or (method == "POST" and path == "/proxies")
     ]
     first_create = next(i for i, (method, _) in enumerate(events) if method == "POST")
-    assert all(method == "DELETE" for method, _ in events[:first_create])
+    assert all(method == "POST" for method, _ in events[first_create:])
 
 
 async def test_error_status_is_none_when_the_request_itself_fails():
