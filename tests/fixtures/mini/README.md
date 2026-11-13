@@ -41,7 +41,7 @@ from the warm-up window, so there is no dataset file for it.
   they were replaced with `Menu item NNN` and `Sample dish NNN`.
 - Kept as they are: geohash cells (coarse, and already public in the docs),
   cuisines, ingredient names (open RecipeNLG terms), stock modes, scopes
-  (with chain ids remapped), prices, day-of-week and times.
+  (with chain ids remapped), `price_units`, day-of-week and times.
 - `dishes.n_products` and `n_vendors` were recomputed from this slice, so
   they describe the fixture, not the full dataset.
 - `price_units` is the price the system uses. `unit_price` was shortened to

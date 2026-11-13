@@ -26,6 +26,10 @@ class FakeToxiproxy:
             assert isinstance(body, dict)
             if body["name"] in self.state:
                 return httpx.Response(409, text="proxy already exists")
+            # like the real server: proxy.go rewrites the listen address to
+            # the socket it bound, so a 0.0.0.0 wildcard comes back as [::]
+            if str(body.get("listen", "")).startswith("0.0.0.0:"):
+                body = {**body, "listen": "[::]:" + body["listen"].split(":", 1)[1]}
             self.state[body["name"]] = body
             return httpx.Response(201, json=body)
         if request.method == "POST" and request.url.path == "/reset":
@@ -158,6 +162,20 @@ async def test_sync_propagates_a_failed_delete(cluster):
     await tox.aclose()
 
 
+async def test_a_second_sync_is_a_noop(cluster):
+    """The real server rewrites a 0.0.0.0 listen to [::] (proxy.go stores
+    the bound address), and sync must not treat that as a stale address:
+    deleting every proxy on every call would drop the replication links
+    the standbys opened through them."""
+    tox, fake = await client({})
+    await tox.sync(cluster)
+    fake.calls.clear()
+    await tox.sync(cluster)
+    await tox.aclose()
+    mutations = [(method, path) for method, path, _ in fake.calls if method in ("DELETE", "POST")]
+    assert mutations == []
+
+
 async def test_sync_recreates_proxies_whose_address_changed(cluster):
     import dataclasses
 
@@ -170,8 +188,11 @@ async def test_sync_recreates_proxies_whose_address_changed(cluster):
     expected = {p.name: p.as_toxiproxy() for p in wanted}
     assert set(fake.state) == set(expected)
     for name, body in expected.items():
-        assert fake.state[name]["listen"] == body["listen"]
-        assert fake.state[name]["upstream"] == body["upstream"]
+        stored = fake.state[name]
+        # the port is what a base-port change moves; the host spelling is
+        # the server's to make (a wildcard comes back as [::])
+        assert stored["listen"].rsplit(":", 1)[-1] == body["listen"].rsplit(":", 1)[-1]
+        assert stored["upstream"] == body["upstream"]
     # every delete happened before the first create, so a freed port is
     # free again by the time its replacement is created
     events = [

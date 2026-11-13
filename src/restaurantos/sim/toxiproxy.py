@@ -25,6 +25,25 @@ class ToxiproxyError(RuntimeError):
         self.status = status
 
 
+# Toxiproxy rewrites a proxy's listen address to the socket it actually
+# bound (proxy.go: proxy.Listen = proxy.listener.Addr().String()), and a
+# wildcard listen usually comes back as "[::]:port" even when it was created
+# as "0.0.0.0:port". So sync compares listen by host and port, and treats
+# the wildcard spellings as equal. Upstream is not rewritten and stays an
+# exact comparison.
+_WILDCARD_HOSTS = {"0.0.0.0", "::", "[::]", ""}
+
+
+def _same_listen(wanted: str, stored: str) -> bool:
+    wanted_host, _, wanted_port = wanted.rpartition(":")
+    stored_host, _, stored_port = stored.rpartition(":")
+    if wanted_port != stored_port:
+        return False
+    return wanted_host == stored_host or (
+        wanted_host in _WILDCARD_HOSTS and stored_host in _WILDCARD_HOSTS
+    )
+
+
 class Toxiproxy:
     """The proxy half of the Toxiproxy control API.
 
@@ -115,7 +134,10 @@ class Toxiproxy:
                 continue
             stored = existing[name]
             body = wanted_bodies[name]
-            if stored.get("listen") != body["listen"] or stored.get("upstream") != body["upstream"]:
+            if (
+                not _same_listen(str(body["listen"]), str(stored.get("listen")))
+                or stored.get("upstream") != body["upstream"]
+            ):
                 await self.delete_proxy(name)
                 stale.add(name)
         for proxy in wanted:
