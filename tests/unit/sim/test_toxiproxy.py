@@ -15,6 +15,7 @@ class FakeToxiproxy:
     def __init__(self, existing: dict[str, dict[str, object]]) -> None:
         self.state = existing
         self.calls: list[tuple[str, str, object]] = []
+        self.fail_delete: set[str] = set()
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
@@ -33,6 +34,8 @@ class FakeToxiproxy:
             return httpx.Response(200)
         if request.method == "DELETE" and request.url.path.startswith("/proxies/"):
             name = request.url.path.removeprefix("/proxies/")
+            if name in self.fail_delete:
+                return httpx.Response(500, text="internal error, see 404 in log")
             if name not in self.state:
                 return httpx.Response(404, text="proxy not found")
             del self.state[name]
@@ -127,6 +130,69 @@ async def test_reset_reenables_everything():
     await tox.reset()
     await tox.aclose()
     assert fake.state["a"]["enabled"] is True
+
+
+async def test_delete_server_error_propagates_and_keeps_its_status():
+    tox, fake = await client(
+        {"boom": {"name": "boom", "listen": "0.0.0.0:1", "upstream": "x:5432"}}
+    )
+    fake.fail_delete = {"boom"}
+    # the 500 body mentions "404": the error must be classified by status,
+    # not by message text
+    with pytest.raises(ToxiproxyError) as info:
+        await tox.delete_proxy("boom")
+    assert info.value.status == 500
+    await tox.aclose()
+
+
+async def test_sync_propagates_a_failed_delete(cluster):
+    tox, fake = await client(
+        {
+            "boom": {"name": "boom", "listen": "0.0.0.0:1", "upstream": "x:5432"},
+        }
+    )
+    fake.fail_delete = {"boom"}
+    with pytest.raises(ToxiproxyError) as info:
+        await tox.sync(cluster)
+    assert info.value.status == 500
+    await tox.aclose()
+
+
+async def test_sync_recreates_proxies_whose_address_changed(cluster):
+    import dataclasses
+
+    moved = dataclasses.replace(cluster, proxy_base_port=cluster.proxy_base_port + 100)
+    wanted = proxies(moved)
+    # the server holds the old cluster's proxies: right names, stale addresses
+    tox, fake = await client({p.name: dict(p.as_toxiproxy()) for p in proxies(cluster)})
+    await tox.sync(moved)
+    await tox.aclose()
+    expected = {p.name: p.as_toxiproxy() for p in wanted}
+    assert set(fake.state) == set(expected)
+    for name, body in expected.items():
+        assert fake.state[name]["listen"] == body["listen"]
+        assert fake.state[name]["upstream"] == body["upstream"]
+    # every delete happened before the first create, so a freed port is
+    # free again by the time its replacement is created
+    events = [
+        (method, path)
+        for method, path, _ in fake.calls
+        if (method == "DELETE" and path.startswith("/proxies/"))
+        or (method == "POST" and path == "/proxies")
+    ]
+    first_create = next(i for i, (method, _) in enumerate(events) if method == "POST")
+    assert all(method == "DELETE" for method, _ in events[:first_create])
+
+
+async def test_error_status_is_none_when_the_request_itself_fails():
+    def unreachable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no server")
+
+    tox = Toxiproxy("http://test", transport=httpx.MockTransport(unreachable))
+    with pytest.raises(ToxiproxyError) as info:
+        await tox.reset()
+    assert info.value.status is None
+    await tox.aclose()
 
 
 async def test_base_url_defaults_to_settings(monkeypatch):
