@@ -42,11 +42,22 @@ jobs:
       ROS_TEST_DSN: postgresql://postgres:postgres@localhost:5432/restaurantos_test
     steps:
       - uses: actions/checkout@v5
-      - name: Build tools for psycopg[c]
-        run: sudo apt-get update && sudo apt-get install -y libpq-dev
+      - name: libpq 17 or newer for psycopg[c] (PGDG repository, as in docs/setup.md)
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y libpq-dev
+          pg_config --version
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # A new suffix starts a fresh cache, so a psycopg wheel that an
+          # earlier run built against an older libpq is not reused.
+          cache-suffix: libpq17
       - run: uv sync --locked
       - name: Unit and integration tests
         # "cluster" tests need the Compose cluster and Toxiproxy; run those locally.

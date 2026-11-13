@@ -9,7 +9,7 @@ PostgreSQL servers and Toxiproxy run **in Docker**. You do not install them on y
 | Git | source control | any recent |
 | Docker Engine + Compose plugin | runs every PostgreSQL node, Toxiproxy and the services | Compose v2 |
 | uv | Python and Python packages | 0.13 or newer |
-| clang + libpq-dev | `psycopg[c]` compiles its C extension against libpq | n/a |
+| clang + libpq-dev | `psycopg[c]` compiles its C extension against libpq | **libpq 17 or newer** (from the PGDG repository; Ubuntu 24.04's own is 16) |
 | Node.js + npm | frontend, eslint, prettier | the version in `frontend/.nvmrc` |
 | PostgreSQL client (`psql`, `pg_dump`) | debugging and snapshots | 18 |
 | Toxiproxy CLI (optional) | poking at proxies by hand | 2.12 |
@@ -25,9 +25,9 @@ The 20 GB covers short runs over a window of days. Three things grow past it on 
 ## Ubuntu 24.04
 
 ```bash
-# 1. Base tools, compiler and libpq headers
+# 1. Base tools and compiler
 sudo apt-get update
-sudo apt-get install -y git curl ca-certificates build-essential clang libpq-dev python3-dev
+sudo apt-get install -y git curl ca-certificates build-essential clang python3-dev
 
 # 2. Docker Engine + Compose plugin (official Docker repository)
 sudo install -m 0755 -d /etc/apt/keyrings
@@ -48,7 +48,9 @@ curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash
 # open a new terminal, then, inside the repository:
 nvm install     # reads frontend/.nvmrc; until that file exists: nvm install --lts
 
-# 5. PostgreSQL 18 client tools (PGDG repository; Ubuntu's own package is older)
+# 5. libpq headers and PostgreSQL 18 client tools, both from the PGDG repository.
+#    Ubuntu's own packages are version 16, and psycopg must be built against
+#    libpq 17 or newer (see "libpq 17 or newer" below). Do this before `uv sync`.
 sudo install -d /usr/share/postgresql-common/pgdg
 sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
   https://www.postgresql.org/media/keys/ACCC4CF8.asc
@@ -56,7 +58,8 @@ echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
 https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo "$VERSION_CODENAME")-pgdg main" \
   | sudo tee /etc/apt/sources.list.d/pgdg.list
 sudo apt-get update
-sudo apt-get install -y postgresql-client-18
+sudo apt-get install -y libpq-dev postgresql-client-18
+pg_config --version                  # must say 17 or newer
 ```
 
 Optional Toxiproxy CLI: download `toxiproxy-cli` for your architecture from <https://github.com/Shopify/toxiproxy/releases> and put it on your `PATH`. Everything the CLI does is also available through the HTTP API on port 8474 and through `rosctl faults`.
@@ -64,13 +67,28 @@ Optional Toxiproxy CLI: download `toxiproxy-cli` for your architecture from <htt
 Check:
 
 ```bash
-docker run --rm hello-world && uv --version && node --version && psql --version
+docker run --rm hello-world && uv --version && node --version && psql --version && pg_config --version
+```
+
+### libpq 17 or newer
+
+`psycopg[c]` is compiled on your machine against whatever libpq headers it finds. Below version 17, psycopg cancels a running query with a blocking call. On a link that a fault test has silenced, that call freezes the whole service for about a minute, every region included. From 17 on, the cancel does not block. The unit test `tests/unit/common/test_environment.py` fails with a pointer to this section when the build is too old.
+
+If you set your machine up before this rule (psycopg built against libpq 16), fix it once:
+
+```bash
+# add the PGDG repository as in step 5 above, then:
+sudo apt-get install -y libpq-dev postgresql-client-18
+uv cache clean psycopg-c
+uv sync --reinstall-package psycopg-c
+uv run python -c "import psycopg; print(psycopg.pq.__build_version__, psycopg.capabilities.has_cancel_safe())"
+# expect 170000 or higher, and True
 ```
 
 ## macOS (differences only)
 
 ```bash
-brew install git uv nvm libpq          # libpq provides the headers for building psycopg[c]
+brew install git uv nvm libpq          # headers for building psycopg[c]; Homebrew's libpq is 17 or newer
 brew link --force libpq                 # puts psql, pg_dump and pg_config on PATH
 brew install --cask docker              # Docker Desktop (OrbStack also works)
 xcode-select --install                  # compiler for psycopg[c]
@@ -82,7 +100,7 @@ brew install toxiproxy                  # optional CLI
 
 ## Windows (differences only)
 
-Use **WSL 2 with Ubuntu 24.04** and follow the Ubuntu steps inside it. Native Windows is not supported: `psycopg[c]` needs the compiler and libpq headers from Ubuntu step 1, and our shell scripts assume bash.
+Use **WSL 2 with Ubuntu 24.04** and follow the Ubuntu steps inside it. Native Windows is not supported: `psycopg[c]` needs the compiler from Ubuntu step 1 and the libpq headers from step 5, and our shell scripts assume bash.
 
 1. `wsl --install -d Ubuntu-24.04` (PowerShell as administrator), then reboot.
 2. Either install Docker Engine inside WSL (Ubuntu step 2), or install Docker Desktop and turn on WSL integration for the Ubuntu distro. Pick one, not both.
