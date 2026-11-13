@@ -31,6 +31,8 @@ The briefs cite sections of the Phase 2 document. It is not in this repository. 
 - Business time is **simulated time** carried in the request (`order_day`, `order_time`). Never use `now()` or `datetime.now()` to decide what "today" is. Wall-clock time is only for measurements (`received_at`, `committed_at`, `acked_at`, `hq_applied_at`).
 - Every write to a region carries the region epoch. Every database connection that a failure test can cut goes through its Toxiproxy proxy, never straight to the container.
 - Database access in a service: build connection strings with `common.db.node_conninfo`, pools with `common.db.make_pool`, and run every call on a request path through `common.db.run_on`. Never write a host name or a port, and never use a bare `async with pool.connection()` there: `run_on` is what stops a request from hanging on a silent link.
+- Never cancel a task while it is inside a database call: no `task.cancel()`, `asyncio.wait_for` or `asyncio.timeout` around psycopg. A cancellation makes psycopg send a cancel request over the same link, and on a dead link that can block the whole process. `run_on` gives up without cancelling.
+- `amount`, `unit` and `multiplier` are data (`docs/schema/data-dictionary.md`). Never assume an amount of 1 or the unit `portion`, in code or in tests.
 - A service must run unchanged with `ROS_NETWORK=host` (on your machine, `uv run`) and `ROS_NETWORK=compose` (in a container).
 - The frontend does no business logic: no aggregation, no joins, no routing. It calls the HTTP API and renders the JSON.
 - Docs: write "Section 2.3", never the section sign. The project stages are "Phase 1/2/3". Do not cite Wikipedia.

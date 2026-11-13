@@ -4,7 +4,7 @@
 
 **You own:** `src/restaurantos/sim/` (the Compose and proxy-list generator, bootstrap, playback, oracle, the `rosctl` CLI, and the proxy half of `toxiproxy.py`), `infra/generated/` (git-ignored output), `db/queries/sim/`, `tests/unit/sim/`, `tests/fixtures/mini/`.
 
-**Read first:** `docs/architecture.md` Sections 4, 5.4, 7.1 and 7.2; `docs/replay-stock-parameters.md` (why stock comes from a warm-up window); the data reference in `docs/schema/` (files, columns and meaning of the cleaned dataset).
+**Read first:** `docs/architecture.md` Sections 4, 5.4, 7.1 and 7.2; `docs/replay-stock-parameters.md` (why stock comes from a warm-up window); `docs/schema/data-dictionary.md` (every file and column of the cleaned dataset, and the rules for reading them).
 
 **Needs:** WP0. Posting orders end to end needs WP2 (and WP1 behind it); until then, point playback at a stub server.
 
@@ -38,14 +38,18 @@ Take names, ports and upstreams only from `restaurantos.common.cluster`; never t
 5. Do **not** apply the schema to HQ or region nodes. Each primary applies its own on first start: `infra/postgres/init-primary.sh` runs `db/shared` plus `db/hq` or `db/region` and writes the region's `node_state` row. Running the files again fails with "already exists". Give `baseline` the region schema the same way (`ROS_NODE_KIND=region`, `ROS_REGION_ID=baseline`).
 6. At HQ, insert one `region_state` row per region (`epoch` 1, `primary_node` and `standby_node` from `common.cluster`). `shard_directory` has a foreign key to it, so this comes first.
 7. **Assign cells to regions:** count vendors per geohash cell from `vendors.csv`, sort the cells, cut them into N contiguous ranges with roughly equal vendor counts, write `shard_directory`. Do not use order data for this.
-8. Load reference data with `COPY`: everything into HQ and `baseline`; each region gets its vendor and product slice plus full copies of the small tables.
-9. Initialise `stock` from the **warm-up window only**: starting stock = max(F, ceil(average daily warm-up usage x C)), also stored as `par_level`. Defaults W = 14 days, C = 7, F = 5, restock every R = 7 days. Create a row for every counter a vendor's products can need, including ones never used during warm-up; `place_order` treats a missing row as zero.
+8. Load reference data with `COPY`: everything into HQ and `baseline`; each region gets its vendor and product slice plus full copies of the small tables. Follow the rules in the data dictionary; the ones that bite:
+   - read every column as text (some ids are all digits, a few with leading zeros);
+   - give `COPY` the column list from the file's header (`products.csv` and `product_dish.csv` start with `product_id`, the tables with `vendor_id`);
+   - load in foreign-key order: `ingredients`, `dishes`, `dish_ingredients`, `vendors`, `products`, `product_dish`;
+   - after loading, check that no ingredient appears in `dish_ingredients` with two different units, and stop with a clear message if one does. A stock counter is kept in its ingredient's unit.
+9. Initialise `stock` from the **warm-up window only**: starting stock = max(F, ceil(average daily warm-up usage x C)), also stored as `par_level`. Defaults W = 14 days, C = 7, F = 5, restock every R = 7 days. Usage is `quantity x multiplier x amount`, with `amount` and `multiplier` read from the data. The warm-up window is days 0 to 13: 292,587 orders. Create a row for every counter a vendor's products can need, including ones never used during warm-up; `place_order` treats a missing row as zero.
 
 Data files are read from `ROS_DATA_DIR` (default `data/`). Check them against `MANIFEST.csv` first.
 
 **Which files bootstrap may write.** Only `infra/generated/`, which is git-ignored. The generated Compose file is complete on its own: it does not include or extend `infra/compose.yaml`. Never write to `infra/compose.yaml` or `infra/toxiproxy/proxies.json`; those are the committed one-region dev baseline and belong to WP0. For `regions = 1` your database services must match that baseline (same image, flags, volumes and ports), so the two cannot drift apart. Both use the Compose project name `restaurantos`, so they share container and volume names: only one can run at a time.
 
-**Which connections bootstrap uses.** Bootstrap is a batch job, not a request path. Open plain connections with `psycopg.AsyncConnection.connect(restaurantos.common.cluster.host_conninfo(cluster, node))`: straight to the node from the host, no Toxiproxy, no statement timeout. Do not use `common.db.make_pool`. It stamps every connection with `statement_timeout = 2000` ms, and a bulk `COPY` of two million orders takes far longer than two seconds. The same goes for the stock initialisation and for anything else here that runs longer than a request.
+**Which connections bootstrap uses.** Bootstrap is a batch job, not a request path. Open plain connections with `psycopg.AsyncConnection.connect(restaurantos.common.cluster.host_conninfo(cluster, node))`: straight to the node from the host, no Toxiproxy, no statement timeout. Do not use `common.db.make_pool`. It stamps every connection with `statement_timeout = 2000` ms, and loading a quarter of a million products or working out starting stock takes longer than two seconds. The same goes for the stock initialisation and for anything else here that runs longer than a request.
 
 ### Starting the services: `rosctl up`
 
@@ -70,7 +74,7 @@ Stretch goal, only if the report needs a write-throughput comparison: no new cod
 
 ### Playback: `rosctl playback`
 
-- Read orders in (`order_day`, `order_time`, dataset order id) order, starting at day W. The third key makes the order total: orders in the same second must always go out in the same sequence, or a sequential run cannot match the oracle. Sort once and cache the sorted file.
+- Read orders in (`order_day`, `order_time`, `order_id` compared as a number) order, starting at day W (1,707,401 orders from day 14 to day 90). `order_items.csv` has no restaurant, line number or price: join it to its order on `order_id`. The data dictionary shows how one order becomes one `POST /orders`. The third key makes the order total: orders in the same second must always go out in the same sequence, or a sequential run cannot match the oracle. Sort once and cache the sorted file.
 - **Scheduling:** an order t simulated seconds after the start goes out t / speed wall-clock seconds after the start. Speed can change mid-run, so keep an anchor (wall-clock now, simulated now) and re-anchor on every change. Do not precompute send times. Default speed 1,000x.
 - Send with a bounded number of requests in flight.
 - **Status events** (on by default): for each accepted order, schedule accepted, preparing, ready and picked-up at +1, +3, +15, +25 simulated minutes plus jitter. Send them to the region's own API.
@@ -88,7 +92,7 @@ Stretch goal, only if the report needs a write-throughput comparison: no new cod
 
 A plain-Python replay with no database: walk the same orders in the same order (read the same sorted file as playback), apply the same stock rules and the same restock instants, and report orders accepted, orders refused and final stock per vendor and item. Used to check a region after a sequential run, and to sanity-check the stock parameters before real runs.
 
-The stock rules are WP1's `place_order` steps 3 to 7. The oracle does not need to model `product_availability`: a product is only switched off for stock when one of its counters is at zero, and an order for it would be refused on stock anyway.
+The stock rules are WP1's `place_order` steps 3 to 7, with `amount` and `multiplier` read from the files, never assumed. The mini fixture must contain recipe rows with `amount` above 1, a unit other than `portion`, and products with `multiplier` above 1; the real dataset has amount 1 on every row, so it cannot catch a rule that forgets to multiply. The oracle does not need to model `product_availability`: a product is only switched off for stock when one of its counters is at zero, and an order for it would be refused on stock anyway.
 
 ## Done when
 

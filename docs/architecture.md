@@ -87,7 +87,7 @@ RestaurantOS/
 │   ├── architecture.md        this file
 │   ├── work-packages/         one brief per work package: what to build, done-when
 │   ├── setup.md               system components
-│   ├── schema/                data dictionary (cleaned dataset + our tables)
+│   ├── schema/                data dictionary of the cleaned dataset
 │   ├── api/                   exported OpenAPI JSON per service
 │   └── diagrams/
 ├── db/                        hand-written SQL (the schema contract)
@@ -109,7 +109,7 @@ RestaurantOS/
 │   ├── toxiproxy/             proxy list for the dev baseline
 │   ├── postgres/              init and replication scripts
 │   └── generated/             git-ignored: Compose file and proxy list written by rosctl bootstrap
-├── scripts/                   small shell helpers
+├── scripts/                   small helper scripts
 ├── tests/
 │   ├── unit/<component>/      no database
 │   ├── integration/           one PostgreSQL
@@ -265,7 +265,7 @@ Static, and decided once at bootstrap. A vendor belongs to its geohash cell (`ve
 
 ### 5.1 Tables
 
-Reference tables mirror the cleaned CSV files **one to one** (same names, same columns; see `docs/schema/`). The only added columns are `products.menu_version` and `products.origin` (`hq` or `region`, see D2 in Section 11).
+Reference tables mirror the cleaned CSV files **one to one** (same names, same columns; see `docs/schema/data-dictionary.md`, which also lists what a loader must watch for). The only added columns are `products.menu_version` and `products.origin` (`hq` or `region`, see D2 in Section 11).
 
 Note: the Phase 2 document (Table 12) says `recipe` and `recipe_ingredient`. The cleaned dataset calls them `dishes`, `dish_ingredients` and `product_dish`. The code uses the dataset names.
 
@@ -319,7 +319,7 @@ A stale epoch raises `StaleEpochError` (the SQL function `assert_epoch` raises S
 
 The fence is cooperative: `assert_epoch` protects the transactions that call it, and nothing in the schema stops a write that skips it. So every function above calls it first, inside its transaction, and `restaurantos.region` is the only code that writes a region's operational tables. Two writers are outside it on purpose: bootstrap, which loads data before the system runs, and the coordinator, which sets `node_state.epoch` during a promotion.
 
-**How a request path calls a database.** Through `common.db.run_on(pool, work, region_id=...)`, never with a bare `async with pool.connection()`. `run_on` adds a deadline kept by the caller's own clock (`ROS_REQUEST_DEADLINE_S`, default 3 s) and turns every way of not getting an answer in time into `RegionUnreachableError`: no connection, an empty pool, a statement timeout, or the deadline itself. The deadline is what covers a link that is silent or slow while a statement is in flight: `statement_timeout` runs on the server, and on such a link its error does not come back in time. The pool also sets `idle_in_transaction_session_timeout` (5 s), so a caller that was cut off half-way through a transaction does not keep its row locks for as long as the fault lasts.
+**How a request path calls a database.** Through `common.db.run_on(pool, work, region_id=...)`, never with a bare `async with pool.connection()`. `run_on` adds a deadline kept by the caller's own clock (`ROS_REQUEST_DEADLINE_S`, default 3 s) and turns every way of not getting an answer in time into `RegionUnreachableError`: no connection, an empty pool, a statement timeout, or the deadline itself. The deadline is what covers a link that is silent or slow while a statement is in flight: `statement_timeout` runs on the server, and on such a link its error does not come back in time. A call that misses the deadline is not cancelled: it is left to finish in the background once the fault is gone, and is then rolled back. Cancelling it would make psycopg send a cancel request over the same dead link, which is pointless at best. The pool also sets `idle_in_transaction_session_timeout` (5 s), so a caller that was cut off half-way through a transaction does not keep its row locks for as long as the fault lasts.
 
 After `RegionUnreachableError` the caller does not know whether its write was committed. That is safe here because the writes that are retried are repeatable: `place_order` through the region's inbox, the HQ apply through `hq_inbox`.
 
@@ -368,7 +368,7 @@ All JSON. No authentication (simulation). FastAPI serves OpenAPI at `/docs` on e
 | `PUT /vendors/{vendor_id}/products/{product_id}/availability` | manual sold-out | |
 | `POST /vendors/{vendor_id}/restock` | restock to par | also called by playback |
 | `GET /vendors?geohash=&q=` | find restaurants | |
-| `GET /query/nearby?geohash=&dish=&limit=` | "who near me can make X now" | geohash cell + 8 neighbours; `dish` is a `dish_id`; "can make" means stock for one portion |
+| `GET /query/nearby?geohash=&dish=&limit=` | "who near me can make X now" | geohash cell + 8 neighbours; `dish` is a `dish_id`; "can make" means stock for an order of one |
 | `GET /query/top-dishes?day=&limit=&mode=live\|hq\|baseline` | city-wide top dishes | |
 | `GET /query/ingredient-usage?day=&mode=live\|hq\|baseline&strategy=A\|B\|C` | distributed join | `strategy` applies to `mode=live` |
 | `GET /regions` | shard directory and epochs | reads HQ only |
@@ -593,10 +593,12 @@ Everything in the Phase 2 document and working notes, plus:
 | Region unreachable | orders are parked (`202`); every other route answers `503`; queries answer with `missing_regions`; nothing falls back to HQ's copy |
 | Semi-join (strategy C) | the region joins against recipe rows sent by the router and must not read its own `dish_ingredients` |
 | Epoch fence | cooperative: enforced by `restaurantos.region` calling `assert_epoch`, not by the schema |
+| Amounts and units | `dish_ingredients.amount`, `unit` and `product_dish.multiplier` are data, never assumed. Today's dataset has amount 1 and unit `portion` everywhere only as placeholders. A stock counter is kept in its ingredient's unit, so one ingredient has one unit (checked at bootstrap); anything that reports an ingredient amount reports the unit too |
+| libpq | psycopg is built against libpq 17 or newer (`docs/setup.md`); a unit test checks it. Older versions cancel queries with a blocking call that freezes the process on a silenced link |
 | D16 | two modes, one setting (`ROS_NETWORK`). `host`: Python services run on the Docker host, for development; built. `compose`: services run in containers from one image, for measured runs; the image is a WP0 task still to do. Published ports are bound to `127.0.0.1` |
 | D17 | the edge API and the relay find their region's primary themselves, by the rule in Section 4 (`common.localnode`), at start, on a timer and after any error |
 | D18 | the baseline is filled by `rosctl baseline sync`, a copy of the regions after a run. Replaying into a one-node system for a write-throughput number is a stretch goal |
-| D19 | request paths call databases through `common.db.run_on`, which keeps a deadline on the caller's side; pools also set `idle_in_transaction_session_timeout`. Checked by `tests/cluster/test_deadline.py` under `silence` and `latency` |
+| D19 | request paths call databases through `common.db.run_on`, which keeps a deadline on the caller's side; a call that misses it is abandoned and later rolled back, never cancelled; pools also set `idle_in_transaction_session_timeout`. Checked by `tests/cluster/test_deadline.py` under `silence` and `latency` |
 
 ## 11. Open decisions
 
