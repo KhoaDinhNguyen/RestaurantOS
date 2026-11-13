@@ -26,7 +26,7 @@ Get the dataset from the team Drive folder and put the CSV files and `MANIFEST.c
 - **Anyone on the team may merge**, including their own PR, once CI is green. No approval is required. Ask for a review when you want one, and always for a contract change (see below).
 - **Rebase onto the latest `main` before merging** (`git fetch && git rebase origin/main`), re-run the tests, then squash-merge and delete the branch.
 - **Merges are done by a human.** Coding agents may open PRs but never merge them (see `AGENTS.md`).
-- **Stay in your component's folder.** If you need a change in someone else's folder, ask them or open a separate PR and tag them.
+- **Stay in your component's folder.** If you need a change in someone else's folder, ask them or open a separate PR and tag them. Two things that look shared are not: your component's settings go in its own `config.py` (prefix `ROS_<COMPONENT>_`), and its named queries in `db/queries/<component>/`. Add each new setting to `.env.example`; anyone may edit that file.
 - **Contracts are frozen.** The SQL schema (`db/`), the shared models (`src/restaurantos/common/models.py`), the HTTP routes and the Toxiproxy proxy names are what the other three people build against. To change one: open an issue, get agreement, and update `docs/architecture.md` in the same PR.
 - **New dependencies need a heads-up** in the team chat first (backend). Frontend packages are up to the UI owners.
 
@@ -65,7 +65,7 @@ Test levels:
 
 - Types: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `chore`, `ci`, `build`.
 - Scope is the component: `gateway`, `region`, `relay`, `coordinator`, `sim`, `db`, `frontend`, `infra`.
-- Example: `feat(relay): resume from last acknowledged outbox sequence`.
+- Example: `feat(relay): resend unconfirmed outbox rows after a restart`.
 
 ## 6. Pull request checklist
 

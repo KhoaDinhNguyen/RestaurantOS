@@ -16,6 +16,12 @@ PostgreSQL servers and Toxiproxy run **in Docker**. You do not install them on y
 
 Hardware: plan for about 8 GB of free RAM for the full cluster (eight PostgreSQL containers plus services) and 20 GB of disk.
 
+The 20 GB covers short runs over a window of days. Three things grow past it on long runs, so check `docker system df -v` after your first full run and correct this number:
+
+- **Outbox rows are never deleted**, and every region's data exists again on its standby and in HQ's analytics copy.
+- **WAL held for a standby that is cut off.** Each standby has a replication slot, so its primary keeps WAL while the link is down, up to `max_slot_wal_keep_size` = 2 GB per primary (set in the Compose file). Disk use from this is bounded, but a standby left cut for longer than 2 GB of WAL cannot catch up any more and has to be cloned again. How soon that happens depends on the playback speed; measure it before you plan a long cut.
+- **Each snapshot is a full copy of every data volume.**
+
 ## Ubuntu 24.04
 
 ```bash
@@ -100,3 +106,18 @@ cd frontend && npm ci
 ```
 
 Continue with `CONTRIBUTING.md`.
+
+## Running services on your machine (host mode)
+
+While you develop, the databases and Toxiproxy run in Docker and your Python service runs directly on your machine, so there is no image to rebuild after an edit and a debugger can attach. Nothing extra needs installing.
+
+```bash
+docker compose -f infra/compose.yaml up -d      # HQ, one region, Toxiproxy
+cp .env.example .env                            # then set ROS_NETWORK=host in it
+uv run pytest -m cluster tests/cluster/test_deadline.py    # checks the path end to end
+```
+
+- With `ROS_NETWORK=host`, a service reaches every database on `127.0.0.1`, through the same Toxiproxy proxies a container would use. The Compose file publishes those ports on `127.0.0.1` only, so they are not visible from the network your machine is on.
+- These ports must be free for the dev baseline: 8474; 5500, 5501, 5510 and 5511; 21000 to 21005 and 21010 to 21019. Each extra region adds ten proxy ports and two database ports.
+- Service ports are fixed: gateway 8000, coordinator 8001, control 8002, the edge API of region n on 8010 + n.
+- Host mode is for developing and debugging. Do not report performance numbers from it: every query takes an extra hop through Docker's port forwarding. Measured runs use container mode (`docs/architecture.md` Section 4).

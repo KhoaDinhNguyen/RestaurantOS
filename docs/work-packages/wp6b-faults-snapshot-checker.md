@@ -56,6 +56,10 @@ Thin HTTP wrappers over all of the above and over playback (Section 6.3), so the
 
 ## Watch out for
 
+- After a failover, the checker's three numbers can differ by the orders that were acknowledged or forwarded to HQ before they reached the standby. Report that amount as "lost at failover", with the order ids, instead of failing; with synchronous replication it must be zero (architecture Section 7.5).
+- The services answer a silenced or slowed link with `RegionUnreachableError` after `ROS_REQUEST_DEADLINE_S` (default 3 s). `tests/cluster/test_deadline.py` already checks that for one proxy; your `silence` and `latency` faults should produce the same behaviour through the whole stack.
+- The checker and the snapshot tool are batch jobs that run on the host. Open plain connections with `restaurantos.common.cluster.host_conninfo`, not `common.db.make_pool`: the pool's 2 s statement timeout is for request paths and will cut a count over every partition.
+- Bootstrap writes the cluster's Compose file and proxy list to `infra/generated/` (git-ignored) from `cluster.toml`. Restore must put the snapshot's `cluster.toml` back and regenerate from it before it starts any container; otherwise it starts whatever cluster the working tree describes today.
 - Stop **all** PostgreSQL containers before archiving volumes. Copying a running database gives a broken snapshot.
 - "Wait for queues to drain" needs a real condition (outbox backlog zero and holding queue empty), not a fixed sleep.
 - A cut link leaves the old primary alive. That is the split-brain case we want; do not "fix" it by killing the container.
