@@ -1,0 +1,20 @@
+product_id,vendor_id,name,unit_price,price_units
+p001,v004,Menu item 001,0.01,24
+p002,v002,Menu item 002,0.00,2
+p003,v001,Menu item 003,0.00,2
+p004,v004,Menu item 004,0.01,25
+p005,v003,Menu item 005,0.00,11
+p006,v001,Menu item 006,0.00,11
+p007,v001,Menu item 007,0.00,11
+p008,v002,Menu item 008,0.00,6
+p009,v003,Menu item 009,0.00,11
+p010,v001,Menu item 010,0.00,9
+p011,v002,Menu item 011,0.00,4
+p012,v002,Menu item 012,0.00,4
+p013,v004,Menu item 013,0.00,12
+p014,v004,Menu item 014,0.01,36
+p015,v001,Menu item 015,0.02,38
+p016,v003,Menu item 016,0.00,12
+p017,v003,Menu item 017,0.00,0
+p018,v003,Menu item 018,0.00,10
+p019,v002,Menu item 019,0.00,7
