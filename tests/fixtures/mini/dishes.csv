@@ -1,0 +1,20 @@
+dish_id,dish_name,scope,stock_mode,n_products,n_vendors,example_name
+d001,,chain:ch01,per_ingredient,1,1,Menu item 008
+d002,Sample dish 002,chain:ch02,per_ingredient,1,1,Sample Dish 002
+d003,Sample dish 003,chain:ch02,per_ingredient,1,1,Sample Dish 003
+d004,Sample dish 004,chain:ch04,per_ingredient,1,1,Sample Dish 004
+d005,Sample dish 005,chain:ch04,per_ingredient,1,1,Sample Dish 005
+d006,Sample dish 006,chain:ch03,per_ingredient,1,1,Sample Dish 006
+d007,Sample dish 007,chain:ch04,per_ingredient,1,1,Sample Dish 007
+d008,Sample dish 008,chain:ch02,none,1,1,Sample Dish 008
+d009,Sample dish 009,chain:ch03,per_ingredient,1,1,Sample Dish 009
+d010,Sample dish 010,chain:ch01,per_item,1,1,Sample Dish 010
+d011,Sample dish 011,chain:ch02,per_item,1,1,Sample Dish 011
+d012,Sample dish 012,chain:ch01,per_ingredient,1,1,Sample Dish 012
+d013,Sample dish 013,chain:ch04,per_item,1,1,Sample Dish 013
+d014,Sample dish 014,chain:ch03,per_ingredient,1,1,Sample Dish 014
+d015,Sample dish 015,chain:ch01,per_item,1,1,Sample Dish 015
+d016,Sample dish 016,chain:ch02,per_ingredient,1,1,Sample Dish 016
+d017,Sample dish 017,chain:ch01,per_ingredient,1,1,Sample Dish 017
+d018,Sample dish 018,chain:ch03,per_ingredient,1,1,Sample Dish 018
+d019,Sample dish 019,chain:ch04,per_ingredient,1,1,Sample Dish 019
