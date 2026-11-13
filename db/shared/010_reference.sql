@@ -9,9 +9,11 @@ CREATE TABLE ingredients (
     source text NOT NULL
 );
 
+-- dish_name is empty for a few thousand dishes in the dataset, and COPY
+-- reads an empty CSV field as NULL, so the column allows it.
 CREATE TABLE dishes (
     dish_id text PRIMARY KEY,
-    dish_name text NOT NULL,
+    dish_name text,
     scope text NOT NULL,
     stock_mode text NOT NULL CHECK (stock_mode IN ('per_ingredient', 'per_item', 'none')),
     n_products integer NOT NULL DEFAULT 0,
@@ -19,11 +21,16 @@ CREATE TABLE dishes (
     example_name text
 );
 
+-- How much of an ingredient one unit of a dish uses. amount and unit are
+-- data: no default, and no code may assume a value for either. Today's
+-- dataset has amount 1 and unit 'portion' on every row only because it cannot
+-- know real quantities. A stock counter is kept in the ingredient's unit, so
+-- every row of one ingredient must use the same unit (checked at load).
 CREATE TABLE dish_ingredients (
     dish_id text NOT NULL REFERENCES dishes (dish_id),
     ingredient_id text NOT NULL REFERENCES ingredients (ingredient_id),
-    amount integer NOT NULL DEFAULT 1 CHECK (amount > 0),
-    unit text NOT NULL DEFAULT 'portion',
+    amount integer NOT NULL CHECK (amount > 0),
+    unit text NOT NULL CHECK (unit <> ''),
     PRIMARY KEY (dish_id, ingredient_id)
 );
 

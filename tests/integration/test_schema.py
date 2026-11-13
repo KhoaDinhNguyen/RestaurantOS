@@ -109,3 +109,26 @@ def test_inbox_rejects_half_filled_rows(conn, outcome, has_order, reason):
     apply(conn, "region")
     with pytest.raises(psycopg.errors.CheckViolation):
         conn.execute(INSERT_INBOX, ("1", outcome, uuid4() if has_order else None, reason))
+
+
+def test_recipe_amounts_and_units_are_data_not_defaults(conn):
+    apply(conn, "region")
+    conn.execute("INSERT INTO ingredients (ingredient_id, source) VALUES ('rice', 'recipenlg')")
+    # A dish may have no name: the dataset has some, and COPY loads them as NULL.
+    conn.execute(
+        "INSERT INTO dishes (dish_id, dish_name, scope, stock_mode)"
+        " VALUES ('d1', NULL, 'global', 'per_ingredient')"
+    )
+    # Any amount and any unit are accepted.
+    conn.execute("INSERT INTO dish_ingredients VALUES ('d1', 'rice', 250, 'gram')")
+    conn.execute("DELETE FROM dish_ingredients")
+    # Neither has a default to fall back on.
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        conn.execute(
+            "INSERT INTO dish_ingredients (dish_id, ingredient_id, unit)"
+            " VALUES ('d1', 'rice', 'gram')"
+        )
+    with pytest.raises(psycopg.errors.NotNullViolation):
+        conn.execute(
+            "INSERT INTO dish_ingredients (dish_id, ingredient_id, amount) VALUES ('d1', 'rice', 1)"
+        )
