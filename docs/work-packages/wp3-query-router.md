@@ -8,6 +8,17 @@
 
 **Needs:** WP0. You can develop against two or three plain PostgreSQL databases loaded with the mini fixture. End-to-end runs need WP6a (real data) and WP2 (the app your routes mount on).
 
+## Shared code you must use
+
+| For | Use |
+| --- | --- |
+| each call to a region, HQ or the baseline | `common.db.run_on` on a pool from `common.db.make_pool(node_conninfo(...))` |
+| reaching the baseline | `common.db.node_conninfo(cluster, "baseline", direct=True)` |
+| the `meta` object | `common.models.QueryMeta` |
+| loading your SQL | `common.sqlfiles.load_query("router/<name>")`, files in `db/queries/router/` |
+| geohash neighbours and distances | `pygeohash` (already a dependency) |
+| a region that does not answer | catch `common.errors.RegionUnreachableError`, add the region to `meta.missing_regions` |
+
 ## What to build
 
 ### Nearby: `GET /query/nearby?geohash=&dish=&limit=`
@@ -56,13 +67,31 @@ All three must return identical numbers. `mode=hq` is one query on HQ's analytic
 - Each scatter call goes through `common.db.run_on`, so one silent region costs the query the request deadline at most, and then shows up in `meta.missing_regions`.
 - `day` is always a parameter. Never "today" from the clock.
 
+## Run it on its own
+
+There is no process of your own: your routes mount on the gateway app (WP2). Most of the work can be done and tested without it.
+
+```bash
+uv run pytest tests/unit/router tests/integration/router
+```
+
+The integration tests need several databases at once, playing HQ, two or three regions and the baseline. Create them inside the one test server (`ROS_TEST_DSN`, see "Running things" in `README.md` in this folder), one database or one schema per role, and apply `db/shared` plus `db/region` or `db/hq` with `common.sqlfiles.schema_files`. Load the same hand-made rows twice: split by restaurant across the regions, and all together into the baseline.
+
+Once the gateway runs, try a query by hand:
+
+```bash
+curl -s 'localhost:8000/api/v1/query/top-dishes?day=14&limit=10&mode=live'
+```
+
 ## Done when
 
-- Every query returns the same result on the cluster and on the baseline: on the mini fixture, where the expected answers are also written down by hand, and on real data after `rosctl baseline sync`.
-- Strategies A, B and C return identical numbers, on the mini fixture and on real data. The mini fixture must have recipe rows with `amount` above 1 and a unit other than `portion`, and products with `multiplier` above 1: the real dataset has amount 1 everywhere, so a query that forgets to multiply would pass on it. A test proves C never reads the region's own `dish_ingredients` (for example: empty that table in the test region and C still answers correctly).
-- On a full day of real data, `rows_transferred` is recorded for all three and comes out A < C < B. Do not assert that order on the mini fixture: a handful of order lines can be fewer rows than their recipes.
-- A nearby query in the middle of one region contacts one node; one on a border contacts two.
-- A top-N test exists where a local top-N would give the wrong answer, and the router gets it right.
+What each line needs is marked in front of it (the marks are explained in `README.md` in this folder).
+
+- `db for the mini fixture; data for real data (needs WP2 and WP6a)` Every query returns the same result on the cluster and on the baseline: on the mini fixture, where the expected answers are also written down by hand, and on real data after `rosctl baseline sync`.
+- `db, then data` Strategies A, B and C return identical numbers, on the mini fixture and on real data. The mini fixture must have recipe rows with `amount` above 1 and a unit other than `portion`, and products with `multiplier` above 1: the real dataset has amount 1 everywhere, so a query that forgets to multiply would pass on it. A test proves C never reads the region's own `dish_ingredients` (for example: empty that table in the test region and C still answers correctly).
+- `data (needs WP2 and WP6a)` On a full day of real data, `rows_transferred` is recorded for all three and comes out A < C < B. Do not assert that order on the mini fixture: a handful of order lines can be fewer rows than their recipes.
+- `db` A nearby query in the middle of one region contacts one node; one on a border contacts two.
+- `db` A top-N test exists where a local top-N would give the wrong answer, and the router gets it right.
 
 ## Watch out for
 

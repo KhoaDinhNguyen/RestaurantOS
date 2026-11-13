@@ -1,6 +1,6 @@
 # Contributing to RestaurantOS
 
-This file covers how we work in this repository: setting up, testing, branching and reviewing. The design itself is in `docs/architecture.md`.
+This file covers how we work in this repository: setting up, testing, branching and reviewing. The design itself is in `docs/architecture.md`. If you are about to start on a work package, read `docs/work-packages/README.md` first.
 
 ## 1. Set up your machine
 

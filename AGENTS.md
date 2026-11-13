@@ -5,7 +5,7 @@ Instructions for coding agents (Claude Code, Codex, Cursor, and others) working 
 ## Read first
 
 1. `docs/architecture.md`: components, contracts, schema, and who owns which folder.
-2. The brief for the work package you are on, in `docs/work-packages/`.
+2. `docs/work-packages/README.md` (the rules every package shares and how to run things), then the brief for the work package you are on, in the same folder.
 3. `CONTRIBUTING.md`: setup, tests, branch and commit rules.
 
 The briefs cite sections of the Phase 2 document. It is not in this repository. If a task depends on one of those sections, ask the user for the passage; do not guess what it says.

@@ -126,7 +126,7 @@ uv manages Python only. The frontend is a normal Node project in `frontend/` wit
 
 ## 3. Components and ownership
 
-Each row is a work package someone can claim. Each has a brief in `docs/work-packages/`. "Needs" lists what must exist first.
+Each row is a work package someone can claim. Each has a brief in `docs/work-packages/`; start with `docs/work-packages/README.md`, which has the reading order, the rules every package shares and how to run things. "Needs" lists what must exist first.
 
 | WP | Component | Folder | What it does | Needs |
 | --- | --- | --- | --- | --- |
@@ -134,11 +134,11 @@ Each row is a work package someone can claim. Each has a brief in `docs/work-pac
 | 1 | Region write path | `region/`, `db/region/` | Order transaction, status state machine, stock, availability, inbox, outbox | WP0 |
 | 2 | Gateway | `gateway/` (not `router/`) | Public API, shard-directory cache, epoch handling, holding queue, timestamps | WP0; WP1 for real writes |
 | 3 | Query router | `gateway/router/`, `db/queries/router/` | Nearby query, city-wide scatter-gather, join strategies A/B/C, single-node baseline | WP0 |
-| 4 | Relay | `relay/` | Region to HQ outbox relay, HQ to region holding-queue drain, menu publisher | WP0; WP1 for the outbox |
+| 4 | Relay | `relay/` | Region to HQ outbox relay (one process per region); HQ to region holding-queue drain and menu publisher (one HQ-side process, `hq-worker`) | WP0; WP1 for the outbox |
 | 5 | Coordinator | `coordinator/`, `infra/postgres/` | Heartbeats, suspect/down, promotion, epoch bump, admin API | WP0 |
 | 6a | Bootstrap and playback | `sim/`, `infra/generated/` | Cluster generation, Toxiproxy client (proxy setup), partition ranges, data and stock loading, order replay with speed control, single-region mode | WP0 |
 | 6b | Faults, snapshot, checker | `sim/` | Toxiproxy client (toxics, link groups), T1 to T6 scripts, snapshot/restore, invariant checker, control API | WP6a |
-| 7 | Web UI | `frontend/` | Four views (Section 8) | the API tables in Section 6; can start against mocked JSON |
+| 7 | Web UI | `frontend/` | Four views (Section 8) | nothing to start: the API tables in Section 6, against mocked JSON |
 
 Everyone codes against the contracts in Sections 4 to 7, not against each other's internals.
 
@@ -194,6 +194,20 @@ PostgreSQL and Toxiproxy run in Docker in both modes, and every connection a fau
 
 Services never build a connection string by hand: `common.db.node_conninfo(cluster, node)` reads the mode, the caller's proxy name and the credentials from the settings.
 
+**How each service starts.** Every service package has a `__main__.py`, so a service is started with `uv run python -m restaurantos.<component>`. Who the process is comes from settings, not from arguments. `rosctl up` and, later, the Compose file use exactly these commands:
+
+| Service | Command | Settings that say who it is | HTTP port | Brief |
+| --- | --- | --- | --- | --- |
+| `gateway` | `python -m restaurantos.gateway` | `ROS_MODE=gateway`, `ROS_CLIENT=gateway` | 8000 | WP2 |
+| `edge-r{n}` | `python -m restaurantos.gateway` | `ROS_MODE=edge`, `ROS_REGION_ID=r{n}` | 8010 + n | WP2 |
+| `coordinator` | `python -m restaurantos.coordinator` | `ROS_CLIENT=coordinator` | 8001 | WP5 |
+| `relay-r{n}` | `python -m restaurantos.relay` | `ROS_RELAY_ROLE=region`, `ROS_CLIENT=relay-r{n}`, `ROS_REGION_ID=r{n}` | none | WP4 |
+| `hq-worker` | `python -m restaurantos.relay` | `ROS_RELAY_ROLE=hq`, `ROS_CLIENT=hq` | none | WP4 |
+| `control` | `rosctl control` | none (it is outside the system) | 8002 | WP6b |
+| `web` | `npm run dev` in `frontend/` | none | Vite's | WP7 |
+
+HTTP ports come from `common.cluster.service_port`. Add `ROS_NETWORK=host` (once, in `.env`) when the process runs on your machine instead of in a container.
+
 With three regions:
 
 | Container | Count | Notes |
@@ -203,7 +217,8 @@ With three regions:
 | `toxiproxy` | 1 | API on 8474 |
 | `gateway` | 1 | port 8000, HQ side |
 | `coordinator` | 1 | port 8001, HQ side |
-| `relay-r{n}` | 1 per region | region side |
+| `relay-r{n}` | 1 per region | region side; the outbox relay |
+| `hq-worker` | 1 | HQ side; the holding-queue drainer and the menu publisher |
 | `edge-r{n}` | 1 per region | port 8010 + n, region side; the gateway code in edge mode |
 | `control` | 1 | port 8002, outside the system |
 | `web` | 1 | Vite dev server or static build |
@@ -221,7 +236,7 @@ One proxy per (client, target) pair, named `<client>__<target>`:
 | `coordinator__r1-primary`, `coordinator__r1-standby` | heartbeats, promotion |
 | `r1-standby__r1-primary`, `r1-primary__r1-standby` | streaming replication; the second one once the roles have swapped |
 | `relay-r1__hq-primary`, `relay-r1__hq-standby` | outbox events going up |
-| `hq__r1-primary`, `hq__r1-standby` | menu versions and holding-queue orders going down |
+| `hq__r1-primary`, `hq__r1-standby` | menu versions and holding-queue orders going down, sent by `hq-worker` |
 | `gateway__hq-primary`, `gateway__hq-standby`, `coordinator__hq-primary`, `coordinator__hq-standby`, `hq-standby__hq-primary`, `hq-primary__hq-standby` | HQ equivalents |
 
 A standby has the same proxies as its primary, because after a promotion it is the primary. Reach a region's primary through the proxy for the node named in `region_state.primary_node`; never assume it is the node called `-primary`.
@@ -548,7 +563,7 @@ After a failover the three numbers may differ by a small, explainable amount, an
 
 ## 8. Web UI
 
-The UI holds no business logic. It calls the routes in Section 6 and renders the JSON. Layout is the UI owners' decision. The backend guarantees these four views have the data they need:
+The UI holds no business logic. It calls the routes in Section 6 and renders the JSON. Layout is the UI owners' decision; `docs/work-packages/wp7-web-ui.md` collects what they need to know about the APIs. The backend guarantees these four views have the data they need:
 
 | View | Who it stands for | Reads | Can do |
 | --- | --- | --- | --- |
@@ -599,6 +614,8 @@ Everything in the Phase 2 document and working notes, plus:
 | D17 | the edge API and the relay find their region's primary themselves, by the rule in Section 4 (`common.localnode`), at start, on a timer and after any error |
 | D18 | the baseline is filled by `rosctl baseline sync`, a copy of the regions after a run. Replaying into a one-node system for a write-throughput number is a stretch goal |
 | D19 | request paths call databases through `common.db.run_on`, which keeps a deadline on the caller's side; a call that misses it is abandoned and later rolled back, never cancelled; pools also set `idle_in_transaction_session_timeout`. Checked by `tests/cluster/test_deadline.py` under `silence` and `latency` |
+| HQ worker | the holding-queue drainer and the menu publisher run in their own HQ-side process, `hq-worker` (WP4), not inside the coordinator or the gateway: a large drain must not share an event loop with heartbeats or with live requests, and T3 must be able to kill it alone. It reaches the regions through the `hq__` proxies and HQ's own database directly |
+| Starting a service | `python -m restaurantos.<component>`; who the process is comes from settings (table in Section 4) |
 
 ## 11. Open decisions
 

@@ -8,6 +8,17 @@
 
 **Needs:** WP0. The second-path check and the gateway's reaction to a new epoch need WP2.
 
+## Shared code you must use
+
+| For | Use |
+| --- | --- |
+| nodes, their roles and the proxies to them | `common.cluster`: `load_cluster`, `primary_of`, `standby_of`, `proxy_name`, `link_groups` |
+| connection strings and pools | `common.db.node_conninfo`, `make_pool` |
+| a heartbeat or any other call with a time limit | `common.db.run_on`, or `common.deadline.run_with_deadline` with your own shorter limit |
+| reading a node's role and epoch | `common.db.probe_node` |
+| the rule the edge API and the relay follow after a promotion | `common.localnode.pick_local_primary` (read it; your step order has to fit it) |
+| settings | your own in `coordinator/config.py`: heartbeat interval, miss count |
+
 ## What to build
 
 ### 1. Streaming replication (`infra/postgres/`)
@@ -64,14 +75,46 @@ Both outbox queries use the partial index `outbox_pending_idx`, so they stay che
 
 Standby with **manual** promotion only: one `rosctl` command. Automatic HQ failover is a stretch goal.
 
+## Run it on its own
+
+Needs the dev cluster (see "Running things" in `README.md` in this folder), which has HQ and one region, each with a standby: enough for every failover case.
+
+```bash
+ROS_CLIENT=coordinator uv run python -m restaurantos.coordinator      # port 8001
+curl -s localhost:8001/admin/cluster
+```
+
+Until bootstrap (WP6a) exists, insert the region's control row at HQ once:
+
+```sql
+-- at HQ: psql -h 127.0.0.1 -p 5500 -U ros -d restaurantos   (password ros)
+INSERT INTO region_state (region_id, primary_node, standby_node) VALUES ('r1', 'r1-primary', 'r1-standby');
+```
+
+Break things by hand:
+
+```bash
+docker compose -f infra/compose.yaml kill r1-primary                 # a real crash (T1b)
+docker compose -f infra/compose.yaml start r1-primary
+
+# T1: cut every link to the primary and leave it running
+uv run python -c "from restaurantos.common.cluster import *; print(*link_groups(load_cluster())['node:r1-primary'])"
+curl -s -X POST 127.0.0.1:8474/proxies/<each name printed> -d '{"enabled": false}'
+curl -s -X POST 127.0.0.1:8474/reset                                 # heal everything
+```
+
+After an experiment that promoted a standby, start again from a clean cluster: `docker compose -f infra/compose.yaml down -v`, then `up -d`.
+
 ## Done when
 
-- T1 (cut every link to a region primary under load): writes resume on the standby; when the links come back, the old primary rejects every write. The region's edge API and relay have moved to the new primary by themselves.
-- Stop the coordinator after each promotion step in turn and start it again: the promotion finishes and the region ends in the same state as an uninterrupted one.
-- T1b (`docker kill` the primary): same, and the old primary rejoins as a standby.
-- T2 (region isolated from HQ): no promotion happens.
-- T5 (latency up to 2,000 ms): no promotion below the threshold.
-- The admin endpoint shows roles, status, epochs and lag changing through all of the above.
+What each line needs is marked in front of it (the marks are explained in `README.md` in this folder).
+
+- `cluster (under load: needs WP2 and WP6a)` T1 (cut every link to a region primary under load): writes resume on the standby; when the links come back, the old primary rejects every write. The region's edge API and relay have moved to the new primary by themselves.
+- `cluster` Stop the coordinator after each promotion step in turn and start it again: the promotion finishes and the region ends in the same state as an uninterrupted one.
+- `cluster` T1b (`docker kill` the primary): same, and the old primary rejoins as a standby.
+- `cluster` T2 (region isolated from HQ): no promotion happens.
+- `cluster` T5 (latency up to 2,000 ms): no promotion below the threshold.
+- `cluster` The admin endpoint shows roles, status, epochs and lag changing through all of the above.
 
 ## Watch out for
 

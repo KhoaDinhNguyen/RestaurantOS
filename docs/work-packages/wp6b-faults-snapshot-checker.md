@@ -8,6 +8,16 @@
 
 **Needs:** WP6a (a cluster to break and a playback to run under it). The scenarios only pass once WP4 and WP5 work, but you can write and dry-run them earlier.
 
+## Shared code you must use
+
+| For | Use |
+| --- | --- |
+| which proxies a fault touches | `common.cluster.link_groups` |
+| the Toxiproxy client | `sim/toxiproxy.py` from WP6a; you add the toxic calls to the same class |
+| connections for the checker and snapshots | `common.cluster.host_conninfo` with a plain `psycopg` connection, never `make_pool` |
+| simulated time in snapshots and scenarios | `common.simclock.SimClock` |
+| a worked example of adding and removing toxics | `tests/cluster/test_deadline.py` |
+
 ## What to build
 
 ### Faults
@@ -47,12 +57,26 @@ After queues drain, compare three numbers that must match: orders acknowledged i
 
 Thin HTTP wrappers over all of the above and over playback (Section 6.3), so the Ops view in the UI can drive them. Every action must also work as a `rosctl` command.
 
+## Run it on its own
+
+The fault layer can be built and tried before WP6a is finished, against the dev cluster (see "Running things" in `README.md` in this folder):
+
+```bash
+uv run pytest tests/unit/sim                       # toxic calls against httpx.MockTransport
+uv run pytest -m cluster tests/cluster             # against the running Toxiproxy
+curl -s 127.0.0.1:8474/proxies | head              # what Toxiproxy has right now
+```
+
+The control API is started with `uv run rosctl control` (port 8002). The scenarios, snapshots and the checker need a bootstrapped cluster and a playback to run under them (WP6a), and only pass once WP4 and WP5 work.
+
 ## Done when
 
-- Each of T1, T1b and T2 to T6 runs from one command and ends with a checker verdict.
-- Save a snapshot mid-run, keep going, restore: the cluster and playback continue from the saved point and the checker still passes at the end.
-- The checker fails loudly when you delete an order by hand or insert a duplicate.
-- The Ops view can inject and heal a fault and see it listed.
+What each line needs is marked in front of it (the marks are explained in `README.md` in this folder).
+
+- `data (needs WP4 and WP5)` Each of T1, T1b and T2 to T6 runs from one command and ends with a checker verdict.
+- `data` Save a snapshot mid-run, keep going, restore: the cluster and playback continue from the saved point and the checker still passes at the end.
+- `data` The checker fails loudly when you delete an order by hand or insert a duplicate.
+- `cluster (needs WP7)` The Ops view can inject and heal a fault and see it listed.
 
 ## Watch out for
 

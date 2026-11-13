@@ -8,6 +8,19 @@
 
 **Needs:** WP0. Real writes need WP1; until then, stub `restaurantos.region` with fakes that return canned results. Keep the fakes under `tests/` (for example `tests/unit/gateway/fakes.py`). `src/restaurantos/region/` is WP1's folder, so nothing of yours goes there.
 
+## Shared code you must use
+
+| For | Use |
+| --- | --- |
+| which nodes and ports exist | `common.cluster.load_cluster`, `service_port` |
+| connection strings and pools | `common.db.node_conninfo`, `make_pool` |
+| every database call on a request path | `common.db.run_on` |
+| edge mode: which local node is the primary | `common.db.find_local_primary` |
+| request and response shapes | `common.models`: `OrderRequest`, `OrderResponse`, `StatusChangeRequest`, `StatusResult` |
+| errors to turn into answers | `common.errors`: `RegionUnreachableError` (`503` or park), `StaleEpochError` (refresh and retry), `UnknownVendorError` (`404`) |
+| the writes themselves | the functions of `restaurantos.region` (WP1); no SQL of your own on a region's tables |
+| settings | shared ones from `common.config.get_settings()`; your own in `gateway/config.py` |
+
 ## What to build
 
 One FastAPI app with two modes, chosen by config:
@@ -65,17 +78,45 @@ The `503` body is `{"error": "region_unreachable", "region_id": "r1"}`. `run_on`
 
 Also add `GET /internal/probe/{node_id}`: run `SELECT 1` on that node and report up or down. The coordinator uses it as its second path before declaring a node down.
 
+## Run it on its own
+
+Needs the dev cluster (see "Running things" in `README.md` in this folder). The same package runs as the gateway or as one region's edge API:
+
+```bash
+ROS_MODE=gateway ROS_CLIENT=gateway uv run python -m restaurantos.gateway     # port 8000
+ROS_MODE=edge ROS_REGION_ID=r1 uv run python -m restaurantos.gateway          # port 8011
+
+curl -s localhost:8000/api/v1/regions
+```
+
+Until bootstrap (WP6a) exists the databases are empty. The gateway needs two control rows at HQ before it can route anything, plus whatever vendors and products you want to order from:
+
+```sql
+-- at HQ: psql -h 127.0.0.1 -p 5500 -U ros -d restaurantos   (password ros)
+INSERT INTO region_state (region_id, primary_node, standby_node) VALUES ('r1', 'r1-primary', 'r1-standby');
+INSERT INTO shard_directory (geohash, region_id) VALUES ('w21z7', 'r1');
+```
+
+Until WP1 exists, the write routes run against your fakes in tests only; the read routes and `GET /regions` work for real. To see the failure answers by hand, switch a proxy off and on through Toxiproxy:
+
+```bash
+curl -s -X POST 127.0.0.1:8474/proxies/gateway__r1-primary -d '{"enabled": false}'
+curl -s -X POST 127.0.0.1:8474/reset          # everything back to normal
+```
+
 ## Done when
 
-- An order for a vendor in each region lands on the right node, and nowhere else.
-- After a promotion, the first request gets `StaleEpochError`, the gateway refreshes, and the retry succeeds without the client noticing.
-- With a region's links cut, `POST /orders` answers `202` within the timeout and the row is in `holding_queue`. The same order sent again while it is parked answers `202` again and adds no row.
-- With a region's links cut, a read or a status change for that region answers `503` within the timeout and names the region. Other regions are not affected.
-- The two points above also hold when the links are silenced or slowed instead of cut (`silence`, and `latency` above the deadline): the answer still comes within `ROS_REQUEST_DEADLINE_S`.
-- Edge mode refuses vendors from other regions and keeps working with HQ unreachable.
-- After a promotion in its region, the edge API moves to the new primary within one check interval, without a restart. With the old primary still running (T1), no request reaches it after that.
-- The whole app runs unchanged with `ROS_NETWORK=host` and with `ROS_NETWORK=compose`.
-- Every order response carries `received_at`, `committed_at` and `acked_at`.
+What each line needs is marked in front of it (the marks are explained in `README.md` in this folder).
+
+- `cluster (needs WP1; more than one region needs WP6a)` An order for a vendor in each region lands on the right node, and nowhere else.
+- `cluster (needs WP1; WP5, or bump the epoch by hand)` After a promotion, the first request gets `StaleEpochError`, the gateway refreshes, and the retry succeeds without the client noticing.
+- `cluster` With a region's links cut, `POST /orders` answers `202` within the timeout and the row is in `holding_queue`. The same order sent again while it is parked answers `202` again and adds no row.
+- `cluster` With a region's links cut, a read or a status change for that region answers `503` within the timeout and names the region. Other regions are not affected.
+- `cluster` The two points above also hold when the links are silenced or slowed instead of cut (`silence`, and `latency` above the deadline): the answer still comes within `ROS_REQUEST_DEADLINE_S`.
+- `cluster` Edge mode refuses vendors from other regions and keeps working with HQ unreachable.
+- `cluster (needs WP5, or promote by hand)` After a promotion in its region, the edge API moves to the new primary within one check interval, without a restart. With the old primary still running (T1), no request reaches it after that.
+- `cluster (container mode also needs the service image)` The whole app runs unchanged with `ROS_NETWORK=host` and with `ROS_NETWORK=compose`.
+- `unit` Every order response carries `received_at`, `committed_at` and `acked_at`.
 
 ## Watch out for
 

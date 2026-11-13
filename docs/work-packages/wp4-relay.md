@@ -8,6 +8,18 @@
 
 **Needs:** WP0. The outbox is filled by WP1; until then, insert outbox rows by hand in tests.
 
+## Shared code you must use
+
+| For | Use |
+| --- | --- |
+| which local node is the region's primary | `common.db.find_local_primary` |
+| connection strings and pools | `common.db.node_conninfo`, `make_pool` |
+| every database call | `common.db.run_on`; treat `RegionUnreachableError` as "try again later" |
+| the events you move | `common.models`: `OutboxEvent` and the three payload models |
+| delivering a parked order, applying a menu version | `restaurantos.region.place_order` and `apply_menu_version` (WP1) |
+| loading your SQL | `common.sqlfiles.load_query("relay/<name>")`, files in `db/queries/relay/` |
+| settings | your own in `relay/config.py`: role, batch size, poll interval, local check interval |
+
 ## What to build
 
 ### 1. Outbox relay (region to HQ), one process per region
@@ -29,6 +41,10 @@ After a failover the new primary's outbox can hold rows the old relay already se
 
 If the process dies between steps 2 and 3, it resends the batch and HQ skips every event it already has.
 
+### The HQ worker: parts 2 and 3 in one process
+
+The next two workers run together in one process on the HQ side, called `hq-worker`. It is the same package started in its other role (`ROS_RELAY_ROLE=hq`, `ROS_CLIENT=hq`), with one task per region so that a region that is down does not hold up the others. It is its own process on purpose, not part of the coordinator or the gateway: a large drain after a partition must not share an event loop with heartbeats or with live requests, and test T3 must be able to kill it alone. It reaches the regions through the `hq__<node>` proxies and HQ's own database directly.
+
 ### 2. Holding-queue drainer (HQ to region)
 
 For each region, take undelivered `holding_queue` rows in order, call `region.place_order` on that region's primary (with the current epoch, and `received_at` from the queue row so the time spent parked is measured), then set `delivered_at` and `delivered_outcome`. Safe to repeat: the region's inbox drops duplicates. A refused order is still "delivered".
@@ -39,14 +55,41 @@ Reach the primary through `hq__<node>`, where `<node>` is `region_state.primary_
 
 When a new row appears in `menu_versions`, send each region its slice with `region.apply_menu_version` (through `hq__<node>` as above, with the current epoch) in one transaction, then record the version in `region_state`. If the connection resets halfway, the region's transaction rolls back and it keeps serving the old version; retry.
 
+## Run it on its own
+
+Needs the dev cluster (see "Running things" in `README.md` in this folder). The package runs in one of two roles, chosen by `ROS_RELAY_ROLE` in your own `relay/config.py`:
+
+```bash
+# part 1, once per region, region side
+ROS_RELAY_ROLE=region ROS_CLIENT=relay-r1 ROS_REGION_ID=r1 uv run python -m restaurantos.relay
+# parts 2 and 3 together, once, HQ side: the "hq-worker"
+ROS_RELAY_ROLE=hq ROS_CLIENT=hq uv run python -m restaurantos.relay
+```
+
+Watch the two ends while it runs (password `ros`):
+
+```bash
+psql -h 127.0.0.1 -p 5510 -U ros -d restaurantos -c "SELECT count(*) FROM outbox WHERE relayed_at IS NULL"
+psql -h 127.0.0.1 -p 5500 -U ros -d restaurantos -c "SELECT count(*) FROM hq_inbox"
+```
+
+Until WP1 fills the outbox, insert rows yourself: build the payload with `OrderCreatedPayload(...).model_dump_json()` so it has the real shape. To see a partition by hand, switch the link off, let a backlog build, and switch it on again:
+
+```bash
+curl -s -X POST 127.0.0.1:8474/proxies/relay-r1__hq-primary -d '{"enabled": false}'
+curl -s -X POST 127.0.0.1:8474/reset
+```
+
 ## Done when
 
-- After a replay and a drain, the HQ analytics copy has exactly the orders the regions have: same count, no duplicates.
-- Kill the relay at random points during a drain (test T3): the final counts are still right.
-- After a promotion in its region (T1 and T1b), the relay moves to the new primary without a restart and HQ receives the orders placed there.
-- After a region-to-HQ partition heals, the outbox empties upward and the holding queue empties downward.
-- A connection reset during menu publishing (test T6) leaves the region on a complete old or complete new version, never a mix.
-- Outbox backlog (count of rows with `relayed_at IS NULL`) is readable, for the admin page.
+What each line needs is marked in front of it (the marks are explained in `README.md` in this folder).
+
+- `data (needs WP1 and WP6a)` After a replay and a drain, the HQ analytics copy has exactly the orders the regions have: same count, no duplicates.
+- `cluster` Kill the relay at random points during a drain (test T3), and the HQ worker likewise: the final counts are still right.
+- `cluster (needs WP5, or promote by hand)` After a promotion in its region (T1 and T1b), the relay moves to the new primary without a restart and HQ receives the orders placed there.
+- `cluster` After a region-to-HQ partition heals, the outbox empties upward and the holding queue empties downward.
+- `cluster` A connection reset during menu publishing (test T6) leaves the region on a complete old or complete new version, never a mix.
+- `db` Outbox backlog (count of rows with `relayed_at IS NULL`) is readable, for the admin page.
 
 ## Watch out for
 

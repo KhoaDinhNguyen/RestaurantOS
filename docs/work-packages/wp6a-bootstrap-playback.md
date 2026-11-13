@@ -8,6 +8,18 @@
 
 **Needs:** WP0. Posting orders end to end needs WP2 (and WP1 behind it); until then, point playback at a stub server.
 
+## Shared code you must use
+
+| For | Use |
+| --- | --- |
+| everything about the cluster's shape | `common.cluster`: `load_cluster`, `proxies`, `toxiproxy_config`, `published_ports`, `host_port`, `service_port`, `primary_of`, `standby_of`, `BASELINE` |
+| connections for batch work (loads, sync) | `common.cluster.host_conninfo` with a plain `psycopg` connection, never `make_pool` |
+| the schema files | `common.sqlfiles.schema_files` |
+| simulated time | `common.simclock`: `SimClock`, `to_sim_seconds`, `from_sim_seconds` |
+| the order request you send | `common.models.OrderRequest` |
+| how to start each service | the table "How each service starts" in architecture Section 4 |
+| the dataset's files and columns | `docs/schema/data-dictionary.md` |
+
 ## What to build
 
 ### Toxiproxy client, proxy half: `sim/toxiproxy.py`
@@ -55,7 +67,7 @@ Data files are read from `ROS_DATA_DIR` (default `data/`). Check them against `M
 
 The Python services run in one of two modes (architecture Section 4). Host mode is the one to build now:
 
-- `rosctl up` starts, as child processes on the host with `ROS_NETWORK=host`: the gateway, the coordinator, and one relay and one edge API per region. `rosctl down` stops them. Each gets its own `ROS_CLIENT`, `ROS_MODE` and `ROS_REGION_ID`; HTTP ports come from `common.cluster.service_port`.
+- `rosctl up` starts, as child processes on the host with `ROS_NETWORK=host`: the gateway, the coordinator, the HQ worker, and one relay and one edge API per region. The commands and the settings each one needs are the table "How each service starts" in architecture Section 4; do not invent others. `rosctl down` stops them. Each gets its own `ROS_CLIENT`, `ROS_MODE` and `ROS_REGION_ID`; HTTP ports come from `common.cluster.service_port`.
 - Send each process's output to `runs/services/<name>.log`, and make `rosctl up <name>` start a single one, so that someone can run one service under a debugger and the rest normally.
 - Container mode comes later: when WP0 adds the image, the generator also writes one service entry per process into `infra/generated/compose.yaml`, with the same names, ports and environment and `ROS_NETWORK=compose`. Keep the list of services in one place in the generator so that both modes read it.
 
@@ -94,16 +106,31 @@ A plain-Python replay with no database: walk the same orders in the same order (
 
 The stock rules are WP1's `place_order` steps 3 to 7, with `amount` and `multiplier` read from the files, never assumed. The mini fixture must contain recipe rows with `amount` above 1, a unit other than `portion`, and products with `multiplier` above 1; the real dataset has amount 1 on every row, so it cannot catch a rule that forgets to multiply. The oracle does not need to model `product_availability`: a product is only switched off for stock when one of its counters is at zero, and an order for it would be refused on stock anyway.
 
+## Run it on its own
+
+`rosctl` is the entry point for everything here and runs on your machine. It needs Docker, and the dataset in `data/` for anything beyond the mini fixture.
+
+```bash
+uv run pytest tests/unit/sim          # the generator, the Toxiproxy client, the oracle: no Docker needed
+uv run rosctl bootstrap               # builds and loads the cluster
+uv run rosctl up                      # starts the services (once they exist)
+uv run rosctl playback --region r1 --target edge --sequential
+```
+
+**Build the mini fixture and a small loader for it first.** Every other package can only run against an empty database until it exists, so it unblocks more people than anything else in this brief. Playback can be developed against a stub HTTP server that answers `201` to every order, long before the gateway is ready.
+
 ## Done when
 
-- `rosctl bootstrap` on a clean machine gives a running, loaded cluster for 1, 2 and 3 regions, and leaves `git status` clean.
-- After bootstrap, `GET /proxies` on Toxiproxy lists exactly the proxies `common.cluster.proxies()` gives, all enabled.
-- Every vendor is in exactly one region; row counts match the manifest.
-- The same seed gives the same run log twice, including after a mid-run speed change.
-- A sequential single-region run matches the oracle exactly.
-- `rosctl up` brings up every service in host mode for 1 and 3 regions, and an order posted to the gateway lands in the right region.
-- After a run and `rosctl baseline sync`, each of the four tables has the same row count on the baseline as on the regions together, and the sync refuses to start while playback is running.
-- The mini fixture exists and the unit tests use it.
+What each line needs is marked in front of it (the marks are explained in `README.md` in this folder).
+
+- `data` `rosctl bootstrap` on a clean machine gives a running, loaded cluster for 1, 2 and 3 regions, and leaves `git status` clean.
+- `data` After bootstrap, `GET /proxies` on Toxiproxy lists exactly the proxies `common.cluster.proxies()` gives, all enabled.
+- `data` Every vendor is in exactly one region; row counts match the manifest.
+- `unit` The same seed gives the same run log twice, including after a mid-run speed change.
+- `data (needs WP1 and WP2)` A sequential single-region run matches the oracle exactly.
+- `data (needs every service)` `rosctl up` brings up every service in host mode for 1 and 3 regions, and an order posted to the gateway lands in the right region.
+- `data` After a run and `rosctl baseline sync`, each of the four tables has the same row count on the baseline as on the regions together, and the sync refuses to start while playback is running.
+- `unit` The mini fixture exists and the unit tests use it.
 
 ## Watch out for
 

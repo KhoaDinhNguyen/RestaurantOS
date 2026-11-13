@@ -8,6 +8,18 @@
 
 **Needs:** WP0 (tables and shared models). Nothing else: you can test against one plain PostgreSQL.
 
+## Shared code you must use
+
+| For | Use |
+| --- | --- |
+| request and result shapes | `common.models`: `OrderRequest`, `OrderResult`, `StatusResult`, `OrderStatus`, `RefusalReason` |
+| outbox rows | `common.models`: `OutboxEvent`, `OrderCreatedPayload`, `StatusChangedPayload`, `ExceptionLoggedPayload` |
+| the epoch check | the SQL function `assert_epoch` (in `db/region/`), called first in every transaction |
+| errors | `common.errors`: `StaleEpochError`, `UnknownVendorError` |
+| loading your SQL | `common.sqlfiles.load_query("region/<name>")`, files in `db/queries/region/` |
+
+You never open a connection or a pool: callers hand you one. They call you through `common.db.run_on`, which turns a `ROS01` error into `StaleEpochError` for them.
+
 ## What to build
 
 Five async functions (signatures in Section 5.2 of the architecture doc). Callers are the gateway, the edge API and the relay. They pass you an open connection and the epoch they believe is current. `place_order` also takes `received_at`, the wall-clock time the request first reached the system; store it on the order and put it in the `order.created` payload.
@@ -47,15 +59,27 @@ One transaction, in this order:
 
 `product_availability` holds a row only while a product is switched off, so `available` is `false` on every row you write. Readers (the menu, the nearby query) still test `available = false` rather than "a row exists".
 
+## Run it on its own
+
+There is no process to start. This package is a library that the gateway, the edge API and the relay call, and all it needs is one PostgreSQL.
+
+```bash
+uv run pytest tests/unit/region tests/integration/region
+```
+
+The integration tests need `ROS_TEST_DSN` (see "Running things" in `README.md` in this folder). Each test applies the region schema (`common.sqlfiles.schema_files("region")`, as `tests/integration/test_schema.py` does) and inserts the few rows it needs: a vendor, a product, its dish and recipe, and stock. Until WP6a's mini fixture exists, keep those rows in a fixture of your own, with an `amount` and a `multiplier` above 1.
+
 ## Done when
 
-- The same order sent twice produces one order, one stock change and one outbox row.
-- Two orders racing for the last of an ingredient: exactly one succeeds.
-- A dish whose recipe has `amount` 250 and a product with `multiplier` 2, ordered with quantity 3, takes 1,500 off the counter.
-- A stale epoch is rejected and changes nothing.
-- A refused order sent again is refused again, with no side effects.
-- A conflicting status change lands in `exception_log` and the first change stands.
-- Single-region sequential playback (WP6a) matches the counting oracle: orders stored, orders refused, final stock.
+What each line needs is marked in front of it (the marks are explained in `README.md` in this folder).
+
+- `db` The same order sent twice produces one order, one stock change and one outbox row.
+- `db` Two orders racing for the last of an ingredient: exactly one succeeds.
+- `db` A dish whose recipe has `amount` 250 and a product with `multiplier` 2, ordered with quantity 3, takes 1,500 off the counter.
+- `db` A stale epoch is rejected and changes nothing.
+- `db` A refused order sent again is refused again, with no side effects.
+- `db` A conflicting status change lands in `exception_log` and the first change stands.
+- `data (needs WP2 and WP6a)` Single-region sequential playback (WP6a) matches the counting oracle: orders stored, orders refused, final stock.
 
 ## Watch out for
 
