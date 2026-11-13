@@ -70,6 +70,33 @@ async def one(conn):
     return (await cur.fetchone())[0]
 
 
+class LoopWatch:
+    """Measures the longest time the event loop went without running a task.
+
+    A blocked loop is the failure this test exists for: one stuck call must
+    never stop every other request in the process.
+    """
+
+    def __init__(self):
+        self.longest = 0.0
+        self._task = None
+
+    async def _tick(self):
+        last = time.monotonic()
+        while True:
+            await asyncio.sleep(0.05)
+            now = time.monotonic()
+            self.longest = max(self.longest, now - last - 0.05)
+            last = now
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._tick())
+        return self
+
+    async def __aexit__(self, *exc):
+        self._task.cancel()
+
+
 @pytest.mark.parametrize("fault", [SILENCE, LATENCY], ids=["silence", "latency"])
 async def test_a_faulty_link_fails_at_the_deadline_and_recovers(toxiproxy, settings, fault):
     pool = make_pool(node_conninfo(load_cluster(), NODE, settings=settings), settings)
@@ -79,17 +106,17 @@ async def test_a_faulty_link_fails_at_the_deadline_and_recovers(toxiproxy, setti
 
         # The fault lands under a connection that is already open.
         add(toxiproxy, fault)
-        started = time.monotonic()
-        with pytest.raises(RegionUnreachableError):
-            await run_on(pool, one, region_id="r1", settings=settings)
-        waited = time.monotonic() - started
-        assert waited < DEADLINE_S + 0.5, f"gave up after {waited:.2f} s"
-
-        # A second caller is bounded as well, whatever state the pool is in.
-        started = time.monotonic()
-        with pytest.raises(RegionUnreachableError):
-            await run_on(pool, one, region_id="r1", settings=settings)
-        assert time.monotonic() - started < DEADLINE_S + 0.5
+        async with LoopWatch() as watch:
+            # Every caller is bounded, not only the first: the first one used
+            # to freeze the process for the callers behind it.
+            for attempt in (1, 2, 3):
+                started = time.monotonic()
+                with pytest.raises(RegionUnreachableError):
+                    await run_on(pool, one, region_id="r1", settings=settings)
+                waited = time.monotonic() - started
+                assert waited < DEADLINE_S + 0.5, f"call {attempt} gave up after {waited:.2f} s"
+            assert abandoned_calls() >= 1
+        assert watch.longest < 0.5, f"the event loop was blocked for {watch.longest:.2f} s"
 
         # Remove the fault: calls work again and nothing stays abandoned.
         for toxic in toxiproxy.get(f"/proxies/{PROXY}/toxics").json():

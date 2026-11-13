@@ -98,6 +98,13 @@ async def test_run_on_returns_the_value_and_commits(region_dsn):
         await pool.close()
 
 
+async def no_abandoned_calls(within=5.0):
+    until = time.monotonic() + within
+    while abandoned_calls() and time.monotonic() < until:
+        await asyncio.sleep(0.05)
+    return abandoned_calls() == 0
+
+
 async def test_run_on_gives_up_at_the_deadline_and_the_pool_recovers(dsn):
     s = settings(request_deadline_s=0.3, statement_timeout_ms=10_000)
     pool = make_pool(dsn, s)
@@ -106,19 +113,40 @@ async def test_run_on_gives_up_at_the_deadline_and_the_pool_recovers(dsn):
         started = time.monotonic()
         with pytest.raises(RegionUnreachableError) as caught:
             await run_on(
-                pool, lambda conn: conn.execute("SELECT pg_sleep(5)"), region_id="r1", settings=s
+                pool, lambda conn: conn.execute("SELECT pg_sleep(1)"), region_id="r1", settings=s
             )
-        assert time.monotonic() - started < 1.0
+        assert time.monotonic() - started < 0.8
         assert caught.value.region_id == "r1"
+        assert abandoned_calls() == 1
 
-        # The link is fine here, so the abandoned call is cancelled on the
-        # server and its connection comes back.
-        for _ in range(100):
-            if abandoned_calls() == 0:
-                break
-            await asyncio.sleep(0.05)
-        assert abandoned_calls() == 0
+        # The abandoned call is not cancelled: it runs to its end in the
+        # background, and then its connection comes back.
+        assert await no_abandoned_calls()
         assert await run_on(pool, one, settings=s) == 1
+    finally:
+        await pool.close()
+
+
+async def test_work_that_finishes_after_the_deadline_is_rolled_back(region_dsn):
+    s = settings(request_deadline_s=0.3)
+    pool = make_pool(region_dsn, s)
+    await pool.open(wait=True, timeout=10)
+
+    async def slow_write(conn):
+        await conn.execute("UPDATE node_state SET menu_version = 9")
+        await conn.execute("SELECT pg_sleep(1)")
+
+    async def read(conn):
+        cur = await conn.execute("SELECT menu_version FROM node_state")
+        return (await cur.fetchone())[0]
+
+    try:
+        before = await run_on(pool, read, settings=s)
+        with pytest.raises(RegionUnreachableError):
+            await run_on(pool, slow_write, settings=s)
+        assert await no_abandoned_calls()
+        # The caller was told "unreachable", so the late write must not appear.
+        assert await run_on(pool, read, settings=s) == before != 9
     finally:
         await pool.close()
 

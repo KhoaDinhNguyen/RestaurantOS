@@ -116,7 +116,11 @@ async def run_on[T](
     holds on a silent link too). Raises StaleEpochError for a stale epoch.
     Anything else `work` raises comes through unchanged.
 
-    After RegionUnreachableError the write may or may not have been committed.
+    A call that misses the deadline is left to finish in the background and is
+    then rolled back; it is never cancelled, because a cancellation delivered
+    into psycopg on a dead link can block the whole process (see
+    common.deadline). The rollback is best effort, so after
+    RegionUnreachableError the write may or may not have been committed.
     Retry only through something that is safe to repeat.
     """
     s = settings or get_settings()
