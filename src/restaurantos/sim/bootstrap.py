@@ -179,10 +179,11 @@ async def bootstrap(*, yes: bool = False, config: Path = Path("infra/cluster.tom
                 "VALUES (%s, %s, %s)",
                 (rid, primary_of(rid), standby_of(rid)),
             )
-        await hq.executemany(
-            "INSERT INTO shard_directory (geohash, region_id) VALUES (%s, %s)",
-            shards,
-        )
+        async with hq.cursor() as cur:
+            await cur.executemany(
+                "INSERT INTO shard_directory (geohash, region_id) VALUES (%s, %s)",
+                shards,
+            )
         await _load_reference(hq, data_dir, vendors=None)
     loaded.append(
         f"hq-primary: region_state {len(region_ids)}, shard_directory {len(shards)}, full reference"
