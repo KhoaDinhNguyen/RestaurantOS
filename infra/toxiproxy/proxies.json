@@ -24,6 +24,18 @@
     "enabled": true
   },
   {
+    "name": "gateway__hq-standby",
+    "listen": "0.0.0.0:21004",
+    "upstream": "hq-standby:5432",
+    "enabled": true
+  },
+  {
+    "name": "hq-primary__hq-standby",
+    "listen": "0.0.0.0:21005",
+    "upstream": "hq-standby:5432",
+    "enabled": true
+  },
+  {
     "name": "gateway__r1-primary",
     "listen": "0.0.0.0:21010",
     "upstream": "r1-primary:5432",
@@ -63,6 +75,24 @@
     "name": "r1-standby__r1-primary",
     "listen": "0.0.0.0:21016",
     "upstream": "r1-primary:5432",
+    "enabled": true
+  },
+  {
+    "name": "hq__r1-standby",
+    "listen": "0.0.0.0:21017",
+    "upstream": "r1-standby:5432",
+    "enabled": true
+  },
+  {
+    "name": "r1-primary__r1-standby",
+    "listen": "0.0.0.0:21018",
+    "upstream": "r1-standby:5432",
+    "enabled": true
+  },
+  {
+    "name": "relay-r1__hq-standby",
+    "listen": "0.0.0.0:21019",
+    "upstream": "hq-standby:5432",
     "enabled": true
   }
 ]

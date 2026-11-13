@@ -242,6 +242,9 @@ data/
 snapshots/
 runs/
 
+# Compose file and Toxiproxy proxy list written by `rosctl bootstrap`.
+infra/generated/
+
 # Node / frontend
 node_modules/
 frontend/coverage/

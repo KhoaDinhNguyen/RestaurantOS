@@ -1,9 +1,15 @@
 # Shape of the cluster. Everything else (node IDs, Toxiproxy proxies, ports,
 # link groups) is derived from this file by restaurantos.common.cluster.
 #
-# After changing it:  uv run python -m restaurantos.common.cluster --write
-# The committed infra/compose.yaml describes regions = 1. WP6a generates the
-# Compose services for more regions.
+# `rosctl bootstrap` reads this file and writes the cluster's Compose file and
+# proxy list to infra/generated/ (git-ignored). Change this file, run
+# bootstrap again; nothing else needs editing.
+#
+# The committed infra/compose.yaml and infra/toxiproxy/proxies.json are the
+# dev baseline for the values below as committed (regions = 1). If you change
+# the committed values, refresh the proxy list with
+#     uv run python -m restaurantos.common.cluster --write
+# and update infra/compose.yaml by hand; a unit test checks they still agree.
 
 [cluster]
 regions = 1          # r1 .. rN

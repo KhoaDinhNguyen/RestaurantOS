@@ -1,12 +1,16 @@
-# RestaurantOS base cluster: HQ + one region, each with a streaming standby,
-# and Toxiproxy in front of every database link.
+# RestaurantOS dev baseline: HQ + one region, each with a streaming standby,
+# and Toxiproxy in front of every database link. Databases only.
 #
 #   docker compose -f infra/compose.yaml up -d
 #   docker compose -f infra/compose.yaml down -v     # also deletes the data
 #
-# Matches infra/cluster.toml with regions = 1. WP6a generates the services for
-# more regions; the application services (gateway, coordinator, relay, edge,
-# control, web) are added by their work packages.
+# Written by hand, owned by WP0, and matches infra/cluster.toml as committed
+# (regions = 1). A real cluster of any size comes from `rosctl bootstrap`
+# (WP6a), which writes its own complete Compose file to infra/generated/ and
+# never edits this one. Do not add services here.
+#
+# Both files use the project name below, so they share container and volume
+# names: run one at a time, and `down -v` before switching.
 #
 # Passwords here are development defaults for a local simulation.
 
@@ -47,8 +51,27 @@ services:
     command: ["-host=0.0.0.0", "-config=/config/proxies.json"]
     volumes:
       - ./toxiproxy/proxies.json:/config/proxies.json:ro
+    # Published on 127.0.0.1 only: the API, and every proxy, so that services
+    # started on the host (ROS_NETWORK=host) take the same routes as services
+    # inside this network. The list is restaurantos.common.cluster.published_ports.
     ports:
-      - "8474:8474"
+      - "127.0.0.1:8474:8474"
+      - "127.0.0.1:21000:21000"
+      - "127.0.0.1:21001:21001"
+      - "127.0.0.1:21002:21002"
+      - "127.0.0.1:21003:21003"
+      - "127.0.0.1:21004:21004"
+      - "127.0.0.1:21005:21005"
+      - "127.0.0.1:21010:21010"
+      - "127.0.0.1:21011:21011"
+      - "127.0.0.1:21012:21012"
+      - "127.0.0.1:21013:21013"
+      - "127.0.0.1:21014:21014"
+      - "127.0.0.1:21015:21015"
+      - "127.0.0.1:21016:21016"
+      - "127.0.0.1:21017:21017"
+      - "127.0.0.1:21018:21018"
+      - "127.0.0.1:21019:21019"
 
   hq-primary:
     image: *pg-image
@@ -62,7 +85,7 @@ services:
       - ./postgres/init-primary.sh:/docker-entrypoint-initdb.d/10-init-primary.sh:ro
     healthcheck: *pg-health
     ports:
-      - "5500:5432"
+      - "127.0.0.1:5500:5432"
 
   hq-standby:
     image: *pg-image
@@ -83,7 +106,7 @@ services:
         condition: service_started
     healthcheck: *pg-health
     ports:
-      - "5501:5432"
+      - "127.0.0.1:5501:5432"
 
   r1-primary:
     image: *pg-image
@@ -98,7 +121,7 @@ services:
       - ./postgres/init-primary.sh:/docker-entrypoint-initdb.d/10-init-primary.sh:ro
     healthcheck: *pg-health
     ports:
-      - "5510:5432"
+      - "127.0.0.1:5510:5432"
 
   r1-standby:
     image: *pg-image
@@ -119,7 +142,7 @@ services:
         condition: service_started
     healthcheck: *pg-health
     ports:
-      - "5511:5432"
+      - "127.0.0.1:5511:5432"
 
 volumes:
   hq-primary-data:
