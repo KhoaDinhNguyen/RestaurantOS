@@ -87,17 +87,26 @@ SELECT create_day_partitions('order_items', 0, 90);
 
 -- Idempotency guard for order placement. One row per order ever seen,
 -- accepted or refused, so a retry gets the same answer with no side effects.
+-- order_day is the request's day on every row. An accepted row has an
+-- order_id and no refusal_reason; a refused row has a refusal_reason and no
+-- order_id. The reasons are restaurantos.common.models.RefusalReason.
 CREATE TABLE inbox (
     channel text NOT NULL,
     external_order_id text NOT NULL,
     outcome text NOT NULL CHECK (outcome IN ('accepted', 'refused')),
-    refusal_reason text,
+    refusal_reason text CHECK (
+        refusal_reason IN ('out_of_stock', 'unavailable', 'unknown_product')
+    ),
     order_day smallint,
     order_id uuid,
     first_seen_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (channel, external_order_id),
-    CHECK ((outcome = 'accepted') = (order_id IS NOT null))
+    CHECK ((outcome = 'accepted') = (order_id IS NOT null)),
+    CHECK ((outcome = 'refused') = (refusal_reason IS NOT null))
 );
+
+-- Refusals per day, for the regional summary. Small: refused rows only.
+CREATE INDEX inbox_refused_day_idx ON inbox (order_day) WHERE outcome = 'refused';
 
 -- Idempotency guard for status events.
 CREATE TABLE processed_events (
