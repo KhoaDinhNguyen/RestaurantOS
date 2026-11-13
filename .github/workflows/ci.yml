@@ -65,20 +65,35 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
-    # Skipped until the UI owners add frontend/package.json.
-    if: ${{ hashFiles('frontend/package.json') != '' }}
     defaults:
       run:
         working-directory: frontend
     steps:
       - uses: actions/checkout@v5
+      # Every later step is skipped until the UI owners add frontend/package.json.
+      # (hashFiles() is not available in a job-level `if`, so the check is a step.)
+      - name: Detect frontend project
+        id: detect
+        working-directory: .
+        run: |
+          if [ -f frontend/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-node@v5
+        if: steps.detect.outputs.present == 'true'
         with:
           node-version-file: frontend/.nvmrc
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
+        if: steps.detect.outputs.present == 'true'
       - run: npm run lint
+        if: steps.detect.outputs.present == 'true'
       - run: npx prettier --check .
+        if: steps.detect.outputs.present == 'true'
       - run: npm test -- --run
+        if: steps.detect.outputs.present == 'true'
       - run: npm run build
+        if: steps.detect.outputs.present == 'true'
