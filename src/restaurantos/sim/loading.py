@@ -68,7 +68,7 @@ def table_of(file_name: str) -> str:
     return file_name.removesuffix(".csv")
 
 
-def read_rows(path: Path, columns: tuple[str, ...]) -> Iterator[tuple[str, ...]]:
+def read_rows(path: Path, columns: tuple[str, ...]) -> Iterator[list[str]]:
     """Rows of one CSV as text tuples, its header checked against
     `columns` so a changed column order fails loudly, not subtly."""
     with path.open(newline="", encoding="utf-8") as f:
@@ -80,7 +80,7 @@ def read_rows(path: Path, columns: tuple[str, ...]) -> Iterator[tuple[str, ...]]
 
 
 def apply_null_rule(
-    table: str, columns: tuple[str, ...], rows: Sequence[tuple[object, ...]]
+    table: str, columns: tuple[str, ...], rows: Sequence[Sequence[object]]
 ) -> list[tuple[object, ...]]:
     """Empty means NULL, and only for the two columns rule 4 allows. An
     empty anywhere else is a broken file, so say so instead of storing ''."""
@@ -103,7 +103,7 @@ def apply_null_rule(
     return out
 
 
-def unit_conflicts(rows: Sequence[tuple[str, ...]]) -> set[str]:
+def unit_conflicts(rows: Sequence[Sequence[str]]) -> set[str]:
     """Ingredient names that appear with more than one unit (must never
     happen: a stock counter is kept in the ingredient's unit)."""
     units: dict[str, set[str]] = {}
@@ -112,15 +112,14 @@ def unit_conflicts(rows: Sequence[tuple[str, ...]]) -> set[str]:
     return {name for name, seen in units.items() if len(seen) > 1}
 
 
-def reference_rows(
-    data_dir: Path, *, vendors: frozenset[str] | None = None
-) -> dict[str, list[tuple[str, ...]]]:
-    """The six reference tables from a data directory. A vendor slice cuts
-    only the three tables a region really slices; the small reference
-    tables load in full either way."""
-    rows = {
-        name: list(read_rows(data_dir / name, REFERENCE_COLUMNS[name])) for name in REFERENCE_ORDER
-    }
+def slice_reference_rows(
+    rows: dict[str, list[list[str]]], vendors: frozenset[str] | None
+) -> dict[str, list[list[str]]]:
+    """Slice already-read reference rows to a vendor slice: `vendors` and
+    `products` keep the slice's rows, `product_dish` keeps the links of
+    those products, and the small reference tables stay whole. The same
+    rule for a re-read and for an in-memory slice, so the regions'
+    tables can be cut from one read."""
     if vendors is None:
         return rows
     products = [r for r in rows["products.csv"] if r[1] in vendors]
@@ -135,11 +134,23 @@ def reference_rows(
     }
 
 
+def reference_rows(
+    data_dir: Path, *, vendors: frozenset[str] | None = None
+) -> dict[str, list[list[str]]]:
+    """The six reference tables from a data directory. A vendor slice cuts
+    only the three tables a region really slices; the small reference
+    tables load in full either way."""
+    rows = {
+        name: list(read_rows(data_dir / name, REFERENCE_COLUMNS[name])) for name in REFERENCE_ORDER
+    }
+    return slice_reference_rows(rows, vendors)
+
+
 def copy_sync(
     conn: psycopg.Connection,
     table: str,
     columns: tuple[str, ...],
-    rows: Sequence[tuple[object, ...]],
+    rows: Sequence[Sequence[object]],
 ) -> int:
     if not rows:
         return 0
@@ -159,7 +170,7 @@ async def copy_async(
     conn: psycopg.AsyncConnection,
     table: str,
     columns: tuple[str, ...],
-    rows: Sequence[tuple[object, ...]],
+    rows: Sequence[Sequence[object]],
 ) -> int:
     if not rows:
         return 0
