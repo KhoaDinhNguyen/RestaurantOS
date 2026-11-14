@@ -1,12 +1,15 @@
 """rosctl bootstrap: turn an empty machine into a loaded cluster.
 
-The steps are the WP6a brief's, in its order: verify the data directory
-against MANIFEST.csv, generate infra/generated/, rebuild the Compose
-project from empty volumes, wait for every node to be healthy, sync
-Toxiproxy, write HQ's control rows, and load the data with
-`restaurantos.sim.loading`'s rules. Reference data goes to every node:
-HQ and baseline hold all of it, each region holds its own vendors and
-products plus full copies of the small tables. Stock comes from the
+The steps, in order: verify the data directory against MANIFEST.csv
+(every file bootstrap reads must be listed and verified), assign the
+shards, then ask about the existing volumes and tear the old cluster
+down — with the Compose file that is on disk, which may describe a
+shape with more regions than the one about to be built — and only then
+generate infra/generated/ and start it, wait for every node to be
+healthy, sync Toxiproxy, write HQ's control rows, and load the data
+with `restaurantos.sim.loading`'s rules. Reference data goes to every
+node: HQ and baseline hold all of it, each region holds its own vendors
+and products plus full copies of the small tables. Stock comes from the
 warm-up window only, and each region keeps counters only for its own
 vendors; the baseline keeps them all.
 
@@ -17,7 +20,9 @@ Toxiproxy, no statement timeout, never common.db.make_pool.
 Bootstrap always rebuilds from nothing (keeping state is what snapshots
 are for): it deletes the project's volumes, after asking, unless --yes
 was given. The prompt needs a terminal; without one, --yes is the only
-way forward.
+way forward. A failed teardown stops bootstrap before anything is
+generated or started, so the Compose file on disk never stops
+describing what is running.
 """
 
 from __future__ import annotations
@@ -56,17 +61,52 @@ from restaurantos.sim.stock import warm_up_stock
 from restaurantos.sim.toxiproxy import Toxiproxy
 
 COMPOSE_FILE = Path("infra/generated/compose.yaml")
+COMMITTED_COMPOSE = Path("infra/compose.yaml")
 PROJECT = "restaurantos"
 
 
-def _docker(*args: str, check: bool = True) -> subprocess.CompletedProcess:
-    command = ["docker", "compose", "-p", PROJECT, "-f", str(COMPOSE_FILE), *args]
+def _compose(*args: str, compose_file: Path = COMPOSE_FILE) -> subprocess.CompletedProcess:
+    command = ["docker", "compose", "-p", PROJECT, "-f", str(compose_file), *args]
     result = subprocess.run(command, capture_output=True, text=True)
-    if check and result.returncode != 0:
+    if result.returncode != 0:
         raise RuntimeError(
             f"{' '.join(command)} failed ({result.returncode}):\n{result.stdout}{result.stderr}"
         )
     return result
+
+
+def _teardown() -> None:
+    """Remove the running cluster and its volumes, with the Compose file
+    that is on disk right now.
+
+    The previously generated file goes first: switching from more
+    regions to fewer must remove the services and volumes that the new
+    file will not name, and only the old file still names them. The
+    committed dev baseline goes second: it shares the project name, so
+    without this an `up` after it would silently reuse its containers
+    and their stale volumes. A failure here stops bootstrap with the
+    captured stderr, before anything is generated or started.
+    """
+    for path in (COMPOSE_FILE, COMMITTED_COMPOSE):
+        if path.is_file():
+            _compose("down", "-v", "--remove-orphans", compose_file=path)
+
+
+def _rebuild(cluster: Cluster, *, yes: bool) -> bool:
+    """Prompt about the volumes, tear the old cluster down, write the new
+    Compose file and start it.
+
+    Returns False when the user refused. A teardown failure raises before
+    the generator runs, so the Compose file on disk keeps describing
+    what is actually running.
+    """
+    volumes = _existing_volumes()
+    if volumes and not yes and not _confirm_volume_deletion(volumes):
+        return False
+    _teardown()
+    generate(cluster, COMPOSE_FILE.parent)
+    _compose("up", "-d", "--wait")
+    return True
 
 
 def _existing_volumes() -> list[str]:
@@ -133,14 +173,9 @@ async def bootstrap(*, yes: bool = False, config: Path = Path("infra/cluster.tom
         f"region(s), {sum(counts.values())} vendors"
     )
 
-    generate(cluster, COMPOSE_FILE.parent)
-    print(f"wrote {COMPOSE_FILE} and infra/generated/proxies.json")
-
-    volumes = _existing_volumes()
-    if volumes and not yes and not _confirm_volume_deletion(volumes):
+    if not _rebuild(cluster, yes=yes):
         return 1
-    _docker("down", "-v", check=False)
-    _docker("up", "-d", "--wait")
+    print(f"wrote {COMPOSE_FILE} and infra/generated/proxies.json")
     print("every node is healthy")
 
     tox = Toxiproxy()

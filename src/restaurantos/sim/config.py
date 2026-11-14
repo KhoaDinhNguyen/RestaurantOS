@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from functools import cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,9 +18,12 @@ class SimSettings(BaseSettings):
 
     # Stock: measure usage on the first W days only; start every counter at
     # max(F, ceil(average daily usage x C)), which is also the par level.
-    stock_warm_up_days: int = 14
-    stock_cover_days: int = 7
-    stock_floor: int = 5
+    # The constraints are part of the contract: W=0 would mean "no warm-up
+    # window", and bootstrap builds the settings before it destroys
+    # anything, so a bad value fails before the volumes are deleted.
+    stock_warm_up_days: int = Field(default=14, gt=0)
+    stock_cover_days: int = Field(default=7, ge=0)
+    stock_floor: int = Field(default=5, ge=0)
 
 
 @cache

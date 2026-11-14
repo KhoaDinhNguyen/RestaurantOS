@@ -7,10 +7,35 @@ import io
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from restaurantos.sim.datacheck import DataCheckError, check_manifest
+from restaurantos.sim.config import SimSettings
+from restaurantos.sim.datacheck import (
+    REQUIRED_FILES,
+    DataCheckError,
+    check_manifest,
+)
+from restaurantos.sim.loading import REFERENCE_ORDER
 from restaurantos.sim.shard import assign_shards, vendor_counts
 from restaurantos.sim.stock import warm_up_stock
+
+# ---- stock settings ---------------------------------------------------------
+
+
+def test_zero_warm_up_days_is_rejected():
+    with pytest.raises(ValidationError):
+        SimSettings(stock_warm_up_days=0)
+
+
+def test_negative_cover_days_is_rejected():
+    with pytest.raises(ValidationError):
+        SimSettings(stock_cover_days=-1)
+
+
+def test_negative_floor_is_rejected():
+    with pytest.raises(ValidationError):
+        SimSettings(stock_floor=-1)
+
 
 # ---- shards -----------------------------------------------------------------
 
@@ -63,6 +88,23 @@ def test_no_vendors_is_an_error():
         assign_shards({}, ["r1"])
 
 
+def test_one_huge_cell_cannot_starve_the_last_regions():
+    # CodeRabbit's skew case: the greedy share closes every range after the
+    # big cell, so regions 2 and 3 would get nothing. The cut must also
+    # close when the cells left are exactly the regions left.
+    counts = {"w21z3": 1, "w21z6": 1, "w21z7": 100}
+    assigned = dict(assign_shards(counts, ["r1", "r2", "r3"]))
+    assert set(assigned.values()) == {"r1", "r2", "r3"}
+    assert assigned == {"w21z3": "r1", "w21z6": "r2", "w21z7": "r3"}
+
+
+def test_every_region_gets_at_least_one_cell():
+    counts = {"w21z2": 1, "w21z3": 1, "w21z5": 1, "w21z7": 97}
+    for regions in (["r1", "r2"], ["r1", "r2", "r3"], ["r1", "r2", "r3", "r4"]):
+        assigned = dict(assign_shards(counts, regions))
+        assert set(assigned.values()) == set(regions), regions
+
+
 # ---- manifest ---------------------------------------------------------------
 
 
@@ -83,12 +125,12 @@ def test_manifest_passes_on_matching_files(tmp_path):
     _write_data(
         tmp_path, {"vendors.csv": "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n"}
     )
-    assert check_manifest(tmp_path) == [("vendors.csv", 1)]
+    assert check_manifest(tmp_path, required=frozenset({"vendors.csv"})) == [("vendors.csv", 1)]
 
 
 def test_manifest_counts_rows_not_lines(tmp_path):
     _write_data(tmp_path, {"products.csv": 'product_id,vendor_id,name\np1,v1,"quoted\nnewline"\n'})
-    assert check_manifest(tmp_path) == [("products.csv", 1)]
+    assert check_manifest(tmp_path, required=frozenset({"products.csv"})) == [("products.csv", 1)]
 
 
 def test_manifest_rejects_a_wrong_hash(tmp_path):
@@ -115,6 +157,34 @@ def test_manifest_rejects_a_missing_file(tmp_path):
 def test_a_missing_manifest_is_named(tmp_path):
     with pytest.raises(DataCheckError, match="MANIFEST"):
         check_manifest(tmp_path)
+
+
+def test_a_required_file_left_out_of_the_manifest_is_rejected(tmp_path):
+    # every file on disk and verified, but the manifest does not mention
+    # one of the files bootstrap reads: it would load unchecked
+    _write_data(
+        tmp_path, {"vendors.csv": "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n"}
+    )
+    manifest = tmp_path / "MANIFEST.csv"
+    lines = manifest.read_text(encoding="utf-8").splitlines()
+    kept = [line for line in lines if "vendors" not in line]
+    manifest.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    with pytest.raises(DataCheckError, match="required files not listed.*vendors"):
+        check_manifest(tmp_path)
+
+
+def test_required_files_cover_everything_bootstrap_reads():
+    # the six reference tables (loading) plus the two order files that
+    # warm_up_stock measures usage from; if this fails, datacheck's
+    # required set has drifted from what the code reads
+    assert (
+        frozenset(REFERENCE_ORDER)
+        | {
+            "orders.csv",
+            "order_items.csv",
+        }
+        == REQUIRED_FILES
+    )
 
 
 # ---- warm-up stock ----------------------------------------------------------

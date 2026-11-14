@@ -12,9 +12,22 @@ import csv
 import hashlib
 from pathlib import Path
 
+from restaurantos.sim.loading import REFERENCE_ORDER
+
 MANIFEST_NAME = "MANIFEST.csv"
 MANIFEST_COLUMNS = ("file", "rows", "sha256")
 CHUNK = 1 << 20
+
+# Every dataset file bootstrap actually reads: the six reference tables
+# (sim/loading, which also feeds the HQ and baseline loads), plus the two
+# order files that warm_up_stock measures usage from (sim/stock). The
+# shard step reads vendors.csv, which is one of the six. A file that is
+# missing from MANIFEST.csv would otherwise load unchecked, so the check
+# refuses unless every required file is both listed and verified.
+REQUIRED_FILES: frozenset[str] = frozenset(REFERENCE_ORDER) | {
+    "orders.csv",
+    "order_items.csv",
+}
 
 
 class DataCheckError(RuntimeError):
@@ -34,8 +47,11 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def check_manifest(data_dir: Path) -> list[tuple[str, int]]:
-    """Verify every manifest entry against the files on disk.
+def check_manifest(
+    data_dir: Path, *, required: frozenset[str] = REQUIRED_FILES
+) -> list[tuple[str, int]]:
+    """Verify every manifest entry against the files on disk, and that
+    every file bootstrap reads is among the verified entries.
 
     Returns (file, rows) for each entry, so the caller can print the row
     counts it just verified. Raises DataCheckError naming every problem.
@@ -70,6 +86,9 @@ def check_manifest(data_dir: Path) -> list[tuple[str, int]]:
             if str(rows) != expected_rows:
                 problems.append(f"{name}: {rows} rows, expected {expected_rows}")
             checked.append((name, rows))
+    missing = required - {name for name, _ in checked}
+    if missing:
+        problems.append("required files not listed in the manifest: " + ", ".join(sorted(missing)))
     if problems:
         raise DataCheckError(
             f"the data directory does not match {MANIFEST_NAME}:\n  " + "\n  ".join(problems)
