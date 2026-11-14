@@ -262,3 +262,38 @@ def test_stock_never_used_counters_get_the_floor(tmp_path):
 def test_stock_covers_every_counter_a_vendor_needs(tmp_path):
     rows = warm_up_stock(_dataset(tmp_path), warm_days=14, cover_days=7, floor=5)
     assert len(rows) == 3  # beef, rice, d2 - and nothing for other vendors
+
+
+def test_a_none_dish_gets_no_counter_even_with_a_recipe(tmp_path):
+    # stock_mode is data, not a fallback: a `none` dish keeps no counter,
+    # even when it has recipe rows that per_ingredient would count
+    path = _dataset(tmp_path)
+    with (path / "dishes.csv").open("a", encoding="utf-8") as f:
+        f.write("d3,sauce,independent,none,1,1,x\n")
+    with (path / "ingredients.csv").open("a", encoding="utf-8") as f:
+        f.write("herbs,recipenlg\n")
+    with (path / "dish_ingredients.csv").open("a", encoding="utf-8") as f:
+        f.write("d3,herbs,1,portion\n")
+    with (path / "products.csv").open("a", encoding="utf-8") as f:
+        f.write("p3,v1,sauce,0.01,10\n")
+    with (path / "product_dish.csv").open("a", encoding="utf-8") as f:
+        f.write("p3,v1,d3,1,false\n")
+    with (path / "orders.csv").open("a", encoding="utf-8") as f:
+        f.write("o3,c3,v1,w21z7,2,1,12:00:00\n")
+    with (path / "order_items.csv").open("a", encoding="utf-8") as f:
+        f.write("o3,p3,4\n")
+    rows = warm_up_stock(path, warm_days=14, cover_days=7, floor=5)
+    items = {(kind, item) for _, kind, item, _, _ in rows}
+    assert ("dish", "d3") not in items  # none keeps no dish counter
+    assert ("ingredient", "herbs") not in items  # and no ingredient counters
+    assert ("dish", "d2") in items  # per_item still does
+
+
+def test_an_unknown_stock_mode_is_a_data_error(tmp_path):
+    path = _dataset(tmp_path)
+    with (path / "dishes.csv").open("r+", encoding="utf-8") as f:
+        content = f.read().replace("per_ingredient,1,1", "per_recipe,1,1")
+        f.seek(0)
+        f.write(content)
+    with pytest.raises(ValueError, match="d1: unknown stock_mode 'per_recipe'"):
+        warm_up_stock(path, warm_days=14, cover_days=7, floor=5)

@@ -74,6 +74,12 @@ def check_manifest(
         for row in reader:
             if not row:
                 continue
+            if len(row) != 3:
+                problems.append(
+                    f"line {reader.line_num}: {len(row)} fields, expected 3 "
+                    f"({'file, rows, sha256'}): {row}"
+                )
+                continue
             name, expected_rows, expected_hash = row
             path = data_dir / name
             if not path.is_file():
