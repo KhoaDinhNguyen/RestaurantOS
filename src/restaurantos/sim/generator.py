@@ -181,11 +181,20 @@ def compose_text(cluster: Cluster) -> str:
     return "\n".join(lines) + "\n"
 
 
-def generate(cluster: Cluster, out_dir: Path) -> tuple[Path, Path]:
-    """Write compose.yaml and proxies.json into out_dir, and return them."""
+def write_generated(out_dir: Path, compose: str, proxy_list: str) -> tuple[Path, Path]:
+    """Write pre-rendered text into out_dir, and return the file paths.
+
+    Bootstrap renders both files before it tears anything down, so that
+    a rendering failure leaves the old cluster untouched; this function
+    is called only after the teardown succeeded."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    compose = out_dir / "compose.yaml"
-    proxy_list = out_dir / "proxies.json"
-    compose.write_text(compose_text(cluster), encoding="utf-8")
-    proxy_list.write_text(toxiproxy_config(cluster), encoding="utf-8")
-    return compose, proxy_list
+    compose_path = out_dir / "compose.yaml"
+    proxy_path = out_dir / "proxies.json"
+    compose_path.write_text(compose, encoding="utf-8")
+    proxy_path.write_text(proxy_list, encoding="utf-8")
+    return compose_path, proxy_path
+
+
+def generate(cluster: Cluster, out_dir: Path) -> tuple[Path, Path]:
+    """Render for this cluster and write both files into out_dir."""
+    return write_generated(out_dir, compose_text(cluster), toxiproxy_config(cluster))
