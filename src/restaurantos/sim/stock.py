@@ -49,15 +49,33 @@ def warm_up_stock(
     for row in _dict_rows(data_dir, "dish_ingredients.csv"):
         recipe.setdefault(row["dish_id"], []).append((row["ingredient_id"], float(row["amount"])))
 
+    def counters_of(dish_id: str) -> list[tuple[tuple[str, str], float]]:
+        """((kind, item), factor) counters a dish needs under its stock_mode.
+
+        The data dictionary has three modes: per_ingredient keeps an
+        ingredient counter per recipe row (factor = the recipe amount),
+        per_item keeps one dish counter (factor 1), and none keeps no
+        counter at all — even when the dish has recipe rows. Any other
+        value is a data error, not something to guess about.
+        """
+        mode = stock_mode.get(dish_id)
+        if mode == "per_ingredient":
+            return [
+                (("ingredient", ingredient_id), amount)
+                for ingredient_id, amount in recipe.get(dish_id, ())
+            ]
+        if mode == "per_item":
+            return [(("dish", dish_id), 1.0)]
+        if mode == "none":
+            return []
+        raise ValueError(f"dish {dish_id}: unknown stock_mode {mode!r}")
+
     # Every counter a vendor's products can need, before any usage is seen.
     needed: set[tuple[str, str, str]] = set()
     for product_id, vendor_id in products.items():
         for dish_id, _ in links.get(product_id, ()):
-            if stock_mode.get(dish_id) == "per_item":
-                needed.add((vendor_id, "dish", dish_id))
-            else:
-                for ingredient_id, _ in recipe.get(dish_id, ()):
-                    needed.add((vendor_id, "ingredient", ingredient_id))
+            for (kind, item_id), _factor in counters_of(dish_id):
+                needed.add((vendor_id, kind, item_id))
 
     # Usage in the warm-up window: quantity x multiplier x amount, charged
     # to the vendor that took the order (the one whose stock it comes off).
@@ -75,13 +93,9 @@ def warm_up_stock(
                 continue
             quantity = float(item["quantity"])
             for dish_id, multiplier in links.get(item["product_id"], ()):
-                if stock_mode.get(dish_id) == "per_item":
-                    key = (vendor_id, "dish", dish_id)
-                    usage[key] = usage.get(key, 0.0) + quantity * multiplier
-                else:
-                    for ingredient_id, amount in recipe.get(dish_id, ()):
-                        key = (vendor_id, "ingredient", ingredient_id)
-                        usage[key] = usage.get(key, 0.0) + quantity * multiplier * amount
+                for (kind, item_id), factor in counters_of(dish_id):
+                    key = (vendor_id, kind, item_id)
+                    usage[key] = usage.get(key, 0.0) + quantity * multiplier * factor
 
     rows: list[tuple[str, str, str, int, int]] = []
     for vendor_id, item_kind, item_id in sorted(needed):

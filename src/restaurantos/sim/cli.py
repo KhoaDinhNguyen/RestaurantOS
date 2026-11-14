@@ -52,7 +52,14 @@ def app(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "bootstrap":
         from restaurantos.sim.bootstrap import bootstrap
+        from restaurantos.sim.datacheck import DataCheckError
 
-        return asyncio.run(bootstrap(yes=args.yes, config=args.config))
+        try:
+            return asyncio.run(bootstrap(yes=args.yes, config=args.config))
+        except (DataCheckError, RuntimeError, ValueError) as error:
+            # a failed data check, teardown or input validation: the user
+            # should see the message, not a traceback
+            print(f"rosctl bootstrap: {error}", file=sys.stderr)
+            return 1
     print(f"rosctl {args.command}: not built yet ({NOT_BUILT[args.command]})", file=sys.stderr)
     return 2
