@@ -30,9 +30,11 @@ def assign_shards(counts: dict[str, int], regions: Sequence[str]) -> list[tuple[
     vendor-count ranges: one range per region, contiguous in cell name.
 
     Greedy cut: walk the sorted cells and close a region's range once the
-    running total has passed that region's share of all vendors. The last
-    region takes whatever remains, so no vendor is dropped and no region
-    can end up empty while cells remain.
+    running total has passed that region's share of all vendors. A range
+    also closes when the cells still unassigned are exactly the regions
+    still to fill, so every region gets at least one cell even when the
+    running total has not reached its share yet. The last region takes
+    whatever remains, so no vendor is dropped either.
     """
     cells = sorted(counts)
     total = sum(counts.values())
@@ -46,9 +48,16 @@ def assign_shards(counts: dict[str, int], regions: Sequence[str]) -> list[tuple[
     out: list[tuple[str, str]] = []
     running = 0
     region = 0
-    for cell in cells:
+    for index, cell in enumerate(cells):
         out.append((cell, regions[region]))
         running += counts[cell]
-        if region < len(regions) - 1 and running >= shares[region]:
+        cells_left = len(cells) - index - 1
+        regions_left = len(regions) - region - 1
+        if region < len(regions) - 1 and (running >= shares[region] or cells_left == regions_left):
             region += 1
+    assigned = {rid for _, rid in out}
+    if assigned != set(regions):
+        raise RuntimeError(
+            f"shard assignment left {sorted(set(regions) - assigned)} empty; this is a bug"
+        )
     return out
