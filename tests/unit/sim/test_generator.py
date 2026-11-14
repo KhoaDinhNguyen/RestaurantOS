@@ -10,6 +10,8 @@ committed file: no YAML dependency, and a drifted line fails by name.
 import re
 from pathlib import Path
 
+import pytest
+
 from restaurantos.common.cluster import (
     BASELINE,
     Cluster,
@@ -132,6 +134,14 @@ def test_toxiproxy_publishes_the_api_and_every_proxy_port():
         block = service_block(compose_text(cluster), "toxiproxy")
         for port in sorted({8474, *(p.port for p in proxies(cluster))}):
             assert f'- "127.0.0.1:{port}:{port}"' in block, (regions, port)
+
+
+def test_synchronous_replication_is_refused_not_faked():
+    # nothing sets it today and the regions=1 output must match the
+    # committed (asynchronous) baseline; refuse loudly instead of writing
+    # a file that does not do what the cluster description says
+    with pytest.raises(NotImplementedError, match="synchronous"):
+        compose_text(Cluster(regions=1, synchronous=True))
 
 
 def test_generate_writes_both_files(tmp_path):

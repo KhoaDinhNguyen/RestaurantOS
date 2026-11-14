@@ -144,9 +144,14 @@ def copy_sync(
     if not rows:
         return 0
     column_list = ", ".join(columns)
-    with conn.cursor() as cur, cur.copy(f"COPY {table} ({column_list}) FROM STDIN") as copy:
-        for row in apply_null_rule(table, columns, rows):
-            copy.write_row(row)
+    with conn.cursor() as cur:
+        with cur.copy(f"COPY {table} ({column_list}) FROM STDIN") as copy:
+            for row in apply_null_rule(table, columns, rows):
+                copy.write_row(row)
+        if cur.rowcount != len(rows):
+            raise RuntimeError(
+                f"COPY {table}: the server took {cur.rowcount} rows, {len(rows)} were sent"
+            )
     return len(rows)
 
 
@@ -159,9 +164,14 @@ async def copy_async(
     if not rows:
         return 0
     column_list = ", ".join(columns)
-    async with conn.cursor() as cur, cur.copy(f"COPY {table} ({column_list}) FROM STDIN") as copy:
-        for row in apply_null_rule(table, columns, rows):
-            await copy.write_row(row)
+    async with conn.cursor() as cur:
+        async with cur.copy(f"COPY {table} ({column_list}) FROM STDIN") as copy:
+            for row in apply_null_rule(table, columns, rows):
+                await copy.write_row(row)
+        if cur.rowcount != len(rows):
+            raise RuntimeError(
+                f"COPY {table}: the server took {cur.rowcount} rows, {len(rows)} were sent"
+            )
     return len(rows)
 
 
