@@ -20,6 +20,7 @@ from restaurantos.gateway.directory import DirectoryCache, get_regions
 from restaurantos.gateway.menu import get_vendor_menu
 from restaurantos.gateway.orders import (
     get_order_status,
+    get_vendor_orders,
     order_response,
     order_status_code,
     park_order,
@@ -27,6 +28,7 @@ from restaurantos.gateway.orders import (
     queued_order_response,
 )
 from restaurantos.gateway.pools import RegionPools
+from restaurantos.gateway.summary import get_region_summary
 
 
 def create_app() -> FastAPI:
@@ -163,6 +165,59 @@ def create_app() -> FastAPI:
             vendor_id,
             order_id,
             route.region_id,
+        )
+
+    @app.get("/api/v1/vendors/{vendor_id}/orders")
+    async def vendor_orders(
+        vendor_id: str,
+        day: int,
+        request: Request,
+        status: str | None = None,
+    ):
+        route = request.app.state.directory.route_vendor(vendor_id)
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        return await get_vendor_orders(
+            pool,
+            vendor_id,
+            day,
+            status,
+            route.region_id,
+        )
+
+    @app.get("/api/v1/regions/{region_id}/summary")
+    async def region_summary(
+        region_id: str,
+        day: int,
+        request: Request,
+    ):
+        if region_id not in cluster.region_ids:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found"},
+            )
+
+        route = next(
+            (
+                route
+                for route in request.app.state.directory.cell_routes.values()
+                if route.region_id == region_id
+            ),
+            None,
+        )
+
+        if route is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found"},
+            )
+
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        return await get_region_summary(
+            pool,
+            region_id,
+            day,
         )
 
     @app.post("/api/v1/orders")

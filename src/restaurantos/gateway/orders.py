@@ -151,3 +151,45 @@ async def get_order_status(
         work,
         region_id=region_id,
     )
+
+
+async def get_vendor_orders(
+    pool: AsyncConnectionPool,
+    vendor_id: str,
+    day: int,
+    status: str | None,
+    region_id: str,
+) -> list[dict[str, object]]:
+    """Read one vendor's kitchen board from its owning region."""
+
+    async def work(conn: psycopg.AsyncConnection) -> list[dict[str, object]]:
+        cursor = await conn.execute(
+            load_query("gateway/get_vendor_orders"),
+            {
+                "vendor_id": vendor_id,
+                "day": day,
+                "status": status,
+            },
+        )
+        rows = await cursor.fetchall()
+
+        return [
+            {
+                "order_id": row[0],
+                "order_day": row[1],
+                "vendor_id": row[2],
+                "status": row[3],
+                "order_time": row[4],
+                "status_changed_at": row[5],
+                "menu_version": row[6],
+                "received_at": row[7],
+                "committed_at": row[8],
+            }
+            for row in rows
+        ]
+
+    return await run_on(
+        pool,
+        work,
+        region_id=region_id,
+    )
