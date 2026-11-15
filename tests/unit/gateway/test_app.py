@@ -1,3 +1,5 @@
+from unittest.mock import AsyncMock
+
 from fastapi.testclient import TestClient
 
 from restaurantos.gateway.app import create_app
@@ -87,3 +89,53 @@ def test_unknown_vendor_returns_404() -> None:
 
     assert response.status_code == 404
     assert response.json() == {"error": "not_found"}
+
+
+def test_vendor_menu(monkeypatch) -> None:
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    async def fake_get_vendor_menu(pool, vendor_id, region_id):
+        assert vendor_id == "v001"
+        assert region_id == "r1"
+
+        return [
+            {
+                "vendor_id": "v001",
+                "product_id": "p003",
+                "name": "Menu item 003",
+                "price_units": 2,
+                "menu_version": 1,
+                "reason": None,
+                "available": True,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.get_vendor_menu",
+        fake_get_vendor_menu,
+    )
+
+    app = create_app()
+
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.get("/api/v1/vendors/v001/menu")
+
+    assert response.status_code == 200
+    assert response.json()[0]["product_id"] == "p003"
+
+    region_pools.get.assert_awaited_once_with("r1-primary")

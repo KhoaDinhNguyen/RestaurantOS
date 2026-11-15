@@ -9,7 +9,9 @@ from restaurantos.common.cluster import HQ_PRIMARY, load_cluster
 from restaurantos.common.config import get_settings
 from restaurantos.common.db import make_pool, node_conninfo
 from restaurantos.common.errors import RegionUnreachableError, UnknownVendorError
-from restaurantos.gateway.directory import get_regions
+from restaurantos.gateway.directory import DirectoryCache, get_regions
+from restaurantos.gateway.menu import get_vendor_menu
+from restaurantos.gateway.pools import RegionPools
 
 
 def create_app() -> FastAPI:
@@ -19,6 +21,9 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        region_pools = RegionPools(cluster, settings)
+        app.state.region_pools = region_pools
+
         if settings.mode == "gateway":
             hq_pool = make_pool(
                 node_conninfo(cluster, HQ_PRIMARY, settings=settings),
@@ -27,10 +32,20 @@ def create_app() -> FastAPI:
             await hq_pool.open()
             app.state.hq_pool = hq_pool
 
-        yield
+            directory = DirectoryCache(
+                vendor_cells={},
+                cell_routes={},
+            )
+            await directory.refresh(hq_pool)
+            app.state.directory = directory
 
-        if settings.mode == "gateway":
-            await app.state.hq_pool.close()
+        try:
+            yield
+        finally:
+            if settings.mode == "gateway":
+                await app.state.hq_pool.close()
+
+            await region_pools.close()
 
     app = FastAPI(
         title="RestaurantOS Gateway",
@@ -73,6 +88,17 @@ def create_app() -> FastAPI:
     @app.get("/api/v1/regions")
     async def regions(request: Request):
         return await get_regions(request.app.state.hq_pool)
+
+    @app.get("/api/v1/vendors/{vendor_id}/menu")
+    async def vendor_menu(vendor_id: str, request: Request):
+        route = request.app.state.directory.route_vendor(vendor_id)
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        return await get_vendor_menu(
+            pool,
+            vendor_id,
+            route.region_id,
+        )
 
     return app
 
