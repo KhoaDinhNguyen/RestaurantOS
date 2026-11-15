@@ -7,7 +7,7 @@ from fastapi.responses import JSONResponse
 
 from restaurantos.common.cluster import HQ_PRIMARY, load_cluster
 from restaurantos.common.config import get_settings
-from restaurantos.common.db import make_pool, node_conninfo
+from restaurantos.common.db import make_pool, node_conninfo, probe_node
 from restaurantos.common.errors import RegionUnreachableError, UnknownVendorError
 from restaurantos.gateway.directory import DirectoryCache, get_regions
 from restaurantos.gateway.menu import get_vendor_menu
@@ -99,6 +99,32 @@ def create_app() -> FastAPI:
             vendor_id,
             route.region_id,
         )
+
+    @app.get("/internal/probe/{node_id}")
+    async def internal_probe(node_id: str):
+        if node_id not in cluster.nodes:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found"},
+            )
+
+        view = await probe_node(
+            node_id,
+            node_conninfo(
+                cluster,
+                node_id,
+                settings=settings,
+            ),
+            settings,
+        )
+
+        return {
+            "node_id": view.node,
+            "reachable": view.reachable,
+            "writable": view.writable,
+            "in_recovery": view.in_recovery,
+            "epoch": view.epoch,
+        }
 
     return app
 

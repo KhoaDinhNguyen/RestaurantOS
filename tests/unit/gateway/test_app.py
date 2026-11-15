@@ -139,3 +139,32 @@ def test_vendor_menu(monkeypatch) -> None:
     assert response.json()[0]["product_id"] == "p003"
 
     region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_internal_probe(monkeypatch) -> None:
+    from restaurantos.common.localnode import NodeView
+
+    async def fake_probe_node(node, conninfo, settings):
+        return NodeView(
+            node=node,
+            reachable=True,
+            in_recovery=False,
+            epoch=2,
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.probe_node",
+        fake_probe_node,
+    )
+
+    client = TestClient(create_app())
+    response = client.get("/internal/probe/r1-primary")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "node_id": "r1-primary",
+        "reachable": True,
+        "writable": True,
+        "in_recovery": False,
+        "epoch": 2,
+    }
