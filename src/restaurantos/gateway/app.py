@@ -1,6 +1,7 @@
 """FastAPI application for the RestaurantOS gateway and edge API."""
 
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -8,9 +9,21 @@ from fastapi.responses import JSONResponse
 from restaurantos.common.cluster import HQ_PRIMARY, load_cluster
 from restaurantos.common.config import get_settings
 from restaurantos.common.db import make_pool, node_conninfo, probe_node
-from restaurantos.common.errors import RegionUnreachableError, UnknownVendorError
+from restaurantos.common.errors import (
+    RegionUnreachableError,
+    StaleEpochError,
+    UnknownVendorError,
+)
+from restaurantos.common.models import OrderRequest
 from restaurantos.gateway.directory import DirectoryCache, get_regions
 from restaurantos.gateway.menu import get_vendor_menu
+from restaurantos.gateway.orders import (
+    order_response,
+    order_status_code,
+    park_order,
+    place_region_order,
+    queued_order_response,
+)
 from restaurantos.gateway.pools import RegionPools
 
 
@@ -81,6 +94,14 @@ def create_app() -> FastAPI:
             content={"error": "not_found"},
         )
 
+    def get_place_order():
+        place_order = getattr(app.state, "place_order", None)
+
+        if place_order is None:
+            raise RuntimeError("restaurantos.region.place_order is not available yet")
+
+        return place_order
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok", "mode": settings.mode}
@@ -125,6 +146,67 @@ def create_app() -> FastAPI:
             "in_recovery": view.in_recovery,
             "epoch": view.epoch,
         }
+
+    @app.post("/api/v1/orders")
+    async def create_order(order: OrderRequest, request: Request):
+        received_at = datetime.now(UTC)
+
+        route = request.app.state.directory.route_vendor(order.vendor_id)
+        pool = await request.app.state.region_pools.get(route.primary_node)
+        place_order = get_place_order()
+
+        try:
+            result = await place_region_order(
+                pool,
+                order,
+                route.region_id,
+                route.epoch,
+                received_at,
+                place_order,
+            )
+        except StaleEpochError:
+            await request.app.state.directory.refresh(request.app.state.hq_pool)
+
+            route = request.app.state.directory.route_vendor(order.vendor_id)
+            pool = await request.app.state.region_pools.get(route.primary_node)
+
+            result = await place_region_order(
+                pool,
+                order,
+                route.region_id,
+                route.epoch,
+                received_at,
+                place_order,
+            )
+        except RegionUnreachableError:
+            await park_order(
+                request.app.state.hq_pool,
+                order,
+                route.region_id,
+                received_at,
+            )
+
+            response = queued_order_response(
+                route.region_id,
+                received_at,
+            )
+
+            return JSONResponse(
+                status_code=202,
+                content=response.model_dump(mode="json"),
+            )
+
+        response = order_response(
+            result,
+            route.region_id,
+            received_at,
+            datetime.now(UTC),
+        )
+
+        return JSONResponse(
+            status_code=order_status_code(result),
+            content=response.model_dump(mode="json"),
+        )
 
     return app
 
