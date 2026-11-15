@@ -171,3 +171,44 @@ def test_queued_order_response() -> None:
     assert response.queued is True
     assert response.outcome is None
     assert response.committed_at is None
+
+
+async def test_get_order_status(monkeypatch) -> None:
+    order_id = uuid4()
+    changed_at = datetime(2026, 11, 15, 12, 1, tzinfo=UTC)
+    received_at = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
+    committed_at = datetime(2026, 11, 15, 12, 0, 1, tzinfo=UTC)
+
+    connection = AsyncMock()
+    cursor = AsyncMock()
+
+    cursor.fetchone.return_value = (
+        order_id,
+        14,
+        "v001",
+        "received",
+        changed_at,
+        1,
+        received_at,
+        committed_at,
+    )
+    connection.execute.return_value = cursor
+
+    async def fake_run_on(pool, work, **kwargs):
+        assert kwargs["region_id"] == "r1"
+        return await work(connection)
+
+    monkeypatch.setattr(orders, "run_on", fake_run_on)
+
+    result = await orders.get_order_status(
+        object(),
+        "v001",
+        order_id,
+        "r1",
+    )
+
+    assert result["order_id"] == order_id
+    assert result["vendor_id"] == "v001"
+    assert result["status"] == "received"
+    assert result["order_day"] == 14
+    assert result["menu_version"] == 1

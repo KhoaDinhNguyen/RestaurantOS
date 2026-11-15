@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from uuid import UUID
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -18,6 +19,7 @@ from restaurantos.common.models import OrderRequest
 from restaurantos.gateway.directory import DirectoryCache, get_regions
 from restaurantos.gateway.menu import get_vendor_menu
 from restaurantos.gateway.orders import (
+    get_order_status,
     order_response,
     order_status_code,
     park_order,
@@ -146,6 +148,22 @@ def create_app() -> FastAPI:
             "in_recovery": view.in_recovery,
             "epoch": view.epoch,
         }
+
+    @app.get("/api/v1/vendors/{vendor_id}/orders/{order_id}")
+    async def order_status(
+        vendor_id: str,
+        order_id: UUID,
+        request: Request,
+    ):
+        route = request.app.state.directory.route_vendor(vendor_id)
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        return await get_order_status(
+            pool,
+            vendor_id,
+            order_id,
+            route.region_id,
+        )
 
     @app.post("/api/v1/orders")
     async def create_order(order: OrderRequest, request: Request):

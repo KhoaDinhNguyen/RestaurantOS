@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from uuid import UUID
 
 import psycopg
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from restaurantos.common.db import run_on
+from restaurantos.common.errors import UnknownVendorError
 from restaurantos.common.models import (
     OrderOutcome,
     OrderRequest,
@@ -104,6 +106,45 @@ async def place_region_order(
             epoch,
             received_at=received_at,
         )
+
+    return await run_on(
+        pool,
+        work,
+        region_id=region_id,
+    )
+
+
+async def get_order_status(
+    pool: AsyncConnectionPool,
+    vendor_id: str,
+    order_id: UUID,
+    region_id: str,
+) -> dict[str, object]:
+    """Read an order's current status from its owning region."""
+
+    async def work(conn: psycopg.AsyncConnection) -> dict[str, object]:
+        cursor = await conn.execute(
+            load_query("gateway/get_order_status"),
+            {
+                "vendor_id": vendor_id,
+                "order_id": order_id,
+            },
+        )
+        row = await cursor.fetchone()
+
+        if row is None:
+            raise UnknownVendorError(f"unknown order {order_id}")
+
+        return {
+            "order_id": row[0],
+            "order_day": row[1],
+            "vendor_id": row[2],
+            "status": row[3],
+            "status_changed_at": row[4],
+            "menu_version": row[5],
+            "received_at": row[6],
+            "committed_at": row[7],
+        }
 
     return await run_on(
         pool,
