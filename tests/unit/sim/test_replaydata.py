@@ -182,8 +182,52 @@ def test_require_window_refuses_the_warm_up(tmp_path: Path) -> None:
         require_window(meta, from_day=13, to_day=20)
     with pytest.raises(ValueError, match="before from_day"):
         require_window(meta, from_day=14, to_day=13)
+    # past the last cached day the run would replay nothing (review B1)
+    with pytest.raises(ValueError, match="last cached day"):
+        require_window(meta, from_day=91, to_day=95)
     assert require_window(meta, from_day=14, to_day=20) == (14, 20)
     assert require_window(meta, from_day=14, to_day=None) == (14, meta.last_day)
+
+
+def test_ensure_cache_rebuilds_when_the_cache_file_is_gone(tmp_path: Path) -> None:
+    """A valid sidecar with a deleted cache is still stale (review B4)."""
+    orders = [
+        ["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"],
+        ["2", "c1", "v1", "w21z7", "3", 15, "12:00:00"],
+    ]
+    items = [["1", "p1", 1], ["2", "p1", 1]]
+    data = make_data_dir(tmp_path, orders, items)
+    meta = build_cache(data, warm_up_days=14)
+    assert meta.orders == 2
+
+    (data / "cached" / "orders-sorted.jsonl").unlink()
+    assert load_meta(data) is not None  # the sidecar survived
+    rebuilt = ensure_cache(data, warm_up_days=14)
+    assert rebuilt.orders == 2  # and the cache came back
+    assert [line["order_id"] for line in cache_lines(data)] == ["1", "2"]
+
+
+def test_failed_build_leaves_no_temp_files(tmp_path: Path, monkeypatch) -> None:
+    """A build that dies mid-write must not leave its temp files behind
+    (review B5: fixed names could let two builds mix into one cache)."""
+    from restaurantos.sim import replaydata as replaydata_module
+
+    orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
+    data = make_data_dir(tmp_path, orders, [["1", "p1", 1]])
+
+    def broken_write(out, conn):
+        out.touch()
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(replaydata_module, "_write_jsonl", broken_write)
+    with pytest.raises(RuntimeError, match="disk full"):
+        build_cache(data, warm_up_days=14)
+    leftovers = [p.name for p in (data / "cached").iterdir() if p.name != ".gitkeep"]
+    assert leftovers == [], f"temp files left behind: {leftovers}"
+    # and the cache is still buildable afterwards
+    monkeypatch.undo()
+    build_cache(data, warm_up_days=14, quiet=True)
+    assert [line["order_id"] for line in cache_lines(data)] == ["1"]
 
 
 def test_iter_orders_windows_the_stream(tmp_path: Path) -> None:

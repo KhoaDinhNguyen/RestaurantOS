@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -241,44 +242,54 @@ def build_cache(data_dir: Path, *, warm_up_days: int, quiet: bool = False) -> Ca
     manifest = _manifest_sha256(data_dir)
     cache_file, meta_path, cache_dir = cache_paths(data_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    sort_db = cache_dir / ".sort.db"
-    tmp_cache = cache_file.with_suffix(".jsonl.tmp")
-    tmp_meta = meta_path.with_suffix(".meta.json.tmp")
+    # Pid-suffixed temp names: two builds at once must not write the
+    # same temp files and install a mix of both under a valid sidecar.
+    pid = os.getpid()
+    sort_db = cache_dir / f".sort-{pid}.db"
+    tmp_cache = cache_file.with_name(f"{cache_file.name}.{pid}.tmp")
+    tmp_meta = meta_path.with_name(f"{meta_path.name}.{pid}.tmp")
 
     # a build that was interrupted leaves a half-written database
     # behind; every build starts from nothing
     sort_db.unlink(missing_ok=True)
-    conn = sqlite3.connect(sort_db)
     try:
-        conn.execute("PRAGMA journal_mode = OFF")
-        conn.execute("PRAGMA synchronous = OFF")
-        conn.execute(
-            "CREATE TABLE orders (order_id TEXT PRIMARY KEY, customer_id TEXT, "
-            "vendor_id TEXT, geohash TEXT, order_day INTEGER, order_time TEXT)"
-        )
-        conn.execute(
-            "CREATE TABLE items (seq INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT, "
-            "product_id TEXT, quantity INTEGER)"
-        )
-        _import_orders(conn, data_dir, warm_up_days)
-        _import_items(conn, data_dir)
-        orders, itemless, first_day, last_day = _write_jsonl(tmp_cache, conn)
-    finally:
-        conn.close()
-        sort_db.unlink(missing_ok=True)
+        conn = sqlite3.connect(sort_db)
+        try:
+            conn.execute("PRAGMA journal_mode = OFF")
+            conn.execute("PRAGMA synchronous = OFF")
+            conn.execute(
+                "CREATE TABLE orders (order_id TEXT PRIMARY KEY, customer_id TEXT, "
+                "vendor_id TEXT, geohash TEXT, order_day INTEGER, order_time TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE items (seq INTEGER PRIMARY KEY AUTOINCREMENT, order_id TEXT, "
+                "product_id TEXT, quantity INTEGER)"
+            )
+            _import_orders(conn, data_dir, warm_up_days)
+            _import_items(conn, data_dir)
+            orders, itemless, first_day, last_day = _write_jsonl(tmp_cache, conn)
+        finally:
+            conn.close()
+            sort_db.unlink(missing_ok=True)
 
-    meta = CacheMeta(
-        orders_sha256=manifest[ORDERS_FILE],
-        order_items_sha256=manifest[ITEMS_FILE],
-        warm_up_days=warm_up_days,
-        first_day=first_day,
-        last_day=last_day,
-        orders=orders,
-        itemless_orders=itemless,
-    )
-    tmp_meta.write_text(meta.to_json(), encoding="utf-8")
-    tmp_cache.replace(cache_file)
-    tmp_meta.replace(meta_path)
+        meta = CacheMeta(
+            orders_sha256=manifest[ORDERS_FILE],
+            order_items_sha256=manifest[ITEMS_FILE],
+            warm_up_days=warm_up_days,
+            first_day=first_day,
+            last_day=last_day,
+            orders=orders,
+            itemless_orders=itemless,
+        )
+        tmp_meta.write_text(meta.to_json(), encoding="utf-8")
+        tmp_cache.replace(cache_file)
+        tmp_meta.replace(meta_path)
+    except BaseException:
+        # a failed build must not leave temp files behind (renamed or
+        # not), or the next build could install a half-written cache
+        tmp_cache.unlink(missing_ok=True)
+        tmp_meta.unlink(missing_ok=True)
+        raise
     if not quiet:
         note = f" ({itemless} orders had no items and were dropped)" if itemless else ""
         print(
@@ -293,7 +304,13 @@ def ensure_cache(data_dir: Path, *, warm_up_days: int | None = None) -> CacheMet
     if warm_up_days is None:
         warm_up_days = _settings_warm_up_days()
     meta = load_meta(data_dir)
-    if meta is not None and meta.warm_up_days == warm_up_days and meta_is_current(data_dir, meta):
+    cache_file, _, _ = cache_paths(data_dir)
+    if (
+        meta is not None
+        and cache_file.is_file()  # a valid sidecar with a deleted cache is still stale
+        and meta.warm_up_days == warm_up_days
+        and meta_is_current(data_dir, meta)
+    ):
         return meta
     return build_cache(data_dir, warm_up_days=warm_up_days)
 
@@ -344,6 +361,11 @@ def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> tuple[
             f"from_day {from_day} is inside the warm-up window: days before "
             f"{max(meta.warm_up_days, meta.first_day)} set the starting stock "
             "and are never replayed"
+        )
+    if from_day > meta.last_day:
+        raise ValueError(
+            f"from_day {from_day} is after the last cached day ({meta.last_day}); "
+            "that run would replay nothing"
         )
     if to_day is not None and to_day < from_day:
         raise ValueError(f"to_day {to_day} is before from_day {from_day}")

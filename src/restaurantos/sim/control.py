@@ -33,7 +33,8 @@ class PlaybackCommand(BaseModel):
     to_day: int | None = Field(default=None, ge=0)
     speed: float | None = Field(default=None, gt=0)
     seed: int = 0
-    run_id: str | None = None
+    # one path component, no traversal; the engine checks it too
+    run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class PlaybackSpeed(BaseModel):

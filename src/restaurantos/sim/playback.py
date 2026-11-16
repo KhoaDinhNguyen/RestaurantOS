@@ -23,12 +23,20 @@ Wall time enters through a `WallClock` (protocol) so tests can drive
 the scheduler deterministically: the real one wraps `time.monotonic`
 and `asyncio.sleep`; a fake one resolves sleeps only when the test
 advances it.
+
+The run log's wall times (`wall_sent_at`, `wall_acked_at`) come from
+that clock: seconds since the run started, on the same monotonic scale
+the engine waited on. To compare them with the gateway's absolute
+timestamps: epoch time = meta["wall_start_epoch"] +
+(t - meta["wall_start_monotonic"]), both recorded by the same run.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import re
 import sys
 import time
 import traceback
@@ -45,6 +53,10 @@ from restaurantos.common.simclock import SECONDS_PER_DAY, SimClock, from_sim_sec
 # Re-check the clock at most this often during a long wait, so a speed
 # change is picked up within a slice instead of at the far deadline.
 WAIT_SLICE_S = 0.2
+
+# A run id names runs/<run_id>/; it comes from the CLI, the API, or a
+# default. One path component, no traversal.
+_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 IDLE = "idle"
 RUNNING = "running"
@@ -109,17 +121,20 @@ class RunLog:
             record = self._pending.pop(self._next)
             self._f.write(json.dumps(record, separators=(",", ":")) + "\n")
             self._next += 1
+        # push the buffer out too: the run log should survive a hard kill
+        self._f.flush()
 
     def close(self) -> None:
         # Drain guarantees every live send task added its record; a gap
-        # here is a bug, and the marker makes it visible in the file
-        # instead of silently shifting every later line.
+        # here is a bug. Write a placeholder line for the missing send
+        # so the gap is visible in the file, and leave the records that
+        # did complete unchanged.
         while self._pending:
-            seq = min(self._pending)
-            record = self._pending.pop(seq)
-            record.setdefault("error", "missing: the send task produced no result")
+            record = self._pending.pop(self._next, None)
+            if record is None:
+                record = {"seq": self._next, "error": "missing: the send task produced no result"}
             self._f.write(json.dumps(record, separators=(",", ":")) + "\n")
-            self._next = seq + 1
+            self._next += 1
         self._f.close()
 
 
@@ -128,6 +143,13 @@ class Playback:
 
     All methods run on the event loop the engine was started on; the
     control routes and the CLI call them from there.
+
+    Known seam, deliberately out of scope here (it belongs with the
+    snapshot work, which needs "pause and wait for in-flight" anyway):
+    the number of send tasks queued for a slot is not bounded
+    separately from the in-flight bound, and pause does not recall
+    sends already queued for a slot. Both only show when the target is
+    slower than the due rate.
     """
 
     def __init__(
@@ -142,6 +164,7 @@ class Playback:
         default_speed: float = 1000.0,
         wall: WallClock | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        window_check: Callable[[int, int | None], tuple[int, int | None]] | None = None,
     ) -> None:
         self._orders_fn = orders_fn
         self._orders_url = target_url.rstrip("/") + "/orders"
@@ -152,6 +175,9 @@ class Playback:
         self.default_speed = default_speed
         self._wall = wall or RealWallClock()
         self._transport = transport
+        # Refuses impossible replay windows for every caller (CLI and
+        # API alike); the CLI passes require_window bound to the cache.
+        self._window_check = window_check
 
         self._state = IDLE
         self._wake = asyncio.Event()
@@ -202,24 +228,27 @@ class Playback:
         # a finished run frees the slot: the control plane may start
         # another run on the same engine without restarting anything
         self._require(FINAL_STATES, "start a run")
-        self._simclock = SimClock(
-            start_sim_seconds=from_day * SECONDS_PER_DAY,
-            speed=speed,
-            wall=self._wall.now,
-            running=False,
-        )
+        if self._window_check is not None:
+            from_day, to_day = self._window_check(from_day, to_day)
+
+        # Validate and create everything BEFORE any engine state is
+        # reset: a bad or reused run id must leave the engine exactly
+        # as it was, not half-reset with the previous run's done
+        # signal cleared.
         self._run_id = run_id or default_run_id(seed)
-        self._seed = seed
-        self._from_day = from_day
-        self._to_day = to_day
-        self._sent = self._acked = self._parked = self._refused = self._failed = 0
-        self._slots = asyncio.Semaphore(self._inflight)
-        self._send_tasks.clear()
-        self._done.clear()
-        self._stream = self._orders_fn(from_day, to_day)
-        run_dir = self._runs_dir / self._run_id
+        if not _RUN_ID.fullmatch(self._run_id):
+            raise ValueError(
+                f"run_id {self._run_id!r} must be one path component: "
+                "letters, digits, '.', '_' or '-', 1 to 64 characters"
+            )
+        runs_root = self._runs_dir.resolve()
+        run_dir = (self._runs_dir / self._run_id).resolve()
+        if run_dir.parent != runs_root:
+            raise ValueError(f"run_id {self._run_id!r} must stay inside the runs directory")
+        if (run_dir / "orders.jsonl").exists():
+            raise ValueError(f"run {self._run_id!r} already exists; choose another run id")
         run_dir.mkdir(parents=True, exist_ok=True)
-        self._log = RunLog(run_dir / "orders.jsonl")
+        log = RunLog(run_dir / "orders.jsonl")
         meta = {
             "run_id": self._run_id,
             "seed": seed,
@@ -230,11 +259,28 @@ class Playback:
             "target_url": self._orders_url,
             "state_at_start": RUNNING,
             "wall_start_epoch": time.time(),
+            "wall_start_monotonic": self._wall.now(),
             **(meta_extra or {}),
         }
         (run_dir / "meta.json").write_text(
             json.dumps(meta, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
         )
+
+        self._simclock = SimClock(
+            start_sim_seconds=from_day * SECONDS_PER_DAY,
+            speed=speed,
+            wall=self._wall.now,
+            running=False,
+        )
+        self._seed = seed
+        self._from_day = from_day
+        self._to_day = to_day
+        self._sent = self._acked = self._parked = self._refused = self._failed = 0
+        self._slots = asyncio.Semaphore(self._inflight)
+        self._send_tasks.clear()
+        self._done.clear()
+        self._stream = self._orders_fn(from_day, to_day)
+        self._log = log
         self._client = httpx.AsyncClient(timeout=self._http_timeout_s, transport=self._transport)
         self._state = RUNNING
         self._simclock.start()
@@ -305,30 +351,64 @@ class Playback:
     # --- the run -----------------------------------------------------------
 
     async def _run(self) -> None:
-        assert self._stream is not None and self._log is not None and self._client is not None
+        # Cleanup touches only these locals, never self._*: if a start
+        # were ever allowed mid-cleanup, the finally block must not
+        # close a newer run's log, client or stream.
+        log, client, stream = self._log, self._client, self._stream
+        assert log is not None and client is not None and stream is not None
+        clock = self._simclock
         stopped = False
+        failed = False
         try:
             sim_start = self._from_day * SECONDS_PER_DAY
-            for seq, request in enumerate(self._stream):
+            for seq, request in enumerate(stream):
                 target = to_sim_seconds(request.order_day, request.order_time)
                 await self._wait_until(target)
                 if self._state == STOPPING:
                     stopped = True
                     break
                 self._dispatch(seq, request, target - sim_start)
+                # One loop turn per dispatch, even in a burst: sends and
+                # control requests must be able to run between the
+                # orders that are all due at once.
+                await asyncio.sleep(0)
         except Exception as error:  # noqa: BLE001 - the run must not die silently
             traceback.print_exc()
             print(f"playback run {self._run_id} failed: {error}", file=sys.stderr)
-            self._state = FAILED
+            failed = True
         finally:
-            await self._drain()
-            self._log.close()
-            await self._client.aclose()
-            stream_close = getattr(self._stream, "close", None)
+            # Each step is guarded: a cleanup error must not skip
+            # _done.set(), or stop() and wait_done() hang forever.
+            try:
+                await self._drain()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+                failed = True
+            try:
+                log.close()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+                failed = True
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
+                failed = True
+            stream_close = getattr(stream, "close", None)
             if stream_close is not None:
-                stream_close()
-            if self._state != FAILED:
-                self._state = STOPPED if stopped else DONE
+                try:
+                    stream_close()
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+                    failed = True
+            if clock is not None:
+                # freeze the reported clock: a finished run must not keep
+                # advancing simulated time
+                with contextlib.suppress(Exception):
+                    clock.pause()
+            # set only here, at the very end: earlier, and a start could
+            # slip in while this run is still cleaning up
+            self._state = FAILED if failed else (STOPPED if stopped else DONE)
             self._done.set()
 
     async def _wait_until(self, target_sim: float) -> None:
@@ -398,12 +478,15 @@ class Playback:
                     response = await self._client.post(
                         self._orders_url, json=request.model_dump(mode="json")
                     )
-                except httpx.HTTPError as error:
-                    record["error"] = type(error).__name__
-                else:
                     record["http_status"] = response.status_code
                     record.update(_response_fields(response))
                     self._count(response)
+                except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
+                    # httpx errors, bad URLs, anything: the line is still
+                    # written and the failure still counted, or the
+                    # reorder buffer would hold every later record hostage
+                    record["error"] = type(error).__name__
+                    self._failed += 1
         except asyncio.CancelledError:
             record["error"] = "cancelled"
             self._log.add(seq, record)

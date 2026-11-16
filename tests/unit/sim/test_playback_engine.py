@@ -343,7 +343,27 @@ async def test_transport_errors_are_logged_not_fatal(tmp_path: Path) -> None:
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="unreachable")
     await pb.wait_done()
     assert pb.status()["state"] == "done"
+    assert pb.status()["orders_failed"] == 3  # counted, not just logged
     assert [line["error"] for line in run_log_lines(tmp_path, pb)] == ["ConnectError"] * 3
+
+
+async def test_non_http_errors_are_logged_not_fatal(tmp_path: Path) -> None:
+    """Anything a send can raise - not only httpx.HTTPError - must end
+    up as the order's log line and in the failure count (review A2:
+    e.g. httpx.InvalidURL is not an HTTPError)."""
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise RuntimeError("boom")
+
+    orders = sample_orders(3)
+    pb = make_playback(orders, tmp_path, inflight=3, speed=1e9, transport=httpx.MockTransport(boom))
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="boom")
+    await pb.wait_done()
+    assert pb.status()["state"] == "done"
+    assert pb.status()["orders_failed"] == 3
+    lines = run_log_lines(tmp_path, pb)
+    assert [line["error"] for line in lines] == ["RuntimeError"] * 3
+    assert [line["seq"] for line in lines] == [0, 1, 2]  # no gap held the buffer hostage
 
 
 async def test_run_meta_is_written(tmp_path: Path) -> None:
@@ -363,26 +383,205 @@ async def test_run_meta_is_written(tmp_path: Path) -> None:
     assert meta["speed"] == 100.0
     assert meta["cache"] == {"warm_up_days": 14}
     assert meta["target_url"].endswith("/orders")
+    # B6: the monotonic baseline that maps wall_sent_at/wall_acked_at to
+    # absolute time (wall_start_epoch + (t - wall_start_monotonic))
+    assert meta["wall_start_monotonic"] == 0.0  # the fake clock starts at zero
 
 
 # --- RunLog -----------------------------------------------------------------
 
 
 def test_runlog_writes_in_sequence_order(tmp_path: Path) -> None:
+    """Out-of-order adds wait in the buffer until the gap in front of
+    them is filled (review A3: the old test never had anything
+    waiting)."""
     log = RunLog(tmp_path / "orders.jsonl")
     log.add(2, {"seq": 2})
-    log.add(0, {"seq": 0})
     log.add(1, {"seq": 1})
     log.flush()
-    assert (
-        not (tmp_path / "orders.jsonl").exists()
-        or (  # nothing written yet:
-            tmp_path / "orders.jsonl"
-        ).read_text()
-        == ""
-    )
-    log.close()
+    # both are waiting behind the missing seq 0; nothing was consumed
+    assert (tmp_path / "orders.jsonl").read_text() == ""
+    log.add(0, {"seq": 0})
+    log.flush()
     seqs = [
         json.loads(line)["seq"] for line in (tmp_path / "orders.jsonl").read_text().splitlines()
     ]
-    assert seqs == [0, 1, 2]
+    assert seqs == [0, 1, 2]  # the gap filled, all three consumed in order
+    log.close()
+    assert [
+        json.loads(line)["seq"] for line in (tmp_path / "orders.jsonl").read_text().splitlines()
+    ] == [0, 1, 2]
+
+
+def test_runlog_close_marks_only_the_missing_sends(tmp_path: Path) -> None:
+    """A gap gets a placeholder line; the records that did complete are
+    written unchanged, not relabelled as missing (review A3)."""
+    log = RunLog(tmp_path / "orders.jsonl")
+    log.add(0, {"seq": 0, "http_status": 201})
+    log.add(2, {"seq": 2, "http_status": 201})
+    log.close()
+    lines = [json.loads(line) for line in (tmp_path / "orders.jsonl").read_text().splitlines()]
+    assert [line["seq"] for line in lines] == [0, 1, 2]
+    assert lines[0]["http_status"] == 201 and "error" not in lines[0]
+    assert lines[1]["error"] == "missing: the send task produced no result"
+    assert lines[2]["http_status"] == 201 and "error" not in lines[2]
+
+
+# --- review round 1 ---------------------------------------------------------
+
+
+async def test_cleanup_failure_still_ends_the_run(tmp_path: Path, monkeypatch) -> None:
+    """A log whose close() raises must not hang stop()/wait_done() and
+    must end the run FAILED (review A1)."""
+    from restaurantos.sim import playback as playback_module
+
+    class FailingCloseLog(RunLog):
+        def close(self) -> None:
+            raise OSError("disk full")
+
+    monkeypatch.setattr(playback_module, "RunLog", FailingCloseLog)
+    orders = sample_orders(2)
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="badlog")
+    await drive(pb, clock)  # the run completes; its log then refuses to close
+    await asyncio.wait_for(pb.wait_done(), timeout=5)
+    assert pb.status()["state"] == "failed"
+
+
+async def test_failed_run_cannot_restart_until_cleanup_ends(tmp_path: Path) -> None:
+    """A stream that blows up mid-run leaves the state non-final while
+    the drain is still working; a start must be refused until cleanup
+    has finished, then allowed (review A1)."""
+
+    def orders_fn(a, b):
+        def generate():
+            yield make_order(14, 0, 0, 1, "1")
+            raise RuntimeError("corrupt cache")
+
+        return generate()
+
+    transport = CountingTransport(httpx.ASGITransport(app=make_stub_app(delay_seconds=0.2)))
+    pb = Playback(
+        orders_fn,
+        target_url="http://stub.test/api/v1",
+        inflight=4,
+        http_timeout_s=5.0,
+        drain_timeout_s=5.0,
+        runs_dir=tmp_path,
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="boom")
+    await settle()
+    # the send is still in flight; the run is not final yet
+    with pytest.raises(StateError):
+        await pb.start(seed=1, from_day=14, to_day=14, speed=1.0, run_id="too-early")
+    await asyncio.wait_for(pb.wait_done(), timeout=5)
+    assert pb.status()["state"] == "failed"
+    # cleanup is over: the slot is free again
+    await pb.start(seed=1, from_day=14, to_day=14, speed=1.0, run_id="after")
+    assert pb.status()["state"] == "running"
+
+
+async def test_run_id_is_rejected_unless_one_safe_component(tmp_path: Path) -> None:
+    """Traversal, separators, absolute paths and reused ids are refused,
+    without half-resetting the engine (review A4)."""
+    orders = sample_orders(2)
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock)
+
+    for bad in ("..", "a/b", "/tmp/evil", "x" * 65, ".hidden"):
+        with pytest.raises(ValueError):
+            await pb.start(seed=0, from_day=14, to_day=14, speed=1.0, run_id=bad)
+
+    # a valid run goes through, and its id cannot be reused
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="good")
+    await drive(pb, clock)
+    assert pb.status()["state"] == "done"
+    with pytest.raises(ValueError, match="already exists"):
+        await pb.start(seed=0, from_day=14, to_day=14, speed=1.0, run_id="good")
+    # the engine survived the refusals and still starts fresh runs
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="good2")
+    await drive(pb, clock)
+    assert pb.status()["state"] == "done"
+
+
+async def test_route_refuses_an_unsafe_run_id(tmp_path: Path) -> None:
+    """The API start path validates run ids too (review A4)."""
+    pb = make_playback(sample_orders(2), tmp_path, clock=FakeWallClock())
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        response = await client.post(
+            "/sim/playback",
+            json={"action": "start", "from_day": 14, "run_id": "../escape"},
+        )
+        # refused at the schema (the documented pattern) before the
+        # engine's own check even runs; either way it is a 422
+        assert response.status_code == 422
+        assert "run_id" in response.text
+        # and the engine is still usable
+        ok = await client.post(
+            "/sim/playback", json={"action": "start", "from_day": 14, "run_id": "fine"}
+        )
+        assert ok.status_code == 200
+        assert ok.json()["state"] == "running"
+
+
+async def test_window_check_refuses_api_starts(tmp_path: Path) -> None:
+    """The replay window is refused, never clamped, on the API path too
+    (review B1)."""
+    from restaurantos.sim.replaydata import CacheMeta, require_window
+
+    meta = CacheMeta(
+        orders_sha256="x",
+        order_items_sha256="y",
+        warm_up_days=14,
+        first_day=14,
+        last_day=90,
+        orders=10,
+        itemless_orders=0,
+    )
+    orders = sample_orders(3)
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders, tmp_path, clock=clock, window_check=lambda f, t: require_window(meta, f, t)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        # into the warm-up window: 422
+        response = await client.post("/sim/playback", json={"action": "start", "from_day": 0})
+        assert response.status_code == 422
+        assert "warm-up" in response.json()["detail"]
+        # past the last cached day: 422 as well
+        response = await client.post("/sim/playback", json={"action": "start", "from_day": 95})
+        assert response.status_code == 422
+        assert "last cached day" in response.json()["detail"]
+        # a valid window still starts
+        ok = await client.post("/sim/playback", json={"action": "start", "from_day": 14})
+        assert ok.status_code == 200
+        await drive(pb, clock)
+        assert pb.status()["state"] == "done"
+
+
+async def test_pause_is_honoured_during_a_burst(tmp_path: Path) -> None:
+    """When a whole burst is due at once, the dispatcher must yield
+    between orders so a pause actually lands mid-burst (review B3).
+    Before the fix, all 100 were dispatched in one unbroken run and the
+    pause request could not be processed until after."""
+    orders = [make_order(14, 0, 0, 0, str(1_000 + i)) for i in range(100)]
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, inflight=100)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        await client.post("/sim/playback", json={"action": "start", "from_day": 14})
+        await settle()
+        await client.post("/sim/playback", json={"action": "pause"})
+        sent = pb.status()["orders_sent"]
+        assert sent < len(orders), "pause did not land until the whole burst was dispatched"
+        await client.post("/sim/playback", json={"action": "resume"})
+        await drive(pb, clock)
+        assert pb.status()["state"] == "done"
+        assert pb.status()["orders_sent"] == len(orders)

@@ -69,6 +69,40 @@ def test_speed_must_be_positive(capsys):
     assert "positive" in capsys.readouterr().err
 
 
+def test_stop_gets_a_timeout_that_outlives_the_drain(fresh_settings):
+    """`stop` waits for the server's drain (up to the drain timeout)
+    before answering; the request must not time out first (review B2)."""
+    from restaurantos.sim.config import get_sim_settings
+    from restaurantos.sim.playback_cli import _control_timeout_s
+
+    sim = get_sim_settings()
+    assert sim.playback_drain_timeout_s == 30.0
+    assert _control_timeout_s(sim, stop=True) == 30.0 + 5.0 + 5.0
+    assert _control_timeout_s(sim) == sim.http_timeout_s
+
+
+async def test_status_reports_http_errors_as_messages(capsys, monkeypatch):
+    """A slow or broken control server is a message, not a traceback
+    (review B2: status only caught ConnectError)."""
+    import httpx
+
+    from restaurantos.sim import playback_cli
+
+    class NoServer:
+        def __init__(self, timeout=None):
+            raise httpx.ReadTimeout("server too slow", request=None)
+
+    monkeypatch.setattr(playback_cli.httpx, "AsyncClient", NoServer)
+    import argparse
+
+    from restaurantos.sim.playback_cli import status_command
+
+    args = argparse.Namespace(port=1)
+    rc = await status_command(args)
+    assert rc == 1
+    assert "rosctl playback status:" in capsys.readouterr().err
+
+
 def test_build_cache_reports_a_missing_manifest(tmp_path, capsys, monkeypatch, fresh_settings):
     monkeypatch.setenv("ROS_DATA_DIR", str(tmp_path / "empty"))
     rc = app(["playback", "build-cache"])

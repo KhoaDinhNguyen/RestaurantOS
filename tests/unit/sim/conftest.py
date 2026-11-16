@@ -129,6 +129,8 @@ def make_playback(
     speed: float = 1000.0,
     transport: httpx.AsyncBaseTransport | None = None,
     from_day: int = 14,
+    drain_timeout_s: float = 5.0,
+    window_check=None,
 ) -> Playback:
     """An engine over a fixed order list, posting to an in-process stub."""
     if transport is None:
@@ -138,11 +140,12 @@ def make_playback(
         target_url="http://stub.test/api/v1",
         inflight=inflight,
         http_timeout_s=5.0,
-        drain_timeout_s=5.0,
+        drain_timeout_s=drain_timeout_s,
         runs_dir=runs_dir,
         default_speed=speed,
         wall=clock,
         transport=transport,
+        window_check=window_check,
     )
 
 

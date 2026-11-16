@@ -74,6 +74,8 @@ async def start_command(args: argparse.Namespace) -> int:
         drain_timeout_s=sim.playback_drain_timeout_s,
         runs_dir=Path("runs"),
         default_speed=sim.playback_speed,
+        # the window is refused, never clamped, for API starts as well
+        window_check=lambda f, t: require_window(meta, f, t),
     )
 
     from restaurantos.sim.control import make_control_app
@@ -159,12 +161,22 @@ def _control_url(args: argparse.Namespace, sim: SimSettings) -> str:
     return f"http://{host}:{port}"
 
 
+def _control_timeout_s(sim: SimSettings, *, stop: bool = False) -> float:
+    """A stop request outlives the server's drain, which can wait the
+    full drain timeout before answering; everything else uses the plain
+    HTTP timeout."""
+    if stop:
+        return sim.playback_drain_timeout_s + sim.http_timeout_s + 5.0
+    return sim.http_timeout_s
+
+
 async def control_command(args: argparse.Namespace, *, method: str, body: dict[str, Any]) -> int:
     sim = get_sim_settings()
     url = _control_url(args, sim)
     command = getattr(args, "play_command", None)
+    stop = method == "POST" and body.get("action") == "stop"
     try:
-        async with httpx.AsyncClient(timeout=sim.http_timeout_s) as client:
+        async with httpx.AsyncClient(timeout=_control_timeout_s(sim, stop=stop)) as client:
             if method == "POST":
                 response = await client.post(f"{url}/sim/playback", json=body)
             else:
@@ -193,7 +205,9 @@ async def status_command(args: argparse.Namespace) -> int:
     sim = get_sim_settings()
     url = _control_url(args, sim)
     try:
-        async with httpx.AsyncClient(timeout=sim.http_timeout_s) as client:
+        async with httpx.AsyncClient(
+            timeout=_control_timeout_s(sim)  # a slow answer is a message, not a traceback
+        ) as client:
             response = await client.get(f"{url}/sim/playback")
             clock = await client.get(f"{url}/sim/clock")
     except httpx.ConnectError:
@@ -202,6 +216,9 @@ async def status_command(args: argparse.Namespace) -> int:
             "is a run live (`rosctl playback start`)?",
             file=sys.stderr,
         )
+        return 1
+    except httpx.HTTPError as error:
+        print(f"rosctl playback status: {error}", file=sys.stderr)
         return 1
     body = {"clock": clock.json(), "playback": response.json()}
     print(json.dumps(body, indent=2, sort_keys=True))
