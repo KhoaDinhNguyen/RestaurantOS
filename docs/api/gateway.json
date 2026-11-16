@@ -28,6 +28,47 @@
         }
       }
     },
+    "/internal/probe/{node_id}": {
+      "get": {
+        "summary": "Internal Probe",
+        "operationId": "internal_probe_internal_probe__node_id__get",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Node Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Internal Probe Internal Probe  Node Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/regions": {
       "get": {
         "summary": "Regions",
@@ -37,7 +78,14 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array",
+                  "title": "Response Regions Api V1 Regions Get"
+                }
               }
             }
           }
@@ -64,44 +112,14 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Vendor Menu Api V1 Vendors  Vendor Id  Menu Get"
                 }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/internal/probe/{node_id}": {
-      "get": {
-        "summary": "Internal Probe",
-        "operationId": "internal_probe_internal_probe__node_id__get",
-        "parameters": [
-          {
-            "name": "node_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Node Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
               }
             }
           },
@@ -148,7 +166,11 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Order Status Api V1 Vendors  Vendor Id  Orders  Order Id  Get"
+                }
               }
             }
           },
@@ -210,7 +232,14 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": true
+                  },
+                  "title": "Response Vendor Orders Api V1 Vendors  Vendor Id  Orders Get"
+                }
               }
             }
           },
@@ -256,7 +285,11 @@
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Region Summary Api V1 Regions  Region Id  Summary Get"
+                }
               }
             }
           },
@@ -288,11 +321,43 @@
           "required": true
         },
         "responses": {
-          "200": {
+          "201": {
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Duplicate order; same result as the original request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Region unreachable; order parked in the HQ holding queue.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Order refused.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
               }
             }
           },
@@ -345,6 +410,14 @@
           "quantity"
         ],
         "title": "OrderItemIn"
+      },
+      "OrderOutcome": {
+        "type": "string",
+        "enum": [
+          "accepted",
+          "refused"
+        ],
+        "title": "OrderOutcome"
       },
       "OrderRequest": {
         "properties": {
@@ -417,6 +490,140 @@
         ],
         "title": "OrderRequest",
         "description": "Body of POST /orders. order_day and order_time are simulated time."
+      },
+      "OrderResponse": {
+        "properties": {
+          "outcome": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OrderOutcome"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "duplicate": {
+            "type": "boolean",
+            "title": "Duplicate",
+            "default": false
+          },
+          "order_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Id"
+          },
+          "order_day": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Order Day"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OrderStatus"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "menu_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Menu Version"
+          },
+          "committed_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Committed At"
+          },
+          "refusal_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RefusalReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "queued": {
+            "type": "boolean",
+            "title": "Queued",
+            "default": false
+          },
+          "region_id": {
+            "type": "string",
+            "title": "Region Id"
+          },
+          "received_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Received At"
+          },
+          "acked_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Acked At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "region_id",
+          "received_at",
+          "acked_at"
+        ],
+        "title": "OrderResponse",
+        "description": "What POST /orders returns: the region's result plus gateway facts.\n\nqueued=True means the region was unreachable and the order is parked in\nHQ's holding queue; outcome is then not known yet."
+      },
+      "OrderStatus": {
+        "type": "string",
+        "enum": [
+          "received",
+          "accepted",
+          "preparing",
+          "ready",
+          "picked_up",
+          "canceled"
+        ],
+        "title": "OrderStatus"
+      },
+      "RefusalReason": {
+        "type": "string",
+        "enum": [
+          "out_of_stock",
+          "unavailable",
+          "unknown_product"
+        ],
+        "title": "RefusalReason"
       },
       "ValidationError": {
         "properties": {

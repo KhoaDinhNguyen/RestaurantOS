@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from restaurantos.common.cluster import HQ_PRIMARY, load_cluster
@@ -15,7 +15,7 @@ from restaurantos.common.errors import (
     StaleEpochError,
     UnknownVendorError,
 )
-from restaurantos.common.models import OrderRequest
+from restaurantos.common.models import OrderRequest, OrderResponse
 from restaurantos.gateway.directory import DirectoryCache, get_regions
 from restaurantos.gateway.menu import get_vendor_menu
 from restaurantos.gateway.orders import (
@@ -52,6 +52,7 @@ def create_app() -> FastAPI:
             directory = DirectoryCache(
                 vendor_cells={},
                 cell_routes={},
+                region_routes={},
             )
             await directory.refresh(hq_pool)
             app.state.directory = directory
@@ -74,6 +75,8 @@ def create_app() -> FastAPI:
         ),
         lifespan=lifespan,
     )
+
+    gateway = APIRouter(prefix="/api/v1")
 
     @app.exception_handler(RegionUnreachableError)
     async def region_unreachable_handler(
@@ -110,12 +113,15 @@ def create_app() -> FastAPI:
     async def health() -> dict[str, str]:
         return {"status": "ok", "mode": settings.mode}
 
-    @app.get("/api/v1/regions")
-    async def regions(request: Request):
+    @gateway.get("/regions")
+    async def regions(request: Request) -> list[dict[str, object]]:
         return await get_regions(request.app.state.hq_pool)
 
-    @app.get("/api/v1/vendors/{vendor_id}/menu")
-    async def vendor_menu(vendor_id: str, request: Request):
+    @gateway.get("/vendors/{vendor_id}/menu")
+    async def vendor_menu(
+        vendor_id: str,
+        request: Request,
+    ) -> list[dict[str, object]]:
         route = request.app.state.directory.route_vendor(vendor_id)
         pool = await request.app.state.region_pools.get(route.primary_node)
 
@@ -126,7 +132,7 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/internal/probe/{node_id}")
-    async def internal_probe(node_id: str):
+    async def internal_probe(node_id: str) -> dict[str, object]:
         if node_id not in cluster.nodes:
             return JSONResponse(
                 status_code=404,
@@ -151,12 +157,12 @@ def create_app() -> FastAPI:
             "epoch": view.epoch,
         }
 
-    @app.get("/api/v1/vendors/{vendor_id}/orders/{order_id}")
+    @gateway.get("/vendors/{vendor_id}/orders/{order_id}")
     async def order_status(
         vendor_id: str,
         order_id: UUID,
         request: Request,
-    ):
+    ) -> dict[str, object]:
         route = request.app.state.directory.route_vendor(vendor_id)
         pool = await request.app.state.region_pools.get(route.primary_node)
 
@@ -167,13 +173,13 @@ def create_app() -> FastAPI:
             route.region_id,
         )
 
-    @app.get("/api/v1/vendors/{vendor_id}/orders")
+    @gateway.get("/vendors/{vendor_id}/orders")
     async def vendor_orders(
         vendor_id: str,
         day: int,
         request: Request,
         status: str | None = None,
-    ):
+    ) -> list[dict[str, object]]:
         route = request.app.state.directory.route_vendor(vendor_id)
         pool = await request.app.state.region_pools.get(route.primary_node)
 
@@ -185,26 +191,19 @@ def create_app() -> FastAPI:
             route.region_id,
         )
 
-    @app.get("/api/v1/regions/{region_id}/summary")
+    @gateway.get("/regions/{region_id}/summary")
     async def region_summary(
         region_id: str,
         day: int,
         request: Request,
-    ):
+    ) -> dict[str, object]:
         if region_id not in cluster.region_ids:
             return JSONResponse(
                 status_code=404,
                 content={"error": "not_found"},
             )
 
-        route = next(
-            (
-                route
-                for route in request.app.state.directory.cell_routes.values()
-                if route.region_id == region_id
-            ),
-            None,
-        )
+        route = request.app.state.directory.region_routes.get(region_id)
 
         if route is None:
             return JSONResponse(
@@ -220,8 +219,29 @@ def create_app() -> FastAPI:
             day,
         )
 
-    @app.post("/api/v1/orders")
-    async def create_order(order: OrderRequest, request: Request):
+    @gateway.post(
+        "/orders",
+        response_model=OrderResponse,
+        status_code=201,
+        responses={
+            200: {
+                "model": OrderResponse,
+                "description": "Duplicate order; same result as the original request.",
+            },
+            202: {
+                "model": OrderResponse,
+                "description": "Region unreachable; order parked in the HQ holding queue.",
+            },
+            409: {
+                "model": OrderResponse,
+                "description": "Order refused.",
+            },
+        },
+    )
+    async def create_order(
+        order: OrderRequest,
+        request: Request,
+    ) -> OrderResponse:
         received_at = datetime.now(UTC)
 
         route = request.app.state.directory.route_vendor(order.vendor_id)
@@ -229,28 +249,29 @@ def create_app() -> FastAPI:
         place_order = get_place_order()
 
         try:
-            result = await place_region_order(
-                pool,
-                order,
-                route.region_id,
-                route.epoch,
-                received_at,
-                place_order,
-            )
-        except StaleEpochError:
-            await request.app.state.directory.refresh(request.app.state.hq_pool)
+            try:
+                result = await place_region_order(
+                    pool,
+                    order,
+                    route.region_id,
+                    route.epoch,
+                    received_at,
+                    place_order,
+                )
+            except StaleEpochError:
+                await request.app.state.directory.refresh(request.app.state.hq_pool)
 
-            route = request.app.state.directory.route_vendor(order.vendor_id)
-            pool = await request.app.state.region_pools.get(route.primary_node)
+                route = request.app.state.directory.route_vendor(order.vendor_id)
+                pool = await request.app.state.region_pools.get(route.primary_node)
 
-            result = await place_region_order(
-                pool,
-                order,
-                route.region_id,
-                route.epoch,
-                received_at,
-                place_order,
-            )
+                result = await place_region_order(
+                    pool,
+                    order,
+                    route.region_id,
+                    route.epoch,
+                    received_at,
+                    place_order,
+                )
         except RegionUnreachableError:
             await park_order(
                 request.app.state.hq_pool,
@@ -280,6 +301,9 @@ def create_app() -> FastAPI:
             status_code=order_status_code(result),
             content=response.model_dump(mode="json"),
         )
+
+    if settings.mode == "gateway":
+        app.include_router(gateway)
 
     return app
 

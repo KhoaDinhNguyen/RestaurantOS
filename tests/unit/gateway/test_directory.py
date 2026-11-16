@@ -57,6 +57,7 @@ def test_directory_routes_vendor() -> None:
                 primary_node="r1-primary",
             )
         },
+        region_routes={},
     )
 
     route = cache.route_vendor("v001")
@@ -70,6 +71,7 @@ def test_directory_rejects_unknown_vendor() -> None:
     cache = DirectoryCache(
         vendor_cells={},
         cell_routes={},
+        region_routes={},
     )
 
     with pytest.raises(UnknownVendorError):
@@ -111,6 +113,7 @@ async def test_directory_refresh(monkeypatch) -> None:
     cache = DirectoryCache(
         vendor_cells={},
         cell_routes={},
+        region_routes={},
     )
 
     await cache.refresh(object())
@@ -140,7 +143,53 @@ def test_vendors_in_same_cell_share_route() -> None:
             "v002": "w21z7",
         },
         cell_routes={"w21z7": route},
+        region_routes={},
     )
 
     assert cache.route_vendor("v001") == route
     assert cache.route_vendor("v002") == route
+
+
+async def test_directory_refresh_keeps_region_without_cells(monkeypatch) -> None:
+    connection = AsyncMock()
+
+    vendor_cursor = AsyncMock()
+    vendor_cursor.fetchall.return_value = []
+
+    region_cursor = AsyncMock()
+    region_cursor.fetchall.return_value = [
+        (
+            "r1",
+            2,
+            "r1-primary",
+            "r1-standby",
+            1,
+            None,
+            [],
+        )
+    ]
+
+    connection.execute.side_effect = [
+        vendor_cursor,
+        region_cursor,
+    ]
+
+    async def fake_run_on(pool, work, **kwargs):
+        return await work(connection)
+
+    monkeypatch.setattr(directory, "run_on", fake_run_on)
+
+    cache = DirectoryCache(
+        vendor_cells={},
+        cell_routes={},
+        region_routes={},
+    )
+
+    await cache.refresh(object())
+
+    assert cache.cell_routes == {}
+    assert cache.region_routes["r1"] == RegionRoute(
+        region_id="r1",
+        epoch=2,
+        primary_node="r1-primary",
+    )

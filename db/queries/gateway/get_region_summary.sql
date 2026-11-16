@@ -14,7 +14,7 @@ WITH order_counts AS (
 sales AS (
     SELECT
         COALESCE(
-            SUM(oi.quantity * oi.price_units),
+            SUM(oi.quantity::bigint * oi.price_units)
             0
         ) AS sales_units
     FROM order_items AS oi

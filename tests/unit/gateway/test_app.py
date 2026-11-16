@@ -126,6 +126,7 @@ def test_vendor_menu(monkeypatch) -> None:
                 primary_node="r1-primary",
             )
         },
+        region_routes={},
     )
 
     region_pools = AsyncMock()
@@ -206,6 +207,7 @@ def test_create_order_accepted(monkeypatch) -> None:
                 primary_node="r1-primary",
             )
         },
+        region_routes={},
     )
 
     region_pools = AsyncMock()
@@ -286,6 +288,7 @@ def test_create_order_parks_when_region_unreachable(monkeypatch) -> None:
                 primary_node="r1-primary",
             )
         },
+        region_routes={},
     )
 
     region_pools = AsyncMock()
@@ -385,6 +388,7 @@ def test_create_order_refreshes_after_stale_epoch(monkeypatch) -> None:
                 primary_node="r1-primary",
             )
         },
+        region_routes={},
     )
     app.state.directory.refresh = fake_refresh
 
@@ -464,6 +468,7 @@ def test_order_status_routes_to_region_primary(monkeypatch) -> None:
                 primary_node="r1-primary",
             )
         },
+        region_routes={},
     )
 
     region_pools = AsyncMock()
@@ -476,3 +481,125 @@ def test_order_status_routes_to_region_primary(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "accepted"
     region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_create_order_parks_when_retry_after_stale_epoch_is_unreachable(
+    monkeypatch,
+) -> None:
+    from restaurantos.common.errors import RegionUnreachableError, StaleEpochError
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    calls = 0
+    parked = False
+
+    async def fake_place_region_order(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            raise StaleEpochError()
+
+        raise RegionUnreachableError(region_id="r1")
+
+    async def fake_refresh(pool):
+        app.state.directory.cell_routes["w21z7"] = RegionRoute(
+            region_id="r1",
+            epoch=2,
+            primary_node="r1-standby",
+        )
+
+    async def fake_park_order(
+        pool,
+        order,
+        region_id,
+        received_at,
+    ):
+        nonlocal parked
+        parked = True
+
+        assert region_id == "r1"
+        assert order.external_order_id == "123"
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.place_region_order",
+        fake_place_region_order,
+    )
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.park_order",
+        fake_park_order,
+    )
+
+    app = create_app()
+
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+    app.state.directory.refresh = fake_refresh
+
+    region_pools = AsyncMock()
+    region_pools.get.side_effect = [object(), object()]
+
+    app.state.region_pools = region_pools
+    app.state.hq_pool = object()
+    app.state.place_order = AsyncMock()
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "channel": "dhrd",
+            "external_order_id": "123",
+            "vendor_id": "v001",
+            "customer_id": "c001",
+            "customer_geohash": "w21z7",
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "items": [
+                {
+                    "product_id": "p003",
+                    "quantity": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json()["queued"] is True
+    assert calls == 2
+    assert parked is True
+
+    assert region_pools.get.await_args_list[0].args == ("r1-primary",)
+    assert region_pools.get.await_args_list[1].args == ("r1-standby",)
+
+
+def test_gateway_only_routes_not_registered_in_edge_mode(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+
+    edge_settings = Settings(
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.get_settings",
+        lambda: edge_settings,
+    )
+
+    app = create_app()
+    client = TestClient(app)
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/health").json()["mode"] == "edge"
+
+    assert client.get("/api/v1/regions").status_code == 404
+    assert client.get("/api/v1/vendors/v001/menu").status_code == 404

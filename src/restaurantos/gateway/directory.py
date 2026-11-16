@@ -22,10 +22,11 @@ class RegionRoute:
 
 @dataclass
 class DirectoryCache:
-    """In-memory vendor and shard routing directory."""
+    """In-memory vendor, shard, and region routing directory."""
 
     vendor_cells: dict[str, str]
     cell_routes: dict[str, RegionRoute]
+    region_routes: dict[str, RegionRoute]
 
     def route_vendor(self, vendor_id: str) -> RegionRoute:
         """Return the region route that owns a vendor."""
@@ -44,7 +45,9 @@ class DirectoryCache:
     async def refresh(self, pool: AsyncConnectionPool) -> None:
         """Refresh vendor and region routing information from HQ."""
 
-        async def work(conn) -> tuple[dict[str, str], dict[str, RegionRoute]]:
+        async def work(
+            conn,
+        ) -> tuple[dict[str, str], dict[str, RegionRoute], dict[str, RegionRoute]]:
             vendor_cursor = await conn.execute(load_query("gateway/get_vendor_cells"))
             vendor_rows = await vendor_cursor.fetchall()
 
@@ -54,6 +57,7 @@ class DirectoryCache:
             vendor_cells = {row[0]: row[1] for row in vendor_rows}
 
             cell_routes: dict[str, RegionRoute] = {}
+            region_routes: dict[str, RegionRoute] = {}
 
             for row in region_rows:
                 region_id = row[0]
@@ -67,15 +71,18 @@ class DirectoryCache:
                     primary_node=primary_node,
                 )
 
+                region_routes[region_id] = route
+
                 for cell in geohashes:
                     cell_routes[cell] = route
 
-            return vendor_cells, cell_routes
+            return vendor_cells, cell_routes, region_routes
 
-        vendor_cells, cell_routes = await run_on(pool, work)
+        vendor_cells, cell_routes, region_routes = await run_on(pool, work)
 
         self.vendor_cells = vendor_cells
         self.cell_routes = cell_routes
+        self.region_routes = region_routes
 
 
 async def get_regions(pool: AsyncConnectionPool) -> list[dict[str, Any]]:
