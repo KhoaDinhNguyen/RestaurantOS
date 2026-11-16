@@ -314,6 +314,7 @@ class Playback:
         kitchen_url: str | None = None,
         kitchen_urls: Mapping[str, str] | None = None,
         vendor_regions: Mapping[str, str] | None = None,
+        sequential: bool = False,
     ) -> None:
         self._orders_fn = orders_fn
         self._api_base = target_url.rstrip("/")
@@ -370,6 +371,14 @@ class Playback:
         # single-URL fallback - only an omitted map falls back
         self._kitchen_urls = dict(kitchen_urls) if kitchen_urls is not None else None
         self._vendor_regions = dict(vendor_regions) if vendor_regions else None
+        # Sequential mode: wait for each order's response before the
+        # next send. It is the one mode that breaks the backlog seam
+        # deliberately: a run that reaches the end of the stream must
+        # have sent every order, so the drain can never cancel the
+        # tail because the send queue cannot build up in the first
+        # place. Inflight is 1 in this mode; the semaphore stays as a
+        # belt-and-braces guard.
+        self._sequential = sequential
 
         self._state = IDLE
         self._wake = asyncio.Event()
@@ -804,6 +813,12 @@ class Playback:
                             break
                     last_dispatched_at = order_target
                     self._dispatch_order(order_target - sim_start, request)
+                    if self._sequential and self._send_tasks:
+                        # send-after-ack: wait for this order's answer
+                        # before the next order goes out. The heap still
+                        # orders events and restocks by their simulated
+                        # timestamps; only order sends serialize.
+                        await asyncio.wait(set(self._send_tasks))
                     pending = next(stream_items, None)
                 else:
                     deadline, _rank, tie_a, tie_b, kind, payload = heapq.heappop(self._heap)
