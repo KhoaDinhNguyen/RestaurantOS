@@ -29,9 +29,10 @@ import csv
 import json
 import os
 import sqlite3
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import time
+from datetime import time as dt_time
 from pathlib import Path
 
 from restaurantos.common.models import OrderRequest
@@ -232,6 +233,29 @@ def _write_jsonl(out: Path, conn: sqlite3.Connection) -> tuple[int, int, int, in
     return orders, imported - orders, first_day, last_day
 
 
+# A killed build's temp files are only removed by a later build. A real
+# build takes about half a minute, so an hour of grace cannot touch a
+# live concurrent build.
+_STALE_TEMP_AFTER_S = 3600.0
+
+
+def _remove_stale_temps(cache_dir: Path) -> None:
+    """Sweep temp files from builds that were hard-killed: the next
+    build has a new pid and would otherwise never clean them (the
+    .sort-<pid>.db of a killed real-data build is hundreds of MB)."""
+    cutoff = time.time() - _STALE_TEMP_AFTER_S
+    for path in cache_dir.iterdir():
+        name = path.name
+        is_temp = (name.startswith(".sort-") and name.endswith(".db")) or name.endswith(".tmp")
+        if not is_temp:
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except FileNotFoundError:
+            pass  # a concurrent sweep got there first; fine
+
+
 def build_cache(data_dir: Path, *, warm_up_days: int, quiet: bool = False) -> CacheMeta:
     """Verify the data directory and (re)build the sorted order cache.
 
@@ -242,6 +266,8 @@ def build_cache(data_dir: Path, *, warm_up_days: int, quiet: bool = False) -> Ca
     manifest = _manifest_sha256(data_dir)
     cache_file, meta_path, cache_dir = cache_paths(data_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
+    _remove_stale_temps(cache_dir)
+
     # Pid-suffixed temp names: two builds at once must not write the
     # same temp files and install a mix of both under a valid sidecar.
     pid = os.getpid()
@@ -282,6 +308,12 @@ def build_cache(data_dir: Path, *, warm_up_days: int, quiet: bool = False) -> Ca
             itemless_orders=itemless,
         )
         tmp_meta.write_text(meta.to_json(), encoding="utf-8")
+        # Publish order: drop the old sidecar first, then install the
+        # new cache, then the new sidecar. A crash between the renames
+        # then leaves a cache with no sidecar, which ensure_cache reads
+        # as "no usable cache" and rebuilds - instead of a new cache
+        # quietly described by the old sidecar.
+        meta_path.unlink(missing_ok=True)
         tmp_cache.replace(cache_file)
         tmp_meta.replace(meta_path)
     except BaseException:
@@ -342,7 +374,7 @@ def to_order_request(order: dict) -> OrderRequest:
         customer_id=order["customer_id"],
         customer_geohash=order["geohash"],
         order_day=order["order_day"],
-        order_time=time.fromisoformat(order["order_time"]),
+        order_time=dt_time.fromisoformat(order["order_time"]),
         items=order["items"],
     )
 

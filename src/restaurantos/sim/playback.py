@@ -106,10 +106,15 @@ class RealWallClock:
 
 
 class RunLog:
-    """`orders.jsonl`, one line per order, written in send order."""
+    """`orders.jsonl`, one line per order, written in send order.
 
-    def __init__(self, path: Path) -> None:
-        self._f = path.open("w", encoding="utf-8")
+    `exclusive=True` opens with "x": creating the log *is* the run-id
+    reservation, atomic across processes, instead of a check-then-open
+    pair two processes can both pass.
+    """
+
+    def __init__(self, path: Path, *, exclusive: bool = False) -> None:
+        self._f = path.open("x" if exclusive else "w", encoding="utf-8")
         self._next = 0
         self._pending: dict[int, dict[str, Any]] = {}
 
@@ -234,23 +239,28 @@ class Playback:
         # Validate and create everything BEFORE any engine state is
         # reset: a bad or reused run id must leave the engine exactly
         # as it was, not half-reset with the previous run's done
-        # signal cleared.
-        self._run_id = run_id or default_run_id(seed)
-        if not _RUN_ID.fullmatch(self._run_id):
+        # signal cleared. The candidate id stays local until the
+        # commit block, so a refused start never leaks it into status().
+        candidate = run_id or default_run_id(seed)
+        if not _RUN_ID.fullmatch(candidate):
             raise ValueError(
-                f"run_id {self._run_id!r} must be one path component: "
+                f"run_id {candidate!r} must be one path component: "
                 "letters, digits, '.', '_' or '-', 1 to 64 characters"
             )
         runs_root = self._runs_dir.resolve()
-        run_dir = (self._runs_dir / self._run_id).resolve()
+        run_dir = (self._runs_dir / candidate).resolve()
         if run_dir.parent != runs_root:
-            raise ValueError(f"run_id {self._run_id!r} must stay inside the runs directory")
-        if (run_dir / "orders.jsonl").exists():
-            raise ValueError(f"run {self._run_id!r} already exists; choose another run id")
+            raise ValueError(f"run_id {candidate!r} must stay inside the runs directory")
         run_dir.mkdir(parents=True, exist_ok=True)
-        log = RunLog(run_dir / "orders.jsonl")
+        try:
+            # exclusive create: two processes cannot both pass an
+            # exists() check and then wipe each other's run
+            log = RunLog(run_dir / "orders.jsonl", exclusive=True)
+        except FileExistsError:
+            raise ValueError(f"run {candidate!r} already exists; choose another run id") from None
+
         meta = {
-            "run_id": self._run_id,
+            "run_id": candidate,
             "seed": seed,
             "from_day": from_day,
             "to_day": to_day,
@@ -262,26 +272,42 @@ class Playback:
             "wall_start_monotonic": self._wall.now(),
             **(meta_extra or {}),
         }
-        (run_dir / "meta.json").write_text(
-            json.dumps(meta, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"
-        )
+        try:
+            (run_dir / "meta.json").write_text(
+                json.dumps(meta, indent=2, sort_keys=True, default=str) + "\n",
+                encoding="utf-8",
+            )
+            simclock = SimClock(
+                start_sim_seconds=from_day * SECONDS_PER_DAY,
+                speed=speed,
+                wall=self._wall.now,
+                running=False,
+            )
+            slots = asyncio.Semaphore(self._inflight)
+            stream = self._orders_fn(from_day, to_day)
+            client = httpx.AsyncClient(timeout=self._http_timeout_s, transport=self._transport)
+        except BaseException:
+            # the reservation rolls back: no handle leaks and the id is
+            # not left burnt for a run that never started
+            with contextlib.suppress(Exception):
+                log.close()
+            with contextlib.suppress(OSError):
+                (run_dir / "orders.jsonl").unlink(missing_ok=True)
+            raise
 
-        self._simclock = SimClock(
-            start_sim_seconds=from_day * SECONDS_PER_DAY,
-            speed=speed,
-            wall=self._wall.now,
-            running=False,
-        )
+        # commit: from here nothing can fail
+        self._simclock = simclock
         self._seed = seed
         self._from_day = from_day
         self._to_day = to_day
         self._sent = self._acked = self._parked = self._refused = self._failed = 0
-        self._slots = asyncio.Semaphore(self._inflight)
+        self._slots = slots
         self._send_tasks.clear()
         self._done.clear()
-        self._stream = self._orders_fn(from_day, to_day)
+        self._stream = stream
         self._log = log
-        self._client = httpx.AsyncClient(timeout=self._http_timeout_s, transport=self._transport)
+        self._run_id = candidate
+        self._client = client
         self._state = RUNNING
         self._simclock.start()
         self._task = asyncio.create_task(self._run(), name=f"playback-{self._run_id}")
@@ -377,39 +403,48 @@ class Playback:
             print(f"playback run {self._run_id} failed: {error}", file=sys.stderr)
             failed = True
         finally:
-            # Each step is guarded: a cleanup error must not skip
-            # _done.set(), or stop() and wait_done() hang forever.
+            cleanup_cancelled = False
             try:
-                await self._drain()
-            except Exception:  # noqa: BLE001
-                traceback.print_exc()
-                failed = True
-            try:
-                log.close()
-            except Exception:  # noqa: BLE001
-                traceback.print_exc()
-                failed = True
-            try:
-                await client.aclose()
-            except Exception:  # noqa: BLE001
-                traceback.print_exc()
-                failed = True
-            stream_close = getattr(stream, "close", None)
-            if stream_close is not None:
+                # Each step is guarded: a cleanup error must not skip
+                # the final state or _done.set().
                 try:
-                    stream_close()
+                    await self._drain()
                 except Exception:  # noqa: BLE001
                     traceback.print_exc()
                     failed = True
-            if clock is not None:
-                # freeze the reported clock: a finished run must not keep
-                # advancing simulated time
-                with contextlib.suppress(Exception):
-                    clock.pause()
-            # set only here, at the very end: earlier, and a start could
-            # slip in while this run is still cleaning up
-            self._state = FAILED if failed else (STOPPED if stopped else DONE)
-            self._done.set()
+                try:
+                    log.close()
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+                    failed = True
+                try:
+                    await client.aclose()
+                except Exception:  # noqa: BLE001
+                    traceback.print_exc()
+                    failed = True
+                stream_close = getattr(stream, "close", None)
+                if stream_close is not None:
+                    try:
+                        stream_close()
+                    except Exception:  # noqa: BLE001
+                        traceback.print_exc()
+                        failed = True
+            except asyncio.CancelledError:
+                # a cancelled cleanup is a failed run, not a hang
+                cleanup_cancelled = True
+                raise
+            finally:
+                if clock is not None:
+                    # freeze the reported clock: a finished run must not
+                    # keep advancing simulated time
+                    with contextlib.suppress(Exception):
+                        clock.pause()
+                # set only here, at the very end: earlier, and a start
+                # could slip in while this run is still cleaning up
+                self._state = (
+                    FAILED if failed or cleanup_cancelled else (STOPPED if stopped else DONE)
+                )
+                self._done.set()
 
     async def _wait_until(self, target_sim: float) -> None:
         while True:

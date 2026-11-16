@@ -427,6 +427,71 @@ def test_runlog_close_marks_only_the_missing_sends(tmp_path: Path) -> None:
     assert lines[2]["http_status"] == 201 and "error" not in lines[2]
 
 
+# --- review round 2 ---------------------------------------------------------
+
+
+async def test_rejected_run_id_does_not_leak_into_status(tmp_path: Path) -> None:
+    """The candidate id stays local until the commit block; a refused
+    start must leave status() reporting the previous run (round 2, 1)."""
+    orders = sample_orders(2)
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="good")
+    await drive(pb, clock)
+    assert pb.status()["run_id"] == "good"
+
+    with pytest.raises(ValueError):
+        await pb.start(seed=0, from_day=14, to_day=14, speed=1.0, run_id="../evil")
+    assert pb.status()["run_id"] == "good"  # not "../evil"
+    assert pb.status()["orders_sent"] == 2  # and the old counters, unchanged
+
+
+async def test_failed_start_rolls_back_the_reservation(tmp_path: Path, monkeypatch) -> None:
+    """A start that dies after reserving the run id leaves no burnt id
+    and no file handle: the log is closed and removed (round 2, 2)."""
+    from pathlib import Path as PathType
+
+    def no_disk(self, *args, **kwargs):
+        raise OSError("disk full")
+
+    orders = sample_orders(2)
+    pb = make_playback(orders, tmp_path, clock=FakeWallClock())
+    monkeypatch.setattr(PathType, "write_text", no_disk)  # meta.json write fails
+    with pytest.raises(OSError, match="disk full"):
+        await pb.start(seed=0, from_day=14, to_day=14, speed=1.0, run_id="burnt")
+    monkeypatch.undo()
+
+    run_dir = tmp_path / "burnt"
+    assert not (run_dir / "orders.jsonl").exists()
+    assert not (run_dir / "meta.json").exists()
+    # the id was not burnt: the same one works now
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="burnt")
+    assert pb.status()["run_id"] == "burnt"
+
+
+async def test_cancelled_cleanup_ends_failed(tmp_path: Path) -> None:
+    """Cancelling the run task while it drains must not hang
+    stop()/wait_done(): the run ends FAILED (round 2, 3)."""
+    orders = [make_order(14, 0, 0, 1, "1")]
+    transport = CountingTransport(httpx.ASGITransport(app=make_stub_app(delay_seconds=0.2)))
+    pb = Playback(
+        lambda a, b: iter(orders),
+        target_url="http://stub.test/api/v1",
+        inflight=4,
+        http_timeout_s=5.0,
+        drain_timeout_s=10.0,
+        runs_dir=tmp_path,
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="cancelled")
+    await settle()  # the send is in flight; the run task is draining
+    task = pb._task  # noqa: SLF001 - the test must cancel the run task itself
+    assert task is not None
+    task.cancel()
+    await asyncio.wait_for(pb.wait_done(), timeout=5)
+    assert pb.status()["state"] == "failed"
+
+
 # --- review round 1 ---------------------------------------------------------
 
 

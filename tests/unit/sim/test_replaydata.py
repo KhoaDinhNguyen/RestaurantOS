@@ -263,3 +263,77 @@ def test_to_order_request_maps_the_data_dictionary(tmp_path: Path) -> None:
     assert request.order_time.isoformat() == "12:03:29"
     assert [item.product_id for item in request.items] == ["p1", "p2"]
     assert request.items[1].quantity == 3
+
+
+# --- review round 2 ---------------------------------------------------------
+
+
+def test_publish_crash_leaves_no_stale_sidecar(tmp_path: Path, monkeypatch) -> None:
+    """A crash between the two renames must not leave a new cache
+    quietly described by the old sidecar: the sidecar is dropped first,
+    so ensure_cache rebuilds (round 2, 4)."""
+    from pathlib import Path as PathType
+
+    orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
+    items = [["1", "p1", 1]]
+    data = make_data_dir(tmp_path, orders, items)
+    build_cache(data, warm_up_days=14, quiet=True)
+    meta_path = data / "cached" / "orders-sorted.meta.json"
+    cache_path = data / "cached" / "orders-sorted.jsonl"
+    assert meta_path.is_file()
+
+    # now the source changes and a rebuild crashes between the renames
+    orders.append(["2", "c1", "v1", "w21z7", "3", 15, "12:00:00"])
+    items.append(["2", "p1", 1])
+    _write_csv(data / "orders.csv", ORDERS_HEADER, orders)
+    _write_csv(data / "order_items.csv", ITEMS_HEADER, items)
+    raw_orders = (data / "orders.csv").read_bytes()
+    raw_items = (data / "order_items.csv").read_bytes()
+    manifest = (data / "MANIFEST.csv").read_text().splitlines()
+    manifest[7] = f"orders.csv,2,{hashlib.sha256(raw_orders).hexdigest()}"
+    manifest[8] = f"order_items.csv,2,{hashlib.sha256(raw_items).hexdigest()}"
+    (data / "MANIFEST.csv").write_text("\n".join(manifest) + "\n")
+
+    original_replace = PathType.replace
+
+    def crash_between_renames(self, target):
+        if "meta" in self.name and self.name.endswith(".tmp"):
+            raise RuntimeError("crash between the two renames")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(PathType, "replace", crash_between_renames)
+    with pytest.raises(RuntimeError, match="between the two renames"):
+        build_cache(data, warm_up_days=14, quiet=True)
+    monkeypatch.undo()
+
+    # the new cache landed, but there is no sidecar to vouch for it
+    assert cache_path.is_file()
+    assert not meta_path.is_file()
+    # so the next ensure_cache rebuilds, and the sidecar returns
+    ensure_cache(data, warm_up_days=14)
+    assert meta_path.is_file()
+    assert [line["order_id"] for line in cache_lines(data)] == ["1", "2"]
+
+
+def test_stale_temps_from_killed_builds_are_swept(tmp_path: Path) -> None:
+    """Temp files older than the grace window are removed by the next
+    build; fresh ones (a live concurrent build's) are left alone
+    (round 2, 5)."""
+    import os
+    import time
+
+    orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
+    data = make_data_dir(tmp_path, orders, [["1", "p1", 1]])
+    build_cache(data, warm_up_days=14, quiet=True)
+
+    cached = data / "cached"
+    old = cached / "orders-sorted.jsonl.999999.tmp"
+    old.write_text("half-written")
+    fresh_db = cached / ".sort-999999.db"
+    fresh_db.write_text("live build")
+    two_hours_ago = time.time() - 7200
+    os.utime(old, (two_hours_ago, two_hours_ago))
+
+    build_cache(data, warm_up_days=14, quiet=True)
+    assert not old.exists()  # swept: too old
+    assert fresh_db.exists()  # untouched: recent, could be a live build
