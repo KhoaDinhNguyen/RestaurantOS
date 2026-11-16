@@ -42,6 +42,20 @@ class Cluster:
     def __post_init__(self) -> None:
         if self.regions < 1:
             raise ValueError("a cluster needs at least one region")
+        # Every region uses one block of ten proxy ports, offset from
+        # proxy_base_port (proxies(): base + region_number * 10 + slot,
+        # slot 0..9); the highest slot is 9, so the top published port is
+        # proxy_base_port + regions * 10 + 9 and must stay inside the
+        # TCP range.
+        if self.proxy_base_port < 1:
+            raise ValueError(f"proxy_base_port must be at least 1, got {self.proxy_base_port}")
+        highest = self.proxy_base_port + self.regions * 10 + 9
+        if highest > 65535:
+            raise ValueError(
+                f"proxy ports would reach {highest}, above the highest TCP port 65535; "
+                f"lower proxy_base_port ({self.proxy_base_port}) or use fewer regions "
+                f"({self.regions})"
+            )
 
     @property
     def region_ids(self) -> list[str]:

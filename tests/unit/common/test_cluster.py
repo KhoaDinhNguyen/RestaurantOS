@@ -204,3 +204,24 @@ def test_committed_files_agree_with_cluster_toml():
         inside = 5432 if port in node_ports else port
         assert f'- "127.0.0.1:{port}:{inside}"' in compose, port
     assert compose.count('- "127.0.0.1:') == len(published_ports(cluster))
+
+
+# ---- proxy port range ---------------------------------------------------------
+
+
+def test_a_proxy_base_port_below_one_is_rejected():
+    with pytest.raises(ValueError, match="proxy_base_port must be at least 1"):
+        Cluster(proxy_base_port=0)
+
+
+def test_proxy_ports_must_stay_below_the_highest_tcp_port():
+    # region n owns ports base + n*10 .. base + n*10 + 9, so the top port
+    # is base + regions*10 + 9
+    with pytest.raises(ValueError, match="above the highest TCP port 65535"):
+        Cluster(regions=4, proxy_base_port=65500)
+    # base + 4*10 + 9 = 65535 exactly: the boundary passes
+    assert Cluster(regions=4, proxy_base_port=65486).regions == 4
+
+
+def test_the_default_base_port_fits_many_regions():
+    assert Cluster(regions=1000, proxy_base_port=21000).regions == 1000
