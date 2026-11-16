@@ -63,6 +63,12 @@ The edge API sits next to its region's two nodes and connects to them directly, 
 
 All the `/vendors/...` routes and `/regions` in Section 6.1, including `/regions/{region_id}/summary` (its fields are listed there). Reads of order status always go to the region primary. `POST /menu/products` writes at HQ only. In edge mode, serve the `/vendors/...` routes and the summary of your own region.
 
+`GET /vendors?geohash=&q=` (restaurant search, contract in Section 6.1) is the one `/vendors` route without a `vendor_id`, so it routes by cell instead:
+
+- Gateway mode: look the cell up in the cell-to-region cache. Unknown cell: answer `[]` without contacting anyone. Otherwise run the search on that region's primary through `run_on`.
+- Edge mode: run the search on your local primary. Your node only holds your region's vendors, so a cell from another region returns no rows by itself; no directory lookup needed.
+- One SQL file in `db/queries/gateway/` serves both modes: vendors with `geohash = %(geohash)s` where `q` is empty, or `primary_cuisine ILIKE` the pattern, or an `EXISTS` on that vendor's `products` with `name ILIKE` the pattern. Build the pattern in Python as `%` + `q` + `%`, escaping `%`, `_` and `\` in `q` so they match literally. Use `EXISTS`, not a join, so each vendor comes back once. Order by `vendor_id`.
+
 ### When the region cannot be reached
 
 Only orders are parked. Everything else fails fast and says which region is missing:

@@ -382,7 +382,7 @@ All JSON. No authentication (simulation). FastAPI serves OpenAPI at `/docs` on e
 | `GET /vendors/{vendor_id}/menu` | menu with availability | |
 | `PUT /vendors/{vendor_id}/products/{product_id}/availability` | manual sold-out | |
 | `POST /vendors/{vendor_id}/restock` | restock to par | also called by playback |
-| `GET /vendors?geohash=&q=` | find restaurants | |
+| `GET /vendors?geohash=&q=` | find restaurants in one cell | exact cell only, no neighbours (that is `/query/nearby`); details below |
 | `GET /query/nearby?geohash=&dish=&limit=` | "who near me can make X now" | geohash cell + 8 neighbours; `dish` is a `dish_id`; "can make" means stock for an order of one |
 | `GET /query/top-dishes?day=&limit=&mode=live\|hq\|baseline` | city-wide top dishes | |
 | `GET /query/ingredient-usage?day=&mode=live\|hq\|baseline&strategy=A\|B\|C` | distributed join | `strategy` applies to `mode=live` |
@@ -419,6 +419,22 @@ Response:
 ```
 
 The edge API (`edge-r{n}`) serves the same `/vendors/...` routes, and `/regions/{region_id}/summary`, for its own region only.
+
+`GET /vendors?geohash=&q=`, the customer's restaurant search:
+
+- `geohash`: required, one 5-character cell. Only that cell is searched, never its neighbours; "near me" is `/query/nearby` (WP3). One cell belongs to one region, so the route goes cell to region through the shard directory and reads that region's primary.
+- `q`: optional, case-insensitive substring (`ILIKE`). A vendor matches when `q` is in its `primary_cuisine` or in the `name` of any of its `products`. Without `q`, every vendor in the cell matches. Stock and sold-out are ignored: "who can make it right now" is `/query/nearby`. Fuzzy matching may come later; not needed now.
+- Response: a JSON list, one entry per vendor (a vendor matched by several products appears once), ordered by `vendor_id`. No `meta`: this is not a `/query` route.
+
+```json
+[
+  { "vendor_id": "212753d2", "chain_id": null, "geohash": "w21z7", "primary_cuisine": "noodles" }
+]
+```
+
+- A cell the shard directory does not know has no restaurants: `200` with `[]`, no region contacted.
+- Edge mode: searches its own region only. A cell owned by another region gives `200` with `[]`.
+- The owning region cannot be reached: `503`, as for every other `/vendors` route.
 
 Answers every route shares:
 
