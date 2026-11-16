@@ -37,6 +37,33 @@ def test_negative_floor_is_rejected():
         SimSettings(stock_floor=-1)
 
 
+def test_zero_restock_interval_is_rejected():
+    # R = 0 would mean "restock continuously", which is not a replay
+    with pytest.raises(ValidationError):
+        SimSettings(stock_restock_days=0)
+
+
+# ---- playback event settings -------------------------------------------------
+
+
+def test_event_defaults_are_on_for_every_accepted_order():
+    sim = SimSettings()
+    assert sim.playback_status_events is True
+    assert sim.playback_event_sample_rate == 1.0
+    assert sim.playback_event_jitter_s == 60.0
+
+
+def test_event_sample_rate_must_be_a_share():
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValidationError):
+            SimSettings(playback_event_sample_rate=bad)
+
+
+def test_negative_jitter_is_rejected():
+    with pytest.raises(ValidationError):
+        SimSettings(playback_event_jitter_s=-1)
+
+
 # ---- shards -----------------------------------------------------------------
 
 
