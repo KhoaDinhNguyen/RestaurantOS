@@ -63,6 +63,63 @@ REFERENCE_ORDER = (
 
 NULLABLE = {("vendors", "chain_id"), ("dishes", "dish_name")}
 
+# Value rules, taken from db/shared/010_reference.sql's CHECK constraints,
+# so a bad value fails while the old cluster is still running instead of
+# during COPY after the volumes are gone. Table and column names as in
+# the SQL file; row values are still text at this point.
+WHOLE_NON_NEGATIVE = frozenset(
+    {("dishes", "n_products"), ("dishes", "n_vendors"), ("products", "price_units")}
+)
+WHOLE_POSITIVE = frozenset({("dish_ingredients", "amount"), ("product_dish", "multiplier")})
+DECIMAL = frozenset({("products", "unit_price")})
+BOOLEAN = frozenset({("product_dish", "multiplier_ambiguous")})
+STOCK_MODES = ("per_ingredient", "per_item", "none")  # dishes.stock_mode
+GEOHASH_LENGTH = 5  # vendors.geohash
+
+
+def check_data_rules(table: str, columns: tuple[str, ...], rows: Sequence[Sequence[str]]) -> None:
+    """Raise ValueError for the first value that breaks its column's rule,
+    naming the table, the column, the row's key (its first field) and the
+    value. Foreign keys are deliberately not checked here: PostgreSQL
+    still owns those."""
+    for row in rows:
+        key = row[0]
+        for i, column in enumerate(columns):
+            name = (table, column)
+            value = row[i]
+            if name in WHOLE_NON_NEGATIVE or name in WHOLE_POSITIVE:
+                try:
+                    number = int(value)
+                except ValueError:
+                    raise ValueError(
+                        f"{table}.{column}: {key}: {value!r} is not a whole number"
+                    ) from None
+                if name in WHOLE_POSITIVE and number <= 0:
+                    raise ValueError(
+                        f"{table}.{column}: {key}: {value!r} is not a whole number > 0"
+                    )
+                if name in WHOLE_NON_NEGATIVE and number < 0:
+                    raise ValueError(
+                        f"{table}.{column}: {key}: {value!r} is not a whole number >= 0"
+                    )
+            elif name in DECIMAL:
+                try:
+                    float(value)
+                except ValueError:
+                    raise ValueError(
+                        f"{table}.{column}: {key}: {value!r} is not a number"
+                    ) from None
+            elif name in BOOLEAN and value not in ("true", "false"):
+                raise ValueError(f"{table}.{column}: {key}: {value!r} is not true or false")
+            elif name == ("dishes", "stock_mode") and value not in STOCK_MODES:
+                raise ValueError(
+                    f"{table}.{column}: {key}: {value!r} is not one of {list(STOCK_MODES)}"
+                )
+            elif name == ("vendors", "geohash") and len(value) != GEOHASH_LENGTH:
+                raise ValueError(
+                    f"{table}.{column}: {key}: {value!r} is not {GEOHASH_LENGTH} characters long"
+                )
+
 
 def table_of(file_name: str) -> str:
     return file_name.removesuffix(".csv")
@@ -123,14 +180,16 @@ def slice_reference_rows(
     if vendors is None:
         return rows
     products = [r for r in rows["products.csv"] if r[1] in vendors]
-    product_ids = {r[0] for r in products}
     return {
         "ingredients.csv": rows["ingredients.csv"],
         "dishes.csv": rows["dishes.csv"],
         "dish_ingredients.csv": rows["dish_ingredients.csv"],
         "vendors.csv": [r for r in rows["vendors.csv"] if r[0] in vendors],
         "products.csv": products,
-        "product_dish.csv": [r for r in rows["product_dish.csv"] if r[0] in product_ids],
+        # the key of products is (vendor_id, product_id): the link rows
+        # belong to a region because their own vendor_id is in the slice,
+        # not because some vendor somewhere has the same product_id
+        "product_dish.csv": [r for r in rows["product_dish.csv"] if r[1] in vendors],
     }
 
 

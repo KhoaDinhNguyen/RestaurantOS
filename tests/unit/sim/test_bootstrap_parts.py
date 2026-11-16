@@ -297,3 +297,59 @@ def test_an_unknown_stock_mode_is_a_data_error(tmp_path):
         f.write(content)
     with pytest.raises(ValueError, match="d1: unknown stock_mode 'per_recipe'"):
         warm_up_stock(path, warm_days=14, cover_days=7, floor=5)
+
+
+def test_a_shared_product_id_keeps_vendors_separate(tmp_path):
+    # the key of products is (vendor_id, product_id): two vendors sell
+    # the same product_id with different dishes, and neither's counters
+    # nor usage may merge with the other's
+    path = tmp_path
+
+    def write(name: str, header: str, *rows: str) -> None:
+        (path / name).write_text("\n".join([header, *rows]) + "\n", encoding="utf-8")
+
+    write("vendors.csv", "vendor_id,chain_id,geohash,primary_cuisine", "v1,,w21z7,x", "v2,,w21z6,x")
+    write("ingredients.csv", "ingredient_id,source", "beef,recipenlg", "fish,recipenlg")
+    write(
+        "dishes.csv",
+        "dish_id,dish_name,scope,stock_mode,n_products,n_vendors,example_name",
+        "d1,noodles,independent,per_ingredient,1,1,x",
+        "d2,drink,independent,per_ingredient,1,1,x",
+    )
+    write(
+        "dish_ingredients.csv",
+        "dish_id,ingredient_id,amount,unit",
+        "d1,beef,2,kg",
+        "d2,fish,1,portion",
+    )
+    write(
+        "products.csv",
+        "product_id,vendor_id,name,unit_price,price_units",
+        "p1,v1,noodles,0.01,10",
+        "p1,v2,drink,0.01,10",
+    )
+    write(
+        "product_dish.csv",
+        "product_id,vendor_id,dish_id,multiplier,multiplier_ambiguous",
+        "p1,v1,d1,2,false",
+        "p1,v2,d2,1,false",
+    )
+    write(
+        "orders.csv",
+        "order_id,customer_id,vendor_id,geohash,day_of_week,order_day,order_time",
+        "o1,c1,v1,w21z7,0,0,10:00:00",
+        "o2,c2,v2,w21z6,1,0,11:00:00",
+    )
+    write("order_items.csv", "order_id,product_id,quantity", "o1,p1,3", "o2,p1,4")
+
+    rows = warm_up_stock(path, warm_days=14, cover_days=7, floor=5)
+    stock = {(vendor, kind, item): on_hand for vendor, kind, item, on_hand, _ in rows}
+    # each vendor needs only its own dish's counters
+    assert set(stock) == {
+        ("v1", "ingredient", "beef"),
+        ("v2", "ingredient", "fish"),
+    }
+    # usage charged separately: v1 beef = 3 x 2 x 2 = 12 -> ceil(12/14 x 7) = 6;
+    # v2 fish = 4 x 1 x 1 = 4 -> below the floor
+    assert stock[("v1", "ingredient", "beef")] == 6
+    assert stock[("v2", "ingredient", "fish")] == 5

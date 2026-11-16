@@ -68,49 +68,45 @@ def _fake_docker_with_volumes(
     return run
 
 
-def _fake_write(events: list[str]):
-    def write(out_dir, compose, proxy_list):
-        events.append("write")
-
-    return write
-
-
 # ---- the rebuild order ---------------------------------------------------------
 
 
-def test_refusal_tears_down_nothing(monkeypatch):
+def test_refusal_tears_down_nothing(monkeypatch, tmp_path):
     events: list[str] = []
+    monkeypatch.setattr(bootstrap, "COMPOSE_FILE", tmp_path / "compose.yaml")
     monkeypatch.setattr(bootstrap, "_existing_volumes", lambda: ["restaurantos_x-data"])
     monkeypatch.setattr(bootstrap, "_confirm_volume_deletion", lambda volumes: False)
     monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
-    monkeypatch.setattr(bootstrap, "write_generated", _fake_write(events))
 
     assert bootstrap._rebuild(yes=False, compose="x", proxy_list="y") is False
     assert events == []
+    assert not list(tmp_path.glob("*.tmp"))  # not even staged
 
 
-def test_a_failed_teardown_stops_bootstrap_before_writing(monkeypatch, tmp_path):
+def test_a_failed_teardown_stops_bootstrap_and_cleans_the_staged_files(monkeypatch, tmp_path):
     events: list[str] = []
     old_file = tmp_path / "compose.yaml"
     old_file.write_text("OLD", encoding="utf-8")
     monkeypatch.setattr(bootstrap, "COMPOSE_FILE", old_file)
     monkeypatch.setattr(bootstrap, "_existing_volumes", lambda: ["restaurantos_x-data"])
     monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
-    monkeypatch.setattr(bootstrap, "write_generated", _fake_write(events))
 
     # the down of the old file fails; the committed baseline is never
-    # reached, nothing is written or started
+    # reached, nothing is started, the staged files are removed
     def failing_down(*args, compose_file=old_file):  # noqa: ANN001, ANN002
         events.append(f"down:{compose_file}")
-        raise RuntimeError("docker compose down failed (1):\ndocker is grumpy")
+        raise bootstrap.BootstrapError("docker compose down failed (1):\ndocker is grumpy")
 
     monkeypatch.setattr(bootstrap, "_compose", failing_down)
-    with pytest.raises(RuntimeError, match="docker is grumpy"):
+    with pytest.raises(bootstrap.BootstrapError, match="docker is grumpy"):
         bootstrap._rebuild(yes=True, compose="x", proxy_list="y")
     assert events == [f"down:{old_file}"]
+    # the old generated file is as it was, and no .tmp survives
+    assert old_file.read_text(encoding="utf-8") == "OLD"
+    assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_teardown_uses_the_old_file_then_write_then_up(monkeypatch, tmp_path):
+def test_teardown_uses_the_old_file_then_replace_then_up(monkeypatch, tmp_path):
     old_file = tmp_path / "compose.yaml"
     old_file.write_text("OLD", encoding="utf-8")
     events: list[str] = []
@@ -120,46 +116,47 @@ def test_teardown_uses_the_old_file_then_write_then_up(monkeypatch, tmp_path):
     def fake_run(argv, **kwargs):  # noqa: ANN001, ANN003
         assert argv[0] == "docker"
         if "down" in argv:
-            # teardown still sees the old generated file, not the new one
+            # teardown still sees the old generated file, not the staged
+            # one (the staged names differ, so teardown reads this file)
             assert old_file.read_text(encoding="utf-8") == "OLD"
             assert "--remove-orphans" in argv
             assert "-v" in argv
             events.append(f"down:{argv[argv.index('-f') + 1]}")
+        elif "rm" in argv:
+            events.append(f"rm:{argv[-1]}")
         elif "up" in argv:
-            # and the cluster is started from the file that was written
+            # and the cluster is started from the file that was staged
+            # and moved into place
             assert old_file.read_text(encoding="utf-8") == "NEW"
+            assert not list(tmp_path.glob("*.tmp"))
             events.append("up")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    def fake_write(out_dir, compose, proxy_list):
-        events.append("write")
-        old_file.write_text("NEW", encoding="utf-8")
-
     monkeypatch.setattr(bootstrap.subprocess, "run", fake_run)
-    monkeypatch.setattr(bootstrap, "write_generated", fake_write)
 
     assert bootstrap._rebuild(yes=True, compose="NEW", proxy_list="{}") is True
     # the old generated file first, then the committed baseline, then the
-    # write, then the start — never write before teardown
+    # leftover sweep, then the start — never up before teardown
     assert events[0] == f"down:{old_file}"
     assert events[1] == f"down:{bootstrap.COMMITTED_COMPOSE}"
-    assert events[2] == "write"
+    assert events[2] == "rm:restaurantos_x-data"
     assert events[3] == "up"
 
 
-def test_no_volumes_no_prompt(monkeypatch):
+def test_no_volumes_no_prompt(monkeypatch, tmp_path):
     events: list[str] = []
     asked: list[bool] = []
+    monkeypatch.setattr(bootstrap, "COMPOSE_FILE", tmp_path / "compose.yaml")
     monkeypatch.setattr(bootstrap, "_existing_volumes", lambda: [])
     monkeypatch.setattr(
         bootstrap, "_confirm_volume_deletion", lambda volumes: asked.append(True) or False
     )
     monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
-    monkeypatch.setattr(bootstrap, "write_generated", _fake_write(events))
 
     assert bootstrap._rebuild(yes=False, compose="x", proxy_list="y") is True
     assert asked == []  # nothing to ask about
     assert events[-1] == "up"
+    assert not list(tmp_path.glob("*.tmp"))  # staged then replaced
 
 
 # ---- volumes the teardown files cannot name (round 2, item 2) --------------------
@@ -177,13 +174,13 @@ def test_leftover_volumes_are_removed_by_name(monkeypatch, tmp_path):
             events, ["restaurantos_baseline-data", "restaurantos_r2-primary-data"]
         ),
     )
-    monkeypatch.setattr(bootstrap, "write_generated", _fake_write(events))
 
     assert bootstrap._rebuild(yes=True, compose="x", proxy_list="y") is True
-    # after the downs, the leftovers were removed by name, before the write
-    assert events.index("rm:restaurantos_baseline-data") < events.index("write")
+    # after the downs, the leftovers were removed by name, before the up
+    assert events.index("rm:restaurantos_baseline-data") < events.index("up")
     assert "rm:restaurantos_r2-primary-data" in events
     assert events[-1] == "up"
+    assert not list(tmp_path.glob("*.tmp"))  # the staged files were moved into place
 
 
 def test_a_failed_volume_removal_stops_bootstrap(monkeypatch, tmp_path):
@@ -194,12 +191,12 @@ def test_a_failed_volume_removal_stops_bootstrap(monkeypatch, tmp_path):
         "run",
         _fake_docker_with_volumes(events, ["restaurantos_baseline-data"], volume_rm_fails=True),
     )
-    monkeypatch.setattr(bootstrap, "write_generated", _fake_write(events))
 
-    with pytest.raises(RuntimeError, match="volume is in use"):
+    with pytest.raises(bootstrap.BootstrapError, match="volume is in use"):
         bootstrap._rebuild(yes=True, compose="x", proxy_list="y")
-    assert "write" not in events
     assert "up" not in events
+    # the staged files were removed with the failed teardown
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 # ---- everything that can fail on the input fails before teardown ------------------
@@ -242,7 +239,6 @@ def _write_dataset(tmp_path, **override: str) -> None:
 def _no_docker(monkeypatch) -> list[str]:
     events: list[str] = []
     monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
-    monkeypatch.setattr(bootstrap, "write_generated", _fake_write(events))
     return events
 
 
@@ -355,3 +351,153 @@ def test_an_in_memory_slice_matches_a_reread(tmp_path):
     assert in_memory["product_dish.csv"] == [["p1", "v1", "d1", "2", "false"]]
     # the small tables are whole either way
     assert in_memory["dishes.csv"] == once["dishes.csv"]
+
+
+# ---- staging (round 3, item 3) -------------------------------------------------
+
+
+def test_a_staging_failure_tears_down_nothing(monkeypatch, tmp_path):
+    events: list[str] = []
+    monkeypatch.setattr(bootstrap, "COMPOSE_FILE", tmp_path / "compose.yaml")
+    monkeypatch.setattr(bootstrap, "_existing_volumes", lambda: ["restaurantos_x-data"])
+
+    def failing_stage(compose, proxy_list):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(bootstrap, "_stage_generated", failing_stage)
+    monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
+    with pytest.raises(OSError, match="No space left"):
+        bootstrap._rebuild(yes=True, compose="x", proxy_list="y")
+    assert events == []  # no down, no up: the old cluster is untouched
+
+
+def test_a_partial_staging_failure_removes_what_was_staged(monkeypatch, tmp_path):
+    # the first file stages, the second write fails: the first .tmp
+    # must not be left behind
+    monkeypatch.setattr(bootstrap, "COMPOSE_FILE", tmp_path / "compose.yaml")
+    real_write = Path.write_text
+
+    def failing_write(self, data, encoding=None):
+        if self.name == "proxies.json.tmp":
+            raise OSError(28, "No space left on device")
+        return real_write(self, data, encoding=encoding)
+
+    monkeypatch.setattr(Path, "write_text", failing_write)
+    with pytest.raises(OSError, match="No space left"):
+        bootstrap._stage_generated("x", "y")
+    # the file that did stage was removed again
+    assert not (tmp_path / "compose.yaml.tmp").exists()
+
+
+# ---- column value rules (round 3, item 2) ---------------------------------------
+
+
+def _typed_dataset(tmp_path, table: str, bad_row: str) -> None:
+    _write_dataset(tmp_path, **{table: bad_row})
+
+
+def test_a_negative_whole_number_fails_before_teardown(monkeypatch, tmp_path):
+    _typed_dataset(
+        tmp_path,
+        "dishes.csv",
+        "dish_id,dish_name,scope,stock_mode,n_products,n_vendors,example_name\n"
+        "d1,noodles,independent,per_ingredient,-1,1,x\n",
+    )
+    events = _no_docker(monkeypatch)
+    with pytest.raises(ValueError, match=r"dishes.n_products: d1: '-1'"):
+        bootstrap._prepare(Cluster(regions=1), tmp_path, SIM)
+    assert events == []
+
+
+def test_a_zero_amount_fails_before_teardown(monkeypatch, tmp_path):
+    _typed_dataset(
+        tmp_path, "dish_ingredients.csv", "dish_id,ingredient_id,amount,unit\nd1,beef,0,kg\n"
+    )
+    events = _no_docker(monkeypatch)
+    with pytest.raises(ValueError, match=r"dish_ingredients.amount: d1: '0'"):
+        bootstrap._prepare(Cluster(regions=1), tmp_path, SIM)
+    assert events == []
+
+
+def test_a_non_numeric_price_fails_before_teardown(monkeypatch, tmp_path):
+    _typed_dataset(
+        tmp_path,
+        "products.csv",
+        "product_id,vendor_id,name,unit_price,price_units\np1,v1,noodles,cheap,10\n",
+    )
+    events = _no_docker(monkeypatch)
+    with pytest.raises(ValueError, match=r"products.unit_price: p1: 'cheap'"):
+        bootstrap._prepare(Cluster(regions=1), tmp_path, SIM)
+    assert events == []
+
+
+def test_a_non_boolean_flag_fails_before_teardown(monkeypatch, tmp_path):
+    _typed_dataset(
+        tmp_path,
+        "product_dish.csv",
+        "product_id,vendor_id,dish_id,multiplier,multiplier_ambiguous\np1,v1,d1,2,maybe\n",
+    )
+    events = _no_docker(monkeypatch)
+    with pytest.raises(ValueError, match=r"product_dish.multiplier_ambiguous: p1: 'maybe'"):
+        bootstrap._prepare(Cluster(regions=1), tmp_path, SIM)
+    assert events == []
+
+
+def test_an_unknown_stock_mode_fails_before_teardown(monkeypatch, tmp_path):
+    _typed_dataset(
+        tmp_path,
+        "dishes.csv",
+        "dish_id,dish_name,scope,stock_mode,n_products,n_vendors,example_name\n"
+        "d1,noodles,independent,per_recipe,1,1,x\n",
+    )
+    events = _no_docker(monkeypatch)
+    # the stock computation runs before the rows pass, so its explicit
+    # stock_mode dispatch rejects the dish first (the column rule would
+    # catch it too, one pass later)
+    with pytest.raises(ValueError, match="dish d1: unknown stock_mode 'per_recipe'"):
+        bootstrap._prepare(Cluster(regions=1), tmp_path, SIM)
+    assert events == []
+
+
+def test_a_short_geohash_fails_before_teardown(monkeypatch, tmp_path):
+    _typed_dataset(
+        tmp_path, "vendors.csv", "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z,x\n"
+    )
+    events = _no_docker(monkeypatch)
+    with pytest.raises(ValueError, match=r"vendors.geohash: v1: 'w21z'"):
+        bootstrap._prepare(Cluster(regions=1), tmp_path, SIM)
+    assert events == []
+
+
+# ---- the product key is (vendor_id, product_id) (round 3, item 1) ---------------
+
+
+def test_a_shared_product_id_slices_by_vendor(tmp_path):
+    # two vendors share the product_id p1 with different dishes; a
+    # region's slice must hold only its own link rows, or the load hits
+    # a foreign-key violation on the other vendor's (vendor, product)
+    _write_dataset(
+        tmp_path,
+        **{
+            "vendors.csv": "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\nv2,,w21z6,x\n",
+            "products.csv": (
+                "product_id,vendor_id,name,unit_price,price_units\n"
+                "p1,v1,noodles,0.01,10\np1,v2,drink,0.02,10\n"
+            ),
+            "product_dish.csv": (
+                "product_id,vendor_id,dish_id,multiplier,multiplier_ambiguous\n"
+                "p1,v1,d1,2,false\np1,v2,d2,1,false\n"
+            ),
+        },
+    )
+    rows = reference_rows(tmp_path)
+    v1_slice = slice_reference_rows(rows, frozenset({"v1"}))
+    v2_slice = slice_reference_rows(rows, frozenset({"v2"}))
+    assert v1_slice["products.csv"] == [["p1", "v1", "noodles", "0.01", "10"]]
+    assert v1_slice["product_dish.csv"] == [["p1", "v1", "d1", "2", "false"]]
+    assert v2_slice["products.csv"] == [["p1", "v2", "drink", "0.02", "10"]]
+    assert v2_slice["product_dish.csv"] == [["p1", "v2", "d2", "1", "false"]]
+    # together the slices are the whole, and nothing is duplicated
+    assert len(v1_slice["product_dish.csv"]) + len(v2_slice["product_dish.csv"]) == len(
+        rows["product_dish.csv"]
+    )

@@ -3,13 +3,14 @@
 Everything that can fail on bad input fails before anything is
 destroyed: the manifest check, the shard assignment, the Compose
 rendering, the stock computation and the reference reads (with the
-unit check and the empty-field rule) all run first. Only then does
-bootstrap ask about the existing volumes, tear the old cluster down —
-with the Compose file that is on disk, which may describe a shape with
-more regions than the one about to be built — remove any volumes the
-teardown files could not name, write the already-rendered files and
-start the cluster, wait for every node to be healthy, sync Toxiproxy,
-write HQ's control rows, and load the data.
+unit check, the empty-field rule and the column value rules) all run
+first. Only then does bootstrap ask about the existing volumes, stage
+the rendered Compose files under temporary names, tear the old cluster
+down — with the Compose file that is on disk, which may describe a
+shape with more regions than the one about to be built — remove any
+volumes the teardown files could not name, move the staged files into
+place, start the cluster, wait for every node to be healthy, sync
+Toxiproxy, write HQ's control rows, and load the data.
 
 Reference data goes to every node: HQ and baseline hold all of it, each
 region holds its own vendors and products plus full copies of the small
@@ -35,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -55,11 +57,12 @@ from restaurantos.common.cluster import (
 from restaurantos.common.config import get_settings
 from restaurantos.sim.config import SimSettings, get_sim_settings
 from restaurantos.sim.datacheck import check_manifest
-from restaurantos.sim.generator import compose_text, toxiproxy_config, write_generated
+from restaurantos.sim.generator import compose_text, toxiproxy_config
 from restaurantos.sim.loading import (
     REFERENCE_COLUMNS,
     REFERENCE_ORDER,
     apply_null_rule,
+    check_data_rules,
     copy_async,
     reference_rows,
     slice_reference_rows,
@@ -74,6 +77,13 @@ COMMITTED_COMPOSE = Path("infra/compose.yaml")
 PROJECT = "restaurantos"
 
 
+class BootstrapError(RuntimeError):
+    """A bootstrap failure the user can act on: bad input, a failed
+    teardown, a load that did not verify. The CLI prints these as a
+    message. Genuine bugs (a broken invariant, for instance) keep their
+    own exception and their traceback."""
+
+
 def _compose(*args: str, compose_file: Path = COMPOSE_FILE) -> subprocess.CompletedProcess:
     command = ["docker", "compose", "-p", PROJECT]
     # Compose does not read the root .env by itself (docs/setup.md); pass
@@ -83,7 +93,7 @@ def _compose(*args: str, compose_file: Path = COMPOSE_FILE) -> subprocess.Comple
     command += ["-f", str(compose_file), *args]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-        raise RuntimeError(
+        raise BootstrapError(
             f"{' '.join(command)} failed ({result.returncode}):\n{result.stdout}{result.stderr}"
         )
     return result
@@ -107,7 +117,7 @@ def _remove_volumes(names: list[str]) -> None:
     for name in names:
         result = subprocess.run(["docker", "volume", "rm", name], capture_output=True, text=True)
         if result.returncode != 0:
-            raise RuntimeError(
+            raise BootstrapError(
                 f"docker volume rm {name} failed ({result.returncode}):\n"
                 f"{result.stdout}{result.stderr}"
             )
@@ -150,19 +160,48 @@ def _confirm_volume_deletion(volumes: list[str]) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def _rebuild(*, yes: bool, compose: str, proxy_list: str) -> bool:
-    """Prompt about the volumes, tear the old cluster down, write the
-    already-rendered Compose files and start the cluster.
+def _stage_generated(compose: str, proxy_list: str) -> list[tuple[Path, Path]]:
+    """Write both rendered files to temporary names, so a write failure
+    (full disk, permissions) happens before anything is torn down. The
+    temporary names differ from the real ones, so the teardown keeps
+    reading the old compose.yaml."""
+    directory = COMPOSE_FILE.parent
+    directory.mkdir(parents=True, exist_ok=True)
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for name, text in (("compose.yaml", compose), ("proxies.json", proxy_list)):
+            tmp = directory / f"{name}.tmp"
+            tmp.write_text(text, encoding="utf-8")
+            staged.append((tmp, directory / name))
+    except BaseException:
+        for tmp, _ in staged:
+            tmp.unlink(missing_ok=True)
+        raise
+    return staged
 
-    Returns False when the user refused. The text was rendered before
-    the teardown, so writing it cannot fail on the input; a teardown
-    failure raises before anything is written or started.
+
+def _rebuild(*, yes: bool, compose: str, proxy_list: str) -> bool:
+    """Prompt about the volumes, stage the rendered Compose files, tear
+    the old cluster down, move the staged files into place and start the
+    cluster.
+
+    Returns False when the user refused. A staging failure happens
+    before the teardown, so nothing has been torn down; a teardown
+    failure removes the staged files and leaves the old generated files
+    as they are.
     """
     volumes = _existing_volumes()
     if volumes and not yes and not _confirm_volume_deletion(volumes):
         return False
-    _teardown()
-    write_generated(COMPOSE_FILE.parent, compose, proxy_list)
+    staged = _stage_generated(compose, proxy_list)
+    try:
+        _teardown()
+    except BaseException:
+        for tmp, _ in staged:
+            tmp.unlink(missing_ok=True)
+        raise
+    for tmp, final in staged:
+        os.replace(tmp, final)
     _compose("up", "-d", "--wait")
     return True
 
@@ -214,9 +253,10 @@ def _prepare(cluster: Cluster, data_dir: Path, sim: SimSettings) -> Prepared:
             "an ingredient appears with two different units: " + ", ".join(sorted(conflicts))
         )
     for name in REFERENCE_ORDER:
-        # the empty-field rule, applied up front: an unexpected empty
-        # value fails here, before anything is destroyed
+        # the empty-field rule and the column value rules, applied up
+        # front: a bad value fails here, before anything is destroyed
         apply_null_rule(name.removesuffix(".csv"), REFERENCE_COLUMNS[name], rows[name])
+        check_data_rules(name.removesuffix(".csv"), REFERENCE_COLUMNS[name], rows[name])
 
     for name in REFERENCE_ORDER:
         expected = manifest.get(name)
@@ -279,13 +319,31 @@ async def bootstrap(*, yes: bool = False, config: Path = Path("infra/cluster.tom
     to delete the existing volumes.
     """
     cluster = load_cluster(config)
-    prepared = _prepare(cluster, get_settings().data_dir, get_sim_settings())
+    try:
+        prepared = _prepare(cluster, get_settings().data_dir, get_sim_settings())
+    except (ValueError, NotImplementedError) as error:
+        # bad input or an unsupported cluster description: user-facing,
+        # and nothing has been destroyed yet
+        raise BootstrapError(str(error)) from error
 
     if not _rebuild(yes=yes, compose=prepared.compose, proxy_list=prepared.proxy_list):
         return 1
     print(f"wrote {COMPOSE_FILE} and infra/generated/proxies.json")
     print("every node is healthy")
 
+    try:
+        return await _load_cluster(cluster, prepared)
+    except (ToxiproxyError, ValueError, psycopg.Error) as error:
+        # the cluster is up by now, so the user must know that re-running
+        # bootstrap is the way forward; genuine bugs (a broken invariant)
+        # keep their own exception and traceback
+        raise BootstrapError(
+            f"{error}\nThe cluster is running but not fully loaded; run bootstrap again."
+        ) from error
+
+
+async def _load_cluster(cluster: Cluster, prepared: Prepared) -> int:
+    """Everything after `up`: sync, HQ control rows, and the loads."""
     async with Toxiproxy() as tox:
         for attempt in range(30):
             try:
@@ -344,7 +402,9 @@ async def bootstrap(*, yes: bool = False, config: Path = Path("infra/cluster.tom
         region = await _connect(cluster, node)
         async with region:
             await _load_reference(region, slice_)
-            region_vendor_counts.append(len(vendors))
+            async with region.cursor() as cur:
+                await cur.execute("SELECT count(*) FROM vendors")
+                region_vendor_counts.append((await cur.fetchone())[0])
             stock_rows = [row for row in stock if row[0] in vendors]
             await copy_async(
                 region,
@@ -354,10 +414,10 @@ async def bootstrap(*, yes: bool = False, config: Path = Path("infra/cluster.tom
             )
         loaded.append(f"{node}: {len(vendors)} vendors, {len(stock_rows)} stock rows")
 
-    if sum(region_vendor_counts) != len(rows["vendors.csv"]):
+    if sum(region_vendor_counts) != prepared.manifest["vendors.csv"]:
         raise ValueError(
             f"the regions hold {sum(region_vendor_counts)} vendors together, "
-            f"HQ holds {len(rows['vendors.csv'])}"
+            f"HQ holds {prepared.manifest['vendors.csv']}"
         )
     for line in loaded:
         print(line)

@@ -33,13 +33,19 @@ def warm_up_stock(
     Only the big files (orders, order_items) are streamed; the reference
     tables are read whole, as every other part of bootstrap does.
     """
-    products: dict[str, str] = {}  # product_id -> vendor_id
+    # The key of products is (vendor_id, product_id), not product_id
+    # alone: two vendors may share a product_id, and keying by the id
+    # would overwrite one of them and merge their dish links.
+    vendor_products: set[tuple[str, str]] = set()  # (vendor_id, product_id)
     for row in _dict_rows(data_dir, "products.csv"):
-        products[row["product_id"]] = row["vendor_id"]
+        vendor_products.add((row["vendor_id"], row["product_id"]))
 
-    links: dict[str, list[tuple[str, float]]] = {}  # product_id -> [(dish, multiplier)]
+    links: dict[
+        tuple[str, str], list[tuple[str, float]]
+    ] = {}  # (vendor, product) -> [(dish, mult)]
     for row in _dict_rows(data_dir, "product_dish.csv"):
-        links.setdefault(row["product_id"], []).append((row["dish_id"], float(row["multiplier"])))
+        key = (row["vendor_id"], row["product_id"])
+        links.setdefault(key, []).append((row["dish_id"], float(row["multiplier"])))
 
     stock_mode: dict[str, str] = {}  # dish_id -> per_ingredient | per_item
     for row in _dict_rows(data_dir, "dishes.csv"):
@@ -72,8 +78,8 @@ def warm_up_stock(
 
     # Every counter a vendor's products can need, before any usage is seen.
     needed: set[tuple[str, str, str]] = set()
-    for product_id, vendor_id in products.items():
-        for dish_id, _ in links.get(product_id, ()):
+    for vendor_id, product_id in sorted(vendor_products):
+        for dish_id, _ in links.get((vendor_id, product_id), ()):
             for (kind, item_id), _factor in counters_of(dish_id):
                 needed.add((vendor_id, kind, item_id))
 
@@ -92,7 +98,9 @@ def warm_up_stock(
             if vendor_id is None:
                 continue
             quantity = float(item["quantity"])
-            for dish_id, multiplier in links.get(item["product_id"], ()):
+            # the order's vendor is the one whose stock the line comes
+            # off, so the links are looked up by (vendor, product)
+            for dish_id, multiplier in links.get((vendor_id, item["product_id"]), ()):
                 for (kind, item_id), factor in counters_of(dish_id):
                     key = (vendor_id, kind, item_id)
                     usage[key] = usage.get(key, 0.0) + quantity * multiplier * factor
