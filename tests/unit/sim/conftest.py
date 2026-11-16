@@ -15,6 +15,7 @@ import heapq
 import itertools
 import os
 import sys
+from collections.abc import Sequence
 from datetime import time as dt_time
 
 # importlib import mode does not put this directory on sys.path, and the
@@ -131,6 +132,11 @@ def make_playback(
     from_day: int = 14,
     drain_timeout_s: float = 5.0,
     window_check=None,
+    status_events: bool = False,
+    event_sample_rate: float = 1.0,
+    event_jitter_s: float = 60.0,
+    restock_days: Sequence[int] = (),
+    restock_vendors: Sequence[str] = (),
 ) -> Playback:
     """An engine over a fixed order list, posting to an in-process stub."""
     if transport is None:
@@ -146,6 +152,11 @@ def make_playback(
         wall=clock,
         transport=transport,
         window_check=window_check,
+        status_events=status_events,
+        event_sample_rate=event_sample_rate,
+        event_jitter_s=event_jitter_s,
+        restock_days=restock_days,
+        restock_vendors=restock_vendors,
     )
 
 

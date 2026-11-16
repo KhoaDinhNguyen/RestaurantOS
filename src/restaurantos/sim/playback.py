@@ -7,17 +7,39 @@ are never precomputed. `common.simclock.SimClock` holds the
 (wall-clock, simulated) anchor pair and re-anchors on every speed
 change and on pause/resume, so simulated time never jumps.
 
-Two properties the acceptance test depends on:
+Besides the order stream, one dispatcher merges two more timelines
+(the extras): each accepted order's four status events at +1, +3, +15
+and +25 simulated minutes plus hash-based jitter, and a restock for
+every vendor at 00:00:00 of each restock day, before that day's first
+order. An event's simulated deadline is fixed when its order is
+dispatched - it depends on nothing but the order's simulated time, the
+seed and the settings - but the event only goes out once the order's
+outcome is known, because it needs the order id the response carries
+and a refused order must not move through any kitchen. The dispatcher
+therefore waits for that outcome at the event's instant; the outcome
+always resolves (every send finishes, errors, or is cancelled by the
+drain), so the wait cannot hang, and it bounds how far the engine runs
+ahead of its target to roughly the first event offset - a self-limit
+that keeps the run target-bound rather than schedule-bound.
 
-- Send order is the stream order, always. Orders in the same second go
-  out in the same sequence, and the in-flight bound is a semaphore
-  acquired in dispatch order (asyncio semaphores are FIFO), so it
-  delays but never reorders.
-- The run log is written in send order whatever order the responses
-  arrive in: each line carries its send sequence number, and a small
-  reorder buffer holds a completed line until every earlier line is
-  written. Byte-identical logs across runs therefore do not depend on
-  how acks interleave.
+Three properties the acceptance test depends on:
+
+- Dispatch order is a pure function of the inputs: the stream, the
+  simulated deadlines and the deterministic jitter, ordered by
+  (simulated time, kind, position in the stream). Orders in the same
+  second go out in the same sequence, restocks go before the first
+  order of their day, and the in-flight bound is a semaphore acquired
+  in dispatch order (asyncio semaphores are FIFO), so it delays but
+  never reorders.
+- The run log is written in dispatch order whatever order the
+  responses arrive in: each line carries its send sequence number, and
+  a small reorder buffer holds a completed line until every earlier
+  line is written. Byte-identical logs across runs therefore do not
+  depend on how acks interleave.
+- Every random value comes from
+  `determinism.stable_float(seed, id, purpose)` and every event id is
+  a uuid5 of the order and the status: no shared generator, nothing
+  drawn in send order, nothing from a clock.
 
 Wall time enters through a `WallClock` (protocol) so tests can drive
 the scheduler deterministically: the real one wraps `time.monotonic`
@@ -35,20 +57,24 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import heapq
 import json
 import re
 import sys
 import time
 import traceback
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 
-from restaurantos.common.models import OrderRequest
+from restaurantos.common.models import OrderRequest, OrderStatus
 from restaurantos.common.simclock import SECONDS_PER_DAY, SimClock, from_sim_seconds, to_sim_seconds
+from restaurantos.sim.determinism import stable_float
 
 # Re-check the clock at most this often during a long wait, so a speed
 # change is picked up within a slice instead of at the far deadline.
@@ -83,6 +109,55 @@ RESPONSE_FIELDS = (
     "acked_at",
     "refusal_reason",
 )
+
+# ...and the ones of a status change (StatusResult in common/models.py).
+EVENT_RESPONSE_FIELDS = ("applied", "duplicate", "conflict")
+
+# The brief's kitchen timeline: (to_status, seconds after the order).
+EVENT_SCHEDULE: tuple[tuple[OrderStatus, int], ...] = (
+    (OrderStatus.ACCEPTED, 60),
+    (OrderStatus.PREPARING, 180),
+    (OrderStatus.READY, 900),
+    (OrderStatus.PICKED_UP, 1500),
+)
+
+# Dispatch order within one simulated instant: restocks first (they
+# must land before the day's first order), then orders, then status
+# events.
+RANK_RESTOCK, RANK_ORDER, RANK_EVENT = 0, 1, 2
+
+
+@dataclass(frozen=True)
+class _OrderOutcome:
+    """What the gateway answered, boiled down to what an event needs."""
+
+    accepted: bool
+    order_id: str | None
+    reason: str
+
+
+class _OrderHandle:
+    """The per-order link between the send and its scheduled events."""
+
+    __slots__ = ("future", "order_seq", "outcome", "request", "sim_time")
+
+    def __init__(
+        self,
+        future: asyncio.Future,
+        request: OrderRequest,
+        sim_time: float,
+        order_seq: int,
+    ) -> None:
+        self.future = future
+        self.request = request
+        self.sim_time = sim_time  # the order's simulated instant, absolute
+        self.order_seq = order_seq
+        self.outcome: _OrderOutcome | None = None
+
+    def resolve(self, outcome: _OrderOutcome) -> None:
+        self.outcome = outcome
+        if not self.future.done():
+            self.future.set_result(None)
 
 
 class StateError(ValueError):
@@ -149,12 +224,24 @@ class Playback:
     All methods run on the event loop the engine was started on; the
     control routes and the CLI call them from there.
 
+    The extras (status events, restock) are opt-in here: the engine's
+    defaults keep a run order-only, while the CLI turns them on from
+    the settings (`ROS_SIM_PLAYBACK_STATUS_EVENTS` is on by default).
+    `restock_days` is the list of days to restock on - the caller
+    picks the days inside its replay window; `restock_vendors` is the
+    vendors to restock, in the order they go out.
+
     Known seam, deliberately out of scope here (it belongs with the
     snapshot work, which needs "pause and wait for in-flight" anyway):
     the number of send tasks queued for a slot is not bounded
     separately from the in-flight bound, and pause does not recall
     sends already queued for a slot. Both only show when the target is
-    slower than the due rate.
+    slower than the due rate. Status events multiply the *scheduled*
+    items about fivefold per order, but those are heap entries, not
+    tasks: a task only exists between its dispatch and its ack, and
+    the outcome wait bounds the dispatch lead, so the seam keeps its
+    shape (a same-instant burst still queues a burst of tasks; events
+    add nothing to it).
     """
 
     def __init__(
@@ -170,9 +257,15 @@ class Playback:
         wall: WallClock | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         window_check: Callable[[int, int | None], tuple[int, int | None]] | None = None,
+        status_events: bool = False,
+        event_sample_rate: float = 1.0,
+        event_jitter_s: float = 60.0,
+        restock_days: Sequence[int] = (),
+        restock_vendors: Sequence[str] = (),
     ) -> None:
         self._orders_fn = orders_fn
-        self._orders_url = target_url.rstrip("/") + "/orders"
+        self._api_base = target_url.rstrip("/")
+        self._orders_url = self._api_base + "/orders"
         self._inflight = inflight
         self._http_timeout_s = http_timeout_s
         self._drain_timeout_s = drain_timeout_s
@@ -183,6 +276,11 @@ class Playback:
         # Refuses impossible replay windows for every caller (CLI and
         # API alike); the CLI passes require_window bound to the cache.
         self._window_check = window_check
+        self._status_events = status_events
+        self._event_sample_rate = event_sample_rate
+        self._event_jitter_s = event_jitter_s
+        self._restock_days = tuple(restock_days)
+        self._restock_vendors = tuple(restock_vendors)
 
         self._state = IDLE
         self._wake = asyncio.Event()
@@ -194,16 +292,34 @@ class Playback:
         self._log: RunLog | None = None
         self._slots: asyncio.Semaphore | None = None
         self._send_tasks: set[asyncio.Task] = set()
+        # scheduled-but-not-yet-dispatched events and restocks:
+        # (sim deadline, rank, tiebreak a, tiebreak b, kind, payload)
+        self._heap: list[tuple] = []
 
         self._run_id = ""
         self._seed = 0
         self._from_day = 0
         self._to_day: int | None = None
+        self._seq = 0
         self._sent = 0
         self._acked = 0
         self._parked = 0
         self._refused = 0
         self._failed = 0
+        self._events_sent = 0
+        self._events_acked = 0
+        self._events_conflicted = 0
+        self._events_failed = 0
+        self._events_skipped = 0
+        self._restocks_sent = 0
+        self._restocks_acked = 0
+        self._restocks_failed = 0
+
+    def _next_seq(self) -> int:
+        """The send sequence number of the next dispatched item."""
+        seq = self._seq
+        self._seq += 1
+        return seq
 
     # --- state ------------------------------------------------------------
 
@@ -270,6 +386,17 @@ class Playback:
             "state_at_start": RUNNING,
             "wall_start_epoch": time.time(),
             "wall_start_monotonic": self._wall.now(),
+            # what the extras of this run do, so a log can be read
+            # against the config that produced it
+            "events": {
+                "enabled": self._status_events,
+                "sample_rate": self._event_sample_rate,
+                "jitter_s": self._event_jitter_s,
+            },
+            "restock": {
+                "days": list(self._restock_days),
+                "vendors": len(self._restock_vendors),
+            },
             **(meta_extra or {}),
         }
         try:
@@ -300,7 +427,29 @@ class Playback:
         self._seed = seed
         self._from_day = from_day
         self._to_day = to_day
+        self._seq = 0
         self._sent = self._acked = self._parked = self._refused = self._failed = 0
+        self._events_sent = 0
+        self._events_acked = 0
+        self._events_conflicted = 0
+        self._events_failed = 0
+        self._events_skipped = 0
+        self._restocks_sent = 0
+        self._restocks_acked = 0
+        self._restocks_failed = 0
+        self._heap = [
+            (
+                day * SECONDS_PER_DAY,
+                RANK_RESTOCK,
+                day,
+                vendor_index,
+                "restock",
+                None,
+            )
+            for day in self._restock_days
+            for vendor_index in range(len(self._restock_vendors))
+        ]
+        heapq.heapify(self._heap)
         self._slots = slots
         self._send_tasks.clear()
         self._done.clear()
@@ -360,6 +509,14 @@ class Playback:
             "orders_parked": self._parked,
             "orders_refused": self._refused,
             "orders_failed": self._failed,
+            "events_sent": self._events_sent,
+            "events_acked": self._events_acked,
+            "events_conflicted": self._events_conflicted,
+            "events_failed": self._events_failed,
+            "events_skipped": self._events_skipped,
+            "restocks_sent": self._restocks_sent,
+            "restocks_acked": self._restocks_acked,
+            "restocks_failed": self._restocks_failed,
             "inflight": len(self._send_tasks),
         }
 
@@ -383,20 +540,60 @@ class Playback:
         log, client, stream = self._log, self._client, self._stream
         assert log is not None and client is not None and stream is not None
         clock = self._simclock
+        sim_start = self._from_day * SECONDS_PER_DAY
         stopped = False
         failed = False
         try:
-            sim_start = self._from_day * SECONDS_PER_DAY
-            for seq, request in enumerate(stream):
-                target = to_sim_seconds(request.order_day, request.order_time)
-                await self._wait_until(target)
+            # One dispatcher, one total order: the next stream order
+            # against the earliest scheduled event or restock, both
+            # compared by (simulated instant, kind, stream position).
+            # Only this loop mutates the heap or pulls the stream, so a
+            # peek, a wait and a pop cannot race anything.
+            stream_items = enumerate(stream)
+            pending = next(stream_items, None)
+            while pending is not None or self._heap:
                 if self._state == STOPPING:
                     stopped = True
                     break
-                self._dispatch(seq, request, target - sim_start)
+                heap_next = self._heap[0][:4] if self._heap else None
+                if pending is not None and (heap_next is None or _stream_key(pending) <= heap_next):
+                    index, request = pending
+                    order_target = to_sim_seconds(request.order_day, request.order_time)
+                    await self._wait_until(order_target)
+                    if self._state == STOPPING:
+                        stopped = True
+                        break
+                    self._dispatch_order(order_target - sim_start, request)
+                    pending = next(stream_items, None)
+                else:
+                    deadline, _rank, tie_a, tie_b, kind, payload = heapq.heappop(self._heap)
+                    await self._wait_until(deadline)
+                    if self._state == STOPPING:
+                        stopped = True
+                        break
+                    if kind == "event":
+                        handle, to_status, jitter = payload
+                        # The event goes out only once the order's
+                        # outcome is known (it needs the order id, and
+                        # a refused order never moves through the
+                        # kitchen). The outcome always resolves: every
+                        # send finishes, errors within the HTTP
+                        # timeout, or is cancelled by the drain.
+                        await handle.future
+                        if self._state == PAUSED:
+                            # the outcome arrived while the run was
+                            # paused; the event waits for the resume
+                            # with the rest of the schedule
+                            await self._wake_or_end()
+                        if self._state == STOPPING:
+                            stopped = True
+                            break
+                        self._dispatch_event(deadline - sim_start, handle, to_status, jitter)
+                    else:
+                        self._dispatch_restock(deadline - sim_start, tie_a, tie_b)
                 # One loop turn per dispatch, even in a burst: sends and
                 # control requests must be able to run between the
-                # orders that are all due at once.
+                # items that are all due at once.
                 await asyncio.sleep(0)
         except Exception as error:  # noqa: BLE001 - the run must not die silently
             traceback.print_exc()
@@ -487,18 +684,135 @@ class Playback:
                 task.cancel()
             await asyncio.gather(sleep_task, wake_task, return_exceptions=True)
 
-    def _dispatch(self, seq: int, request: OrderRequest, sim_offset: float) -> None:
+    def _dispatch_order(self, sim_offset: float, request: OrderRequest) -> None:
+        seq = self._next_seq()
         self._sent += 1
-        task = asyncio.create_task(self._send_one(seq, request, sim_offset))
+        handle = self._schedule_events(seq, request, sim_offset)
+        task = asyncio.create_task(self._send_one(seq, request, sim_offset, handle))
         self._send_tasks.add(task)
         task.add_done_callback(self._send_tasks.discard)
 
-    async def _send_one(self, seq: int, request: OrderRequest, sim_offset: float) -> None:
+    def _schedule_events(
+        self, order_seq: int, request: OrderRequest, sim_offset: float
+    ) -> _OrderHandle | None:
+        """Reserve the order's status events, or None if it gets none.
+
+        The deadlines are fixed here, at dispatch: they depend on
+        nothing but the order's simulated instant, the seed and the
+        settings, never on when the ack arrives. Whether an event is
+        actually sent is decided later, by the order's outcome.
+        """
+        if not self._status_events:
+            return None
+        if self._event_sample_rate < 1.0 and (
+            stable_float(self._seed, request.external_order_id, "events-sample")
+            >= self._event_sample_rate
+        ):
+            return None  # this order is out of the sample: no events
+        sim_time = self._from_day * SECONDS_PER_DAY + sim_offset
+        handle = _OrderHandle(
+            asyncio.get_running_loop().create_future(), request, sim_time, order_seq
+        )
+        for index, (to_status, offset) in enumerate(EVENT_SCHEDULE):
+            jitter = (
+                stable_float(self._seed, request.external_order_id, f"events-jitter-{index}")
+                * self._event_jitter_s
+            )
+            # The jitter never reorders the four events of one order
+            # (the base gaps are at least 120 s and the jitter is below
+            # 60 s) and never moves one before the order itself. The
+            # tiebreak (dispatch sequence, event index) keeps two
+            # orders whose events land on the same simulated second in
+            # dispatch order.
+            heapq.heappush(
+                self._heap,
+                (
+                    sim_time + offset + jitter,
+                    RANK_EVENT,
+                    order_seq,
+                    index,
+                    "event",
+                    (handle, to_status, jitter),
+                ),
+            )
+        return handle
+
+    def _dispatch_event(
+        self, sim_offset: float, handle: _OrderHandle, to_status: OrderStatus, jitter: float
+    ) -> None:
+        outcome = handle.outcome
+        assert outcome is not None
+        assert self._log is not None
+        if not outcome.accepted or outcome.order_id is None:
+            # Parked, refused, failed or cancelled orders never move
+            # through the kitchen. The scheduled event still gets its
+            # line, with the reason, so the log carries one entry per
+            # scheduled event and the count is checkable.
+            seq = self._next_seq()
+            self._events_skipped += 1
+            self._log.add(
+                seq,
+                {
+                    "kind": "status_event",
+                    "seq": seq,
+                    "external_order_id": handle.request.external_order_id,
+                    "to_status": to_status.value,
+                    "sim_sent_at": round(sim_offset, 3),
+                    "skipped": True,
+                    "reason": outcome.reason,
+                },
+            )
+            self._log.flush()
+            return
+        seq = self._next_seq()
+        self._events_sent += 1
+        # The house style for event ids: deterministic, so the same
+        # replayed window produces the same event ids and a re-run is
+        # idempotent at the region (409 conflict, logged and counted).
+        record: dict[str, Any] = {
+            "kind": "status_event",
+            "seq": seq,
+            "external_order_id": handle.request.external_order_id,
+            "vendor_id": handle.request.vendor_id,
+            "order_id": outcome.order_id,
+            "to_status": to_status.value,
+            "event_id": str(uuid5(NAMESPACE_URL, f"{outcome.order_id}:{to_status.value}")),
+            "sim_sent_at": round(sim_offset, 3),
+            "jitter_s": round(jitter, 3),
+            "wall_sent_at": None,
+        }
+        task = asyncio.create_task(self._send_event(seq, record))
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
+
+    def _dispatch_restock(self, sim_offset: float, day: int, vendor_index: int) -> None:
+        seq = self._next_seq()
+        self._restocks_sent += 1
+        record: dict[str, Any] = {
+            "kind": "restock",
+            "seq": seq,
+            "vendor_id": self._restock_vendors[vendor_index],
+            "restock_day": day,
+            "sim_sent_at": round(sim_offset, 3),
+            "wall_sent_at": None,
+        }
+        task = asyncio.create_task(self._send_restock(seq, record))
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
+
+    async def _send_one(
+        self,
+        seq: int,
+        request: OrderRequest,
+        sim_offset: float,
+        handle: _OrderHandle | None = None,
+    ) -> None:
         assert self._log is not None and self._client is not None and self._slots is not None
         # The record exists before the semaphore: a task cancelled while
         # still queued for a slot was never sent, and the run log must
         # carry one line for every dispatched order either way.
         record: dict[str, Any] = {
+            "kind": "order",
             "seq": seq,
             "external_order_id": request.external_order_id,
             "order_day": request.order_day,
@@ -527,10 +841,78 @@ class Playback:
             self._log.add(seq, record)
             self._log.flush()
             self._failed += 1
+            if handle is not None:
+                # the dispatcher may be waiting on this order's outcome
+                handle.resolve(_OrderOutcome(False, None, "cancelled"))
+            raise
+        if handle is not None:
+            handle.resolve(_outcome_of(record))
+        record["wall_acked_at"] = round(self._wall.now(), 3)
+        self._log.add(seq, record)
+        self._log.flush()
+
+    async def _send_event(self, seq: int, record: dict[str, Any]) -> None:
+        url = f"{self._api_base}/vendors/{record['vendor_id']}/orders/{record['order_id']}/status"
+        await self._send_aux(
+            seq,
+            record,
+            url,
+            {"event_id": record["event_id"], "to_status": record["to_status"]},
+        )
+
+    async def _send_restock(self, seq: int, record: dict[str, Any]) -> None:
+        url = f"{self._api_base}/vendors/{record['vendor_id']}/restock"
+        await self._send_aux(seq, record, url, None)
+
+    async def _send_aux(
+        self,
+        seq: int,
+        record: dict[str, Any],
+        url: str,
+        body: dict[str, Any] | None,
+    ) -> None:
+        """Send one event or restock: the same slot, log and failure
+        discipline as an order send, with counters picked by kind."""
+        assert self._log is not None and self._client is not None and self._slots is not None
+        is_event = record["kind"] == "status_event"
+        try:
+            async with self._slots:
+                record["wall_sent_at"] = round(self._wall.now(), 3)
+                try:
+                    response = await self._client.post(url, json=body)
+                    record["http_status"] = response.status_code
+                    if is_event:
+                        record.update(_response_fields(response, EVENT_RESPONSE_FIELDS))
+                    if response.status_code in (200, 201):
+                        if is_event:
+                            self._events_acked += 1
+                        else:
+                            self._restocks_acked += 1
+                    elif is_event and response.status_code == 409:
+                        # a status change that lost to an earlier one:
+                        # the architecture says 409 on conflict, and a
+                        # re-replayed window hits it on purpose
+                        self._events_conflicted += 1
+                    else:
+                        self._count_aux_failed(record)
+                except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
+                    record["error"] = type(error).__name__
+                    self._count_aux_failed(record)
+        except asyncio.CancelledError:
+            record["error"] = "cancelled"
+            self._log.add(seq, record)
+            self._log.flush()
+            self._count_aux_failed(record)
             raise
         record["wall_acked_at"] = round(self._wall.now(), 3)
         self._log.add(seq, record)
         self._log.flush()
+
+    def _count_aux_failed(self, record: dict[str, Any]) -> None:
+        if record["kind"] == "status_event":
+            self._events_failed += 1
+        else:
+            self._restocks_failed += 1
 
     def _count(self, response: httpx.Response) -> None:
         if response.status_code in (200, 201):
@@ -553,15 +935,40 @@ class Playback:
         self._log.flush()
 
 
-def _response_fields(response: httpx.Response) -> dict[str, Any]:
-    """The pass-through fields of a POST /orders answer, if it sent any."""
+def _response_fields(
+    response: httpx.Response, fields: tuple[str, ...] = RESPONSE_FIELDS
+) -> dict[str, Any]:
+    """The pass-through fields of an answer, if it sent any."""
     try:
         body = response.json()
     except ValueError:
         return {"error": f"unparsable response body ({len(response.content)} bytes)"}
     if not isinstance(body, dict):
         return {"error": "response body is not a JSON object"}
-    return {field: body[field] for field in RESPONSE_FIELDS if field in body}
+    return {field: body[field] for field in fields if field in body}
+
+
+_REASONS = {200: "accepted", 201: "accepted", 202: "parked", 409: "refused"}
+
+
+def _outcome_of(record: dict[str, Any]) -> _OrderOutcome:
+    """What the order's send came to, for its scheduled events."""
+    status = record.get("http_status")
+    order_id = record.get("order_id")
+    accepted = status in (200, 201) and order_id is not None
+    reason: str = "failed"
+    if isinstance(status, int):
+        reason = _REASONS.get(status, "failed")
+    if "error" in record:
+        reason = record["error"]  # transport error, or "cancelled"
+    return _OrderOutcome(accepted, order_id, reason)
+
+
+def _stream_key(item: tuple[int, OrderRequest]) -> tuple[int, int, int, int]:
+    """The sort key of a (stream position, order) pair on the merged
+    timeline: (simulated instant, rank, position, 0)."""
+    index, request = item
+    return (to_sim_seconds(request.order_day, request.order_time), RANK_ORDER, index, 0)
 
 
 def default_run_id(seed: int) -> str:
