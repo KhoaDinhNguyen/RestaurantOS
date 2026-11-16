@@ -88,6 +88,27 @@ def app(argv: Sequence[str] | None = None) -> int:
         help="requests kept in flight at once (default ROS_SIM_PLAYBACK_INFLIGHT)",
     )
     pstart.add_argument(
+        "--events",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="send each accepted order its four status events "
+        "(default ROS_SIM_PLAYBACK_STATUS_EVENTS, on)",
+    )
+    pstart.add_argument(
+        "--event-sample-rate",
+        type=float,
+        default=None,
+        help="share of orders that get their full event set, 0 to 1 "
+        "(default ROS_SIM_PLAYBACK_EVENT_SAMPLE_RATE)",
+    )
+    pstart.add_argument(
+        "--restock-days",
+        type=int,
+        default=None,
+        help="restock every R days at 00:00:00 of days W+R, W+2R, ... "
+        "(default ROS_SIM_STOCK_RESTOCK_DAYS)",
+    )
+    pstart.add_argument(
         "--port",
         type=int,
         default=None,

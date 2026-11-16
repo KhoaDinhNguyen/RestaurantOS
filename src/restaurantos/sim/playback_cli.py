@@ -28,6 +28,7 @@ import httpx
 from restaurantos.common.config import get_settings
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.config import SimSettings, get_sim_settings
+from restaurantos.sim.loading import REFERENCE_COLUMNS, read_rows
 from restaurantos.sim.playback import Playback, StateError
 from restaurantos.sim.replaydata import (
     CacheMeta,
@@ -48,6 +49,26 @@ def _orders_fn(cache_file: Path):
     return make
 
 
+def restock_days(warm_up_days: int, restock_every: int, from_day: int, to_day: int) -> list[int]:
+    """Days W+R, W+2R, ... inside the replay window.
+
+    The first restock is a full interval after the warm-up window
+    (bootstrap set every counter to par on day W), and the caller's
+    window decides which of them this run contains.
+    """
+    if restock_every <= 0:
+        raise ValueError("the restock interval must be positive")
+    first = warm_up_days + restock_every
+    return [day for day in range(first, to_day + 1, restock_every) if day >= from_day]
+
+
+def restock_vendors(data_dir: Path) -> list[str]:
+    """Every vendor, sorted: restock order must not depend on the CSV's
+    row order."""
+    columns = REFERENCE_COLUMNS["vendors.csv"]
+    return sorted(row[0] for row in read_rows(data_dir / "vendors.csv", columns))
+
+
 async def start_command(args: argparse.Namespace) -> int:
     common = get_settings()
     sim = get_sim_settings()
@@ -66,6 +87,20 @@ async def start_command(args: argparse.Namespace) -> int:
     speed = args.speed or sim.playback_speed
     inflight = args.inflight or sim.playback_inflight
     target = args.target or sim.playback_target_url
+    events_on = sim.playback_status_events if args.events is None else args.events
+    event_rate = (
+        args.event_sample_rate
+        if args.event_sample_rate is not None
+        else sim.playback_event_sample_rate
+    )
+    restock_every = args.restock_days if args.restock_days is not None else sim.stock_restock_days
+    last_day = to_day if to_day is not None else meta.last_day
+    try:
+        days = restock_days(meta.warm_up_days, restock_every, from_day, last_day)
+        vendors = restock_vendors(data_dir)
+    except (OSError, RuntimeError) as error:
+        print(f"rosctl playback start: {error}", file=sys.stderr)
+        return 1
     playback = Playback(
         _orders_fn(data_dir / "cached" / "orders-sorted.jsonl"),
         target_url=target,
@@ -76,6 +111,11 @@ async def start_command(args: argparse.Namespace) -> int:
         default_speed=sim.playback_speed,
         # the window is refused, never clamped, for API starts as well
         window_check=lambda f, t: require_window(meta, f, t),
+        status_events=events_on,
+        event_sample_rate=event_rate,
+        event_jitter_s=sim.playback_event_jitter_s,
+        restock_days=days,
+        restock_vendors=vendors,
     )
 
     from restaurantos.sim.control import make_control_app
@@ -120,10 +160,14 @@ async def start_command(args: argparse.Namespace) -> int:
                 "argv": sys.argv[1:],
             },
         )
+        events_note = "on" if events_on else "off"
+        if events_on and event_rate < 1.0:
+            events_note += f" (sample rate {event_rate})"
         print(
             f"run {playback.status()['run_id']} started: {from_day} -> "
             f"{to_day if to_day is not None else meta.last_day}, speed {speed}x, "
-            f"{inflight} in flight, control on {sim.control_host}:"
+            f"{inflight} in flight, events {events_note}, restock on "
+            f"{len(days)} day(s) x {len(vendors)} vendors, control on {sim.control_host}:"
             f"{args.port or sim.control_port}",
             file=sys.stderr,
         )

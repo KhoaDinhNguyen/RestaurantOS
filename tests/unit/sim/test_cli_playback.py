@@ -110,6 +110,47 @@ def test_build_cache_reports_a_missing_manifest(tmp_path, capsys, monkeypatch, f
     assert "MANIFEST.csv" in capsys.readouterr().err
 
 
+def test_start_help_lists_the_extras_flags(capsys):
+    with pytest.raises(SystemExit):
+        app(["playback", "start", "--help"])
+    out = capsys.readouterr().out
+    for flag in ("--events", "--no-events", "--event-sample-rate", "--restock-days"):
+        assert flag in out
+
+
+# --- restock helpers ---------------------------------------------------------
+
+
+def test_restock_days_are_the_interval_days_inside_the_window():
+    from restaurantos.sim.playback_cli import restock_days
+
+    # W=14, R=7: the first restock is a full interval after day W
+    assert restock_days(14, 7, 14, 90) == [21, 28, 35, 42, 49, 56, 63, 70, 77, 84]
+    # a window that starts later keeps only the days it contains
+    assert restock_days(14, 7, 25, 90) == [28, 35, 42, 49, 56, 63, 70, 77, 84]
+    # a window that ends before the first restock day restocks nothing
+    assert restock_days(14, 7, 14, 20) == []
+    assert restock_days(14, 7, 21, 27) == [21]
+
+    with pytest.raises(ValueError, match="positive"):
+        restock_days(14, 0, 14, 90)
+
+
+def test_restock_vendors_are_sorted_and_header_checked(tmp_path):
+    from restaurantos.sim.loading import REFERENCE_COLUMNS
+    from restaurantos.sim.playback_cli import restock_vendors
+
+    columns = ",".join(REFERENCE_COLUMNS["vendors.csv"])
+    (tmp_path / "vendors.csv").write_text(
+        columns + "\nv9,,w21z7,x\nv1,,w21z7,x\nv5,,w21z6,y\n", encoding="utf-8"
+    )
+    assert restock_vendors(tmp_path) == ["v1", "v5", "v9"]
+
+    (tmp_path / "vendors.csv").write_text("wrong,header\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="header"):
+        restock_vendors(tmp_path)
+
+
 def test_start_refuses_a_window_inside_the_warmup(tmp_path, monkeypatch, capsys, fresh_settings):
     # a tiny valid data directory whose cache starts at day 14
     import hashlib
