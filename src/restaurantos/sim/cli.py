@@ -1,9 +1,10 @@
 """The rosctl command line (WP6a). pyproject.toml points the `rosctl`
 script at app().
 
-`bootstrap` and `playback` exist; the other subcommands are the rest of
-WP6a and are registered so that `rosctl --help` shows the full shape of
-the tool while it is being built.
+`bootstrap`, `playback` and `baseline sync` exist; the other
+subcommands are the rest of WP6a and are registered so that
+`rosctl --help` shows the full shape of the tool while it is being
+built.
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from pathlib import Path
 NOT_BUILT = {
     "up": "start the services (WP6a, later)",
     "down": "stop the services (WP6a, later)",
-    "baseline": "sync the baseline node (WP6a, later)",
     "control": "the control API for the fault tests (WP6b)",
 }
 
@@ -151,6 +151,23 @@ def app(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="warm-up window W (default ROS_SIM_STOCK_WARM_UP_DAYS)",
     )
+    # --- baseline -------------------------------------------------------
+    base = sub.add_parser(
+        "baseline",
+        help="the single-node comparison database",
+    )
+    bsub = base.add_subparsers(dest="baseline_command", required=True)
+    bsync = bsub.add_parser(
+        "sync",
+        help="copy the regions' orders, order_items, stock and "
+        "product_availability into the baseline node",
+    )
+    bsync.add_argument(
+        "--config",
+        type=Path,
+        default=Path("infra/cluster.toml"),
+        help="cluster description to copy from (default: infra/cluster.toml)",
+    )
 
     for name, helptext in NOT_BUILT.items():
         sub.add_parser(name, help=helptext)
@@ -182,5 +199,19 @@ def app(argv: Sequence[str] | None = None) -> int:
             # message, not a traceback.
             print(f"rosctl playback {args.play_command}: {error}", file=sys.stderr)
             return 1
+    if args.command == "baseline" and args.baseline_command == "sync":
+        from restaurantos.common.cluster import load_cluster
+        from restaurantos.sim.baseline_sync import BaselineSyncError, format_report, sync
+        from restaurantos.sim.config import get_sim_settings
+
+        try:
+            counts = sync(load_cluster(args.config), get_sim_settings())
+        except BaselineSyncError as error:
+            # playback still live, a region down, a sick control
+            # endpoint: the message says what to do about it.
+            print(f"rosctl baseline sync: {error}", file=sys.stderr)
+            return 1
+        print(format_report(counts))
+        return 0
     print(f"rosctl {args.command}: not built yet ({NOT_BUILT[args.command]})", file=sys.stderr)
     return 2

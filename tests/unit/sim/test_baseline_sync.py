@@ -12,9 +12,11 @@ import pytest
 from conftest import FakeWallClock, make_playback, sample_orders
 
 from restaurantos.sim.baseline_sync import (
+    BaselineSyncError,
     format_report,
     playback_refusal,
 )
+from restaurantos.sim.cli import app
 from restaurantos.sim.control import make_control_app
 
 
@@ -188,3 +190,45 @@ def test_report_lists_each_region_and_a_total():
 def test_report_covers_every_synced_table():
     counts = {"r1": {table: 1 for table in ("orders", "order_items", "stock")}}
     assert "product_availability 0" in format_report(counts)
+
+
+# --- the CLI --------------------------------------------------------------------
+
+
+def test_baseline_help_works(capsys):
+    for args in (["baseline", "--help"], ["baseline", "sync", "--help"]):
+        with pytest.raises(SystemExit) as caught:
+            app(args)
+        assert caught.value.code == 0, args
+
+
+def test_baseline_needs_a_subcommand(capsys):
+    with pytest.raises(SystemExit) as caught:
+        app(["baseline"])
+    assert caught.value.code == 2
+
+
+def test_sync_refusal_is_printed_as_a_message(capsys, monkeypatch):
+    def refuse(cluster, settings, **kwargs):
+        raise BaselineSyncError(
+            "refusing to sync the baseline: playback run 'probe-1' is running "
+            "with 0 request(s) still in flight"
+        )
+
+    monkeypatch.setattr("restaurantos.sim.baseline_sync.sync", refuse)
+    assert app(["baseline", "sync"]) == 1
+    err = capsys.readouterr().err
+    assert "rosctl baseline sync:" in err
+    assert "probe-1" in err
+    assert "Traceback" not in err
+
+
+def test_sync_prints_the_report_and_exits_zero(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "restaurantos.sim.baseline_sync.sync",
+        lambda cluster, settings, **kwargs: {"r1": {"orders": 3, "order_items": 4, "stock": 5}},
+    )
+    assert app(["baseline", "sync"]) == 0
+    out = capsys.readouterr().out
+    assert "r1: orders 3, order_items 4, stock 5, product_availability 0" in out
+    assert "total: orders 3, order_items 4, stock 5, product_availability 0" in out
