@@ -1,6 +1,7 @@
 """FastAPI application for the RestaurantOS gateway and edge API."""
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -16,7 +17,9 @@ from restaurantos.common.errors import (
     UnknownVendorError,
 )
 from restaurantos.common.models import OrderRequest, OrderResponse
+from restaurantos.gateway.config import get_gateway_settings
 from restaurantos.gateway.directory import DirectoryCache, get_regions
+from restaurantos.gateway.edge import EdgePrimary, run_edge
 from restaurantos.gateway.menu import get_vendor_menu
 from restaurantos.gateway.orders import (
     get_order_status,
@@ -31,14 +34,40 @@ from restaurantos.gateway.pools import RegionPools
 from restaurantos.gateway.summary import get_region_summary
 
 
+async def refresh_directory_periodically(
+    directory: DirectoryCache,
+    hq_pool,
+    interval_s: float,
+) -> None:
+    """Refresh the Gateway shard directory on its configured interval."""
+    while True:
+        await asyncio.sleep(interval_s)
+        await directory.refresh(hq_pool)
+
+
+async def refresh_edge_primary_periodically(
+    primary: EdgePrimary,
+    interval_s: float,
+) -> None:
+    """Refresh the edge API's local primary on its configured interval."""
+    while True:
+        await asyncio.sleep(interval_s)
+        await primary.refresh()
+
+
 def create_app() -> FastAPI:
     """Create the gateway or edge FastAPI application."""
     settings = get_settings()
     cluster = load_cluster(settings.cluster_file)
+    gateway_settings = get_gateway_settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        region_pools = RegionPools(cluster, settings)
+        region_pools = RegionPools(
+            cluster,
+            settings,
+            direct=settings.mode == "edge",
+        )
         app.state.region_pools = region_pools
 
         if settings.mode == "gateway":
@@ -57,11 +86,47 @@ def create_app() -> FastAPI:
             await directory.refresh(hq_pool)
             app.state.directory = directory
 
+            directory_refresh_task = asyncio.create_task(
+                refresh_directory_periodically(
+                    directory,
+                    hq_pool,
+                    gateway_settings.directory_refresh_s,
+                )
+            )
+        else:
+            if settings.region_id is None:
+                raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+            edge_primary = EdgePrimary(
+                cluster,
+                settings.region_id,
+                settings,
+            )
+            await edge_primary.refresh()
+            app.state.edge_primary = edge_primary
+
+            edge_primary_task = asyncio.create_task(
+                refresh_edge_primary_periodically(
+                    edge_primary,
+                    gateway_settings.local_check_s,
+                )
+            )
+
         try:
             yield
         finally:
             if settings.mode == "gateway":
+                directory_refresh_task.cancel()
+
+                with suppress(asyncio.CancelledError):
+                    await directory_refresh_task
+
                 await app.state.hq_pool.close()
+            else:
+                edge_primary_task.cancel()
+
+                with suppress(asyncio.CancelledError):
+                    await edge_primary_task
 
             await region_pools.close()
 
@@ -77,6 +142,7 @@ def create_app() -> FastAPI:
     )
 
     gateway = APIRouter(prefix="/api/v1")
+    edge = APIRouter(prefix="/api/v1")
 
     @app.exception_handler(RegionUnreachableError)
     async def region_unreachable_handler(
@@ -131,6 +197,30 @@ def create_app() -> FastAPI:
             route.region_id,
         )
 
+    @edge.get("/vendors/{vendor_id}/menu")
+    async def edge_vendor_menu(
+        vendor_id: str,
+        request: Request,
+    ) -> list[dict[str, object]]:
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work():
+            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+
+            return await get_vendor_menu(
+                pool,
+                vendor_id,
+                region_id,
+            )
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
+
     @app.get("/internal/probe/{node_id}")
     async def internal_probe(node_id: str) -> dict[str, object]:
         if node_id not in cluster.nodes:
@@ -173,6 +263,32 @@ def create_app() -> FastAPI:
             route.region_id,
         )
 
+    @edge.get("/vendors/{vendor_id}/orders/{order_id}")
+    async def edge_order_status(
+        vendor_id: str,
+        order_id: UUID,
+        request: Request,
+    ) -> dict[str, object]:
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work():
+            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+
+            return await get_order_status(
+                pool,
+                vendor_id,
+                order_id,
+                region_id,
+            )
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
+
     @gateway.get("/vendors/{vendor_id}/orders")
     async def vendor_orders(
         vendor_id: str,
@@ -189,6 +305,34 @@ def create_app() -> FastAPI:
             day,
             status,
             route.region_id,
+        )
+
+    @edge.get("/vendors/{vendor_id}/orders")
+    async def edge_vendor_orders(
+        vendor_id: str,
+        day: int,
+        request: Request,
+        status: str | None = None,
+    ) -> list[dict[str, object]]:
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work():
+            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+
+            return await get_vendor_orders(
+                pool,
+                vendor_id,
+                day,
+                status,
+                region_id,
+            )
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
         )
 
     @gateway.get("/regions/{region_id}/summary")
@@ -217,6 +361,33 @@ def create_app() -> FastAPI:
             pool,
             region_id,
             day,
+        )
+
+    @edge.get("/regions/{region_id}/summary")
+    async def edge_region_summary(
+        region_id: str,
+        request: Request,
+        day: int,
+    ) -> dict[str, object]:
+        if region_id != settings.region_id:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found"},
+            )
+
+        async def work():
+            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+
+            return await get_region_summary(
+                pool,
+                region_id,
+                day,
+            )
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
         )
 
     @gateway.post(
@@ -304,6 +475,8 @@ def create_app() -> FastAPI:
 
     if settings.mode == "gateway":
         app.include_router(gateway)
+    else:
+        app.include_router(edge)
 
     return app
 

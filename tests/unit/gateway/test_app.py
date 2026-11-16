@@ -1,5 +1,7 @@
+import asyncio
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 from restaurantos.gateway.app import create_app
@@ -581,7 +583,7 @@ def test_create_order_parks_when_retry_after_stale_epoch_is_unreachable(
     assert region_pools.get.await_args_list[1].args == ("r1-standby",)
 
 
-def test_gateway_only_routes_not_registered_in_edge_mode(monkeypatch) -> None:
+def test_hq_only_routes_not_registered_in_edge_mode(monkeypatch) -> None:
     from restaurantos.common.config import Settings
 
     edge_settings = Settings(
@@ -602,4 +604,324 @@ def test_gateway_only_routes_not_registered_in_edge_mode(monkeypatch) -> None:
     assert client.get("/health").json()["mode"] == "edge"
 
     assert client.get("/api/v1/regions").status_code == 404
-    assert client.get("/api/v1/vendors/v001/menu").status_code == 404
+    assert client.post("/api/v1/orders", json={}).status_code == 404
+
+
+async def test_periodic_directory_refresh(monkeypatch) -> None:
+    from restaurantos.gateway import app as gateway_app
+
+    directory = AsyncMock()
+    hq_pool = object()
+
+    sleeps = 0
+
+    async def fake_sleep(delay):
+        nonlocal sleeps
+        sleeps += 1
+
+        assert delay == 5.0
+
+        if sleeps > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(gateway_app.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await gateway_app.refresh_directory_periodically(
+            directory,
+            hq_pool,
+            5.0,
+        )
+
+    directory.refresh.assert_awaited_once_with(hq_pool)
+
+
+async def test_periodic_edge_primary_refresh(monkeypatch) -> None:
+    from restaurantos.gateway import app as gateway_app
+
+    primary = AsyncMock()
+    sleeps = 0
+
+    async def fake_sleep(delay):
+        nonlocal sleeps
+        sleeps += 1
+
+        assert delay == 1.0
+
+        if sleeps > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(gateway_app.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await gateway_app.refresh_edge_primary_periodically(
+            primary,
+            1.0,
+        )
+
+    primary.refresh.assert_awaited_once_with()
+
+
+def test_edge_mode_finds_primary_at_startup(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    primary = AsyncMock()
+    primary.refresh.return_value = "r1-primary"
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "EdgePrimary",
+        lambda *args, **kwargs: primary,
+    )
+
+    app = gateway_app.create_app()
+
+    with TestClient(app):
+        pass
+
+    primary.refresh.assert_awaited()
+
+
+def test_edge_vendor_menu_uses_local_primary(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_get_vendor_menu(pool, vendor_id, region_id):
+        assert pool == "edge-pool"
+        assert vendor_id == "v001"
+        assert region_id == "r1"
+
+        return [
+            {
+                "vendor_id": "v001",
+                "product_id": "p003",
+                "name": "Menu item 003",
+                "price_units": 2,
+                "menu_version": 1,
+                "reason": None,
+                "available": True,
+            }
+        ]
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "get_vendor_menu",
+        fake_get_vendor_menu,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.get_pool.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = AsyncMock()
+
+    client = TestClient(app)
+    response = client.get("/api/v1/vendors/v001/menu")
+
+    assert response.status_code == 200
+    assert response.json()[0]["product_id"] == "p003"
+
+    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+
+
+def test_edge_vendor_menu_returns_503_without_primary(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.common.errors import RegionUnreachableError
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.get_pool.side_effect = RegionUnreachableError(region_id="r1")
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = AsyncMock()
+
+    client = TestClient(app)
+    response = client.get("/api/v1/vendors/v001/menu")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "region_unreachable",
+        "region_id": "r1",
+    }
+
+
+def test_edge_summary_rejects_other_region(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+
+    app = gateway_app.create_app()
+    client = TestClient(app)
+
+    response = client.get("/api/v1/regions/r2/summary?day=14")
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "not_found"}
+
+
+def test_edge_summary_uses_local_primary(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_get_region_summary(pool, region_id, day):
+        assert pool == "edge-pool"
+        assert region_id == "r1"
+        assert day == 14
+
+        return {
+            "region_id": "r1",
+            "day": 14,
+            "epoch": 1,
+            "menu_version": 1,
+            "vendors": 1,
+            "orders": {
+                "total": 3,
+                "received": 0,
+                "accepted": 3,
+                "preparing": 0,
+                "ready": 0,
+                "picked_up": 0,
+                "canceled": 0,
+            },
+            "refused": 0,
+            "sales_units": 24,
+            "products_unavailable": 0,
+            "outbox_backlog": 0,
+            "data_as_of": None,
+        }
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "get_region_summary",
+        fake_get_region_summary,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.get_pool.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = AsyncMock()
+
+    client = TestClient(app)
+    response = client.get("/api/v1/regions/r1/summary?day=14")
+
+    assert response.status_code == 200
+    assert response.json()["region_id"] == "r1"
+    assert response.json()["orders"]["total"] == 3
+
+    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+
+
+def test_edge_menu_refreshes_primary_after_database_error(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.common.errors import RegionUnreachableError
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_get_vendor_menu(pool, vendor_id, region_id):
+        raise RegionUnreachableError(region_id=region_id)
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "get_vendor_menu",
+        fake_get_vendor_menu,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.get_pool.return_value = object()
+    edge_primary.refresh.return_value = "r1-standby"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = AsyncMock()
+
+    client = TestClient(app)
+    response = client.get("/api/v1/vendors/v001/menu")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "region_unreachable",
+        "region_id": "r1",
+    }
+
+    edge_primary.refresh.assert_awaited_once_with()

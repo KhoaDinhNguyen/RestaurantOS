@@ -27,6 +27,13 @@ async def test_region_pool_is_reused(monkeypatch) -> None:
     assert make_pool.call_count == 1
     pool.open.assert_awaited_once()
 
+    node_conninfo.assert_called_once_with(
+        manager.cluster,
+        "r1-primary",
+        direct=False,
+        settings=manager.settings,
+    )
+
 
 async def test_region_pools_close_all(monkeypatch) -> None:
     first_pool = AsyncMock()
@@ -48,3 +55,77 @@ async def test_region_pools_close_all(monkeypatch) -> None:
 
     first_pool.close.assert_awaited_once()
     second_pool.close.assert_awaited_once()
+
+
+async def test_region_pool_can_connect_directly(monkeypatch) -> None:
+    pool = AsyncMock()
+
+    make_pool = Mock(return_value=pool)
+    node_conninfo = Mock(return_value="test-conninfo")
+
+    monkeypatch.setattr(pools, "make_pool", make_pool)
+    monkeypatch.setattr(pools, "node_conninfo", node_conninfo)
+
+    settings = Settings(network="host")
+    cluster = Cluster(regions=1)
+
+    manager = pools.RegionPools(
+        cluster,
+        settings,
+        direct=True,
+    )
+
+    result = await manager.get("r1-primary")
+
+    assert result is pool
+
+    node_conninfo.assert_called_once_with(
+        cluster,
+        "r1-primary",
+        direct=True,
+        settings=settings,
+    )
+
+    pool.open.assert_awaited_once()
+
+
+async def test_region_pool_drop_closes_and_forgets_pool(monkeypatch) -> None:
+    first_pool = AsyncMock()
+    second_pool = AsyncMock()
+
+    make_pool = Mock(
+        side_effect=[
+            first_pool,
+            second_pool,
+        ]
+    )
+
+    monkeypatch.setattr(
+        pools,
+        "make_pool",
+        make_pool,
+    )
+    monkeypatch.setattr(
+        pools,
+        "node_conninfo",
+        Mock(return_value="test-conninfo"),
+    )
+
+    manager = pools.RegionPools(
+        Cluster(regions=1),
+        Settings(network="host"),
+    )
+
+    first = await manager.get("r1-primary")
+
+    await manager.drop("r1-primary")
+
+    second = await manager.get("r1-primary")
+
+    assert first is first_pool
+    assert second is second_pool
+    assert second is not first
+
+    first_pool.close.assert_awaited_once()
+    first_pool.open.assert_awaited_once()
+    second_pool.open.assert_awaited_once()
