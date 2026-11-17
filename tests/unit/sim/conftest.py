@@ -135,7 +135,8 @@ def make_playback(
     status_events: bool = False,
     event_sample_rate: float = 1.0,
     event_jitter_s: float = 60.0,
-    restock_days: Sequence[int] = (),
+    restock_every: int | None = None,
+    warm_up_days: int = 0,
     restock_vendors: Sequence[str] = (),
 ) -> Playback:
     """An engine over a fixed order list, posting to an in-process stub."""
@@ -155,7 +156,8 @@ def make_playback(
         status_events=status_events,
         event_sample_rate=event_sample_rate,
         event_jitter_s=event_jitter_s,
-        restock_days=restock_days,
+        restock_every=restock_every,
+        warm_up_days=warm_up_days,
         restock_vendors=restock_vendors,
     )
 

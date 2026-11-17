@@ -16,6 +16,7 @@ from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
+import pytest
 from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
@@ -334,28 +335,27 @@ async def test_restock_goes_out_before_the_days_first_order(tmp_path: Path) -> N
     """At 00:00:00 of each restock day, every vendor, ahead of that
     day's first order - even one placed at exactly midnight."""
     orders = [
-        make_order(15, 0, 0, 0, "1001"),  # midnight sharp
-        make_order(15, 0, 0, 10, "1002"),
-        make_order(15, 0, 0, 20, "1003"),
+        make_order(21, 0, 0, 0, "1001"),  # midnight sharp
+        make_order(21, 0, 0, 10, "1002"),
+        make_order(21, 0, 0, 20, "1003"),
     ]
     clock = FakeWallClock()
     pb = make_playback(
         orders,
         tmp_path,
         clock=clock,
-        restock_days=(15,),
+        restock_every=7,  # W=14: restock days are 21, 28, ...
+        warm_up_days=14,
         restock_vendors=("v002", "v001"),  # engine sends them in this order
     )
-    # 10,000x: day 15 starts 86,400 simulated seconds in, which is 8.64
-    # fake wall seconds - inside the driver's step budget
-    await pb.start(seed=0, from_day=14, to_day=15, speed=10_000.0, run_id="restock")
+    await pb.start(seed=0, from_day=21, to_day=21, speed=100.0, run_id="restock")
     await drive(pb, clock)
 
     lines = run_log_lines(tmp_path, pb)
     assert [line["kind"] for line in lines[:2]] == ["restock", "restock"]
     assert [line["vendor_id"] for line in lines[:2]] == ["v002", "v001"]
-    assert [line["restock_day"] for line in lines[:2]] == [15, 15]
-    assert [line["sim_sent_at"] for line in lines[:2]] == [86400.0, 86400.0]
+    assert [line["restock_day"] for line in lines[:2]] == [21, 21]
+    assert [line["sim_sent_at"] for line in lines[:2]] == [0.0, 0.0]
     assert [line["http_status"] for line in lines[:2]] == [201, 201]
     assert [line["kind"] for line in lines[2:]] == ["order"] * 3
     status = pb.status()
@@ -363,14 +363,86 @@ async def test_restock_goes_out_before_the_days_first_order(tmp_path: Path) -> N
     assert status["restocks_acked"] == 2
 
 
+async def test_restock_days_follow_each_runs_window(tmp_path: Path) -> None:
+    """The restock days are computed per run, from the run's own window:
+    a second start on the same engine never sees the first run's days
+    (CodeRabbit round 1, 2). A day before the new from_day would fire
+    at once; a day after the new to_day would keep the run alive."""
+    engine_orders = [make_order(21, 0, 0, 5, "1001"), make_order(28, 0, 0, 5, "1002")]
+    pb = make_playback(
+        engine_orders,
+        tmp_path,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001",),
+    )
+
+    await pb.start(seed=0, from_day=21, to_day=21, speed=1e9, run_id="day21")
+    await pb.wait_done()
+    days_21 = [
+        line["restock_day"] for line in run_log_lines(tmp_path, pb) if line["kind"] == "restock"
+    ]
+    assert days_21 == [21]
+
+    await pb.start(seed=0, from_day=28, to_day=28, speed=1e9, run_id="day28")
+    await pb.wait_done()
+    lines = run_log_lines(tmp_path, pb)
+    restocks = [line for line in lines if line["kind"] == "restock"]
+    assert [line["restock_day"] for line in restocks] == [28]
+    # every restock of the second run starts inside its own window
+    assert all(line["sim_sent_at"] >= 0 for line in restocks)
+    # and the meta of the second run describes the second run
+    meta = json.loads((tmp_path / "day28" / "meta.json").read_text())
+    assert meta["restock"]["days"] == [28]
+
+
+async def test_a_window_without_restock_days_sends_none(tmp_path: Path) -> None:
+    """A window that ends before the first restock day (W+R) contains
+    no restock, and the run ends with its last order, not with a wait
+    for a restock that no order needs."""
+    orders = [make_order(14, 0, 0, 5, "1001"), make_order(15, 0, 0, 5, "1002")]
+    pb = make_playback(
+        orders,
+        tmp_path,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001",),
+    )
+    await pb.start(seed=0, from_day=14, to_day=20, speed=1e9, run_id="early")
+    await pb.wait_done()
+    assert pb.status()["state"] == "done"
+    assert pb.status()["restocks_sent"] == 0
+    assert all(line["kind"] == "order" for line in run_log_lines(tmp_path, pb))
+
+
+async def test_restock_needs_a_to_day(tmp_path: Path) -> None:
+    """Without to_day the window has no end to intersect with the
+    interval days: restock refuses to guess (review item 1)."""
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, restock_every=7, warm_up_days=14)
+    with pytest.raises(ValueError, match="restock needs to_day"):
+        await pb.start(seed=0, from_day=14, to_day=None, speed=1e9, run_id="open")
+    # and the refusal did not burn the run id
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="open")
+    await drive(pb, clock)
+    assert pb.status()["state"] == "done"
+
+
 async def test_restock_on_the_first_day_goes_out_first(tmp_path: Path) -> None:
     """A restock day at the very start of the window fires at simulated
-    zero, before the first order of the run."""
+    zero, before the first order of the run (W=7 and R=7: day 14 is
+    W+R)."""
     orders = [make_order(14, 0, 0, 1, "1001")]
-    clock = FakeWallClock()
-    pb = make_playback(orders, tmp_path, clock=clock, restock_days=(14,), restock_vendors=("v001",))
-    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="day14")
-    await drive(pb, clock)
+    pb = make_playback(
+        orders,
+        tmp_path,
+        restock_every=7,
+        warm_up_days=7,
+        restock_vendors=("v001",),
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="day14")
+    await pb.wait_done()
     lines = run_log_lines(tmp_path, pb)
     assert lines[0]["kind"] == "restock"
     assert lines[0]["sim_sent_at"] == 0.0
@@ -391,7 +463,8 @@ async def _extras_scenario(runs_dir: Path, orders, seed: int) -> str:
         clock=clock,
         inflight=4,
         status_events=True,
-        restock_days=(14,),
+        restock_every=7,
+        warm_up_days=7,  # day 14 is W+R: the scenario restocks at start
         restock_vendors=("v001", "v002"),
     )
     client = httpx.AsyncClient(
@@ -400,7 +473,7 @@ async def _extras_scenario(runs_dir: Path, orders, seed: int) -> str:
     try:
         response = await client.post(
             "/sim/playback",
-            json={"action": "start", "from_day": 14, "speed": 100.0, "seed": seed},
+            json={"action": "start", "from_day": 14, "to_day": 14, "speed": 100.0, "seed": seed},
         )
         assert response.status_code == 200, response.text
 
@@ -490,11 +563,12 @@ async def test_meta_records_the_extras(tmp_path: Path) -> None:
         clock=clock,
         status_events=True,
         event_sample_rate=0.5,
-        restock_days=(14, 21),
+        restock_every=7,
+        warm_up_days=14,
         restock_vendors=("v001",),
     )
     await pb.start(seed=3, from_day=14, to_day=21, speed=100.0, run_id="meta")
     await pb.stop()
     meta = json.loads((tmp_path / "meta" / "meta.json").read_text())
     assert meta["events"] == {"enabled": True, "sample_rate": 0.5, "jitter_s": 60.0}
-    assert meta["restock"] == {"days": [14, 21], "vendors": 1}
+    assert meta["restock"] == {"days": [21], "vendors": 1}

@@ -171,7 +171,7 @@ def test_start_help_lists_the_extras_flags(capsys):
 
 
 def test_restock_days_are_the_interval_days_inside_the_window():
-    from restaurantos.sim.playback_cli import restock_days
+    from restaurantos.sim.playback import restock_days
 
     # W=14, R=7: the first restock is a full interval after day W
     assert restock_days(14, 7, 14, 90) == [21, 28, 35, 42, 49, 56, 63, 70, 77, 84]

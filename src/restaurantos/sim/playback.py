@@ -127,6 +127,20 @@ EVENT_SCHEDULE: tuple[tuple[OrderStatus, int], ...] = (
 RANK_RESTOCK, RANK_ORDER, RANK_EVENT = 0, 1, 2
 
 
+def restock_days(warm_up_days: int, restock_every: int, from_day: int, to_day: int) -> list[int]:
+    """Days W+R, W+2R, ... inside one run's replay window.
+
+    The first restock is a full interval after the warm-up window
+    (bootstrap set every counter to par on day W); which of the
+    interval days a run contains depends on that run's window, so the
+    list is computed per run, in `start`, never per engine.
+    """
+    if restock_every <= 0:
+        raise ValueError("the restock interval must be positive")
+    first = warm_up_days + restock_every
+    return [day for day in range(first, to_day + 1, restock_every) if day >= from_day]
+
+
 @dataclass(frozen=True)
 class _OrderOutcome:
     """What the gateway answered, boiled down to what an event needs."""
@@ -227,9 +241,10 @@ class Playback:
     The extras (status events, restock) are opt-in here: the engine's
     defaults keep a run order-only, while the CLI turns them on from
     the settings (`ROS_SIM_PLAYBACK_STATUS_EVENTS` is on by default).
-    `restock_days` is the list of days to restock on - the caller
-    picks the days inside its replay window; `restock_vendors` is the
-    vendors to restock, in the order they go out.
+    `restock_every` is R, the restock interval in days (`None`: no
+    restock); the restock days are computed per run, from `warm_up_days`
+    (W) and the run's own window, so two runs on one engine never see
+    each other's restock days.
 
     Known seam, deliberately out of scope here (it belongs with the
     snapshot work, which needs "pause and wait for in-flight" anyway):
@@ -260,7 +275,8 @@ class Playback:
         status_events: bool = False,
         event_sample_rate: float = 1.0,
         event_jitter_s: float = 60.0,
-        restock_days: Sequence[int] = (),
+        restock_every: int | None = None,
+        warm_up_days: int = 0,
         restock_vendors: Sequence[str] = (),
     ) -> None:
         self._orders_fn = orders_fn
@@ -279,7 +295,8 @@ class Playback:
         self._status_events = status_events
         self._event_sample_rate = event_sample_rate
         self._event_jitter_s = event_jitter_s
-        self._restock_days = tuple(restock_days)
+        self._restock_every = restock_every
+        self._warm_up_days = warm_up_days
         self._restock_vendors = tuple(restock_vendors)
 
         self._state = IDLE
@@ -352,6 +369,24 @@ class Playback:
         if self._window_check is not None:
             from_day, to_day = self._window_check(from_day, to_day)
 
+        # The restock days belong to this run's window, not to the
+        # engine: a later start with a different window must never see
+        # a restock from outside it (a day before from_day would fire
+        # at once, a day after to_day would keep the run waiting for an
+        # order that never comes). Without a to_day the window has no
+        # end to intersect with, so restock needs one.
+        if self._restock_every is not None:
+            if to_day is None:
+                raise ValueError(
+                    "restock needs to_day: pass to_day so the run knows "
+                    "which restock days its window contains"
+                )
+            run_restock_days = restock_days(
+                self._warm_up_days, self._restock_every, from_day, to_day
+            )
+        else:
+            run_restock_days = []
+
         # Validate and create everything BEFORE any engine state is
         # reset: a bad or reused run id must leave the engine exactly
         # as it was, not half-reset with the previous run's done
@@ -394,7 +429,7 @@ class Playback:
                 "jitter_s": self._event_jitter_s,
             },
             "restock": {
-                "days": list(self._restock_days),
+                "days": run_restock_days,
                 "vendors": len(self._restock_vendors),
             },
             **(meta_extra or {}),
@@ -446,7 +481,7 @@ class Playback:
                 "restock",
                 None,
             )
-            for day in self._restock_days
+            for day in run_restock_days
             for vendor_index in range(len(self._restock_vendors))
         ]
         heapq.heapify(self._heap)
