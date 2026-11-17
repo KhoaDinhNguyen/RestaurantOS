@@ -309,6 +309,9 @@ class Playback:
         self._log: RunLog | None = None
         self._slots: asyncio.Semaphore | None = None
         self._send_tasks: set[asyncio.Task] = set()
+        # the restocks dispatched at the current instant: the barrier
+        # waits for them before the day's first order goes out
+        self._restock_tasks: set[asyncio.Task] = set()
         # scheduled-but-not-yet-dispatched events and restocks:
         # (sim deadline, rank, tiebreak a, tiebreak b, kind, payload)
         self._heap: list[tuple] = []
@@ -487,6 +490,7 @@ class Playback:
         heapq.heapify(self._heap)
         self._slots = slots
         self._send_tasks.clear()
+        self._restock_tasks.clear()
         self._done.clear()
         self._stream = stream
         self._log = log
@@ -598,6 +602,11 @@ class Playback:
                     if self._state == STOPPING:
                         stopped = True
                         break
+                    # the day's restocks are acknowledged before the
+                    # first order goes out (review item 2)
+                    if self._restock_tasks and not await self._restock_barrier():
+                        stopped = True
+                        break
                     self._dispatch_order(order_target - sim_start, request)
                     pending = next(stream_items, None)
                 else:
@@ -607,6 +616,11 @@ class Playback:
                         stopped = True
                         break
                     if kind == "event":
+                        # not a restock: the restocks go first all the
+                        # way to their acks (review item 2)
+                        if self._restock_tasks and not await self._restock_barrier():
+                            stopped = True
+                            break
                         handle, to_status, jitter = payload
                         # The event goes out only once the order's
                         # outcome is known (it needs the order id, and
@@ -876,6 +890,25 @@ class Playback:
         task = asyncio.create_task(self._send_restock(seq, record))
         self._send_tasks.add(task)
         task.add_done_callback(self._send_tasks.discard)
+        # the barrier waits for the whole batch before the day's first
+        # order: a restock only counts once the region has applied it
+        self._restock_tasks.add(task)
+        task.add_done_callback(self._restock_tasks.discard)
+
+    async def _restock_barrier(self) -> bool:
+        """Wait for the outstanding restocks before anything else goes
+        out. Returns False if stop arrives during the wait.
+
+        Dispatch order put the restocks first, but the region applies
+        them in answer order: without this barrier the day's first
+        orders race up to inflight-1 restocks still in flight, and
+        against a real region their refused-versus-accepted outcome
+        would depend on timing. The stub never shows this; the oracle
+        applies the restock first, and so does the run."""
+        while self._restock_tasks:
+            if not await self._await_or_stop(asyncio.wait(set(self._restock_tasks))):
+                return False
+        return True
 
     async def _send_one(
         self,

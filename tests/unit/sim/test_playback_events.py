@@ -430,6 +430,89 @@ async def test_restock_needs_a_to_day(tmp_path: Path) -> None:
     assert pb.status()["state"] == "done"
 
 
+class HoldingRestocks(httpx.AsyncBaseTransport):
+    """Holds every restock answer until the test releases it, so the
+    barrier is observable: nothing else of that day may go out."""
+
+    def __init__(self) -> None:
+        self.inner = httpx.ASGITransport(app=make_stub_app())
+        self.release = asyncio.Event()
+        self.paths: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.paths.append(request.url.path)
+        if request.url.path.endswith("/restock"):
+            await self.release.wait()
+        return await self.inner.handle_async_request(request)
+
+
+async def test_restocks_are_acknowledged_before_the_days_first_order(tmp_path: Path) -> None:
+    """Review item 2: dispatch order put the restocks first, but the
+    semaphore only orders their sends - up to inflight-1 restocks could
+    still be in flight when the day's first orders went out, and against
+    a real region the refused-vs-accepted outcome would depend on
+    timing. The barrier waits for the whole batch's answers first."""
+    orders = [make_order(21, 0, 0, 5, "1001"), make_order(21, 0, 0, 10, "1002")]
+    transport = HoldingRestocks()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=8,
+        speed=1e9,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=1e9, run_id="barrier")
+    await settle()
+    # both restocks are dispatched and held; no order has gone out
+    assert pb.status()["restocks_sent"] == 2
+    assert pb.status()["orders_sent"] == 0
+
+    transport.release.set()
+    await pb.wait_done()
+    assert pb.status()["state"] == "done"
+    lines = run_log_lines(tmp_path, pb)
+    restocks = [line for line in lines if line["kind"] == "restock"]
+    day_orders = [line for line in lines if line["kind"] == "order"]
+    # the day's orders went out after every restock was answered
+    last_restock_ack = max(line["wall_acked_at"] for line in restocks)
+    assert all(line["wall_sent_at"] >= last_restock_ack for line in day_orders)
+
+
+async def test_stop_during_the_restock_barrier_ends_stopped(tmp_path: Path) -> None:
+    """A stop while the barrier waits for held restocks ends the run
+    promptly: the barrier gives way to the stop, the held restocks are
+    cancelled by the drain (one line each), and the order behind the
+    barrier was never dispatched, so it has no line."""
+    orders = [make_order(21, 0, 0, 5, "1001")]
+    transport = HoldingRestocks()  # never released
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=8,
+        speed=1e9,
+        drain_timeout_s=0.3,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=1e9, run_id="held-barrier")
+    await settle()
+    assert pb.status()["orders_sent"] == 0  # the barrier holds the day
+
+    before = time.monotonic()
+    await pb.stop()
+    assert pb.status()["state"] == "stopped"
+    assert time.monotonic() - before < 5.0, "stop sat behind the held restocks"
+    lines = run_log_lines(tmp_path, pb)
+    assert [line["seq"] for line in lines] == list(range(len(lines)))
+    assert [line["kind"] for line in lines] == ["restock", "restock"]
+    assert all(line["error"] == "cancelled" for line in lines)
+
+
 async def test_restock_on_the_first_day_goes_out_first(tmp_path: Path) -> None:
     """A restock day at the very start of the window fires at simulated
     zero, before the first order of the run (W=7 and R=7: day 14 is
