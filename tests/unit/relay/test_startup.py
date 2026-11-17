@@ -70,12 +70,17 @@ def test_hq_startup_runs_worker_with_wp1(monkeypatch):
     monkeypatch.setattr(entry, "load_cluster", lambda _: Cluster())
     place_order = AsyncMock()
     worker = AsyncMock()
-    monkeypatch.setattr(entry, "import_module", lambda _: SimpleNamespace(place_order=place_order))
+    monkeypatch.setattr(
+        entry,
+        "import_module",
+        lambda _: SimpleNamespace(place_order=place_order, apply_menu_version=AsyncMock()),
+    )
     monkeypatch.setattr(entry, "run_hq_worker", worker)
 
     assert main() == 0
     worker.assert_awaited_once()
     assert worker.await_args.args[3] is place_order
+    assert callable(worker.await_args.args[4])
 
 
 def test_hq_startup_explains_missing_wp1(monkeypatch, capsys):
@@ -94,3 +99,13 @@ def test_hq_startup_rejects_wrong_client(monkeypatch, capsys):
 
     assert main() == 1
     assert "ROS_CLIENT=hq" in capsys.readouterr().err
+
+
+def test_hq_startup_explains_missing_menu_function(monkeypatch, capsys):
+    monkeypatch.setenv("ROS_RELAY_ROLE", "hq")
+    monkeypatch.setenv("ROS_CLIENT", "hq")
+    monkeypatch.setattr(entry, "load_cluster", lambda _: Cluster())
+    monkeypatch.setattr(entry, "import_module", lambda _: SimpleNamespace(place_order=AsyncMock()))
+
+    assert main() == 1
+    assert "needs WP1: restaurantos.region.apply_menu_version" in capsys.readouterr().err

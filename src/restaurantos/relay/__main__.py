@@ -24,10 +24,16 @@ def main() -> int:
 
         cluster = load_cluster(settings.cluster_file)
         if relay.role == "hq":
-            place_order = getattr(import_module("restaurantos.region"), "place_order", None)
+            region = import_module("restaurantos.region")
+            place_order = getattr(region, "place_order", None)
             if not callable(place_order):
                 raise ValueError(
                     "HQ holding-queue delivery needs WP1: restaurantos.region.place_order"
+                )
+            apply_menu_version = getattr(region, "apply_menu_version", None)
+            if not callable(apply_menu_version):
+                raise ValueError(
+                    "HQ menu publishing needs WP1: restaurantos.region.apply_menu_version"
                 )
         else:
             if region_id is None or region_id not in cluster.region_ids:
@@ -44,7 +50,7 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO)
     try:
         if relay.role == "hq":
-            asyncio.run(run_hq_worker(cluster, settings, relay, place_order))
+            asyncio.run(run_hq_worker(cluster, settings, relay, place_order, apply_menu_version))
         else:
             asyncio.run(run_region_relay(cluster, region_id, settings, relay))
     except KeyboardInterrupt:

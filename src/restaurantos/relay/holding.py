@@ -15,6 +15,7 @@ from restaurantos.common.errors import RegionUnreachableError, StaleEpochError
 from restaurantos.common.models import OrderRequest, OrderResult
 from restaurantos.common.sqlfiles import load_query
 from restaurantos.relay.config import RelaySettings
+from restaurantos.relay.menu import ApplyMenuVersion, publish_menu
 
 PlaceOrder = Callable[..., Awaitable[OrderResult]]
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ async def drain_batch(
         return await cursor.fetchall()
 
     async def target(conn: AsyncConnection):
-        cursor = await conn.execute(load_query("relay/holding_target"), {"region_id": region_id})
+        cursor = await conn.execute(load_query("relay/region_target"), {"region_id": region_id})
         row = await cursor.fetchone()
         if row is None:
             raise RegionUnreachableError("no HQ state for region", region_id=region_id)
@@ -85,14 +86,22 @@ async def drain_batch(
 
 
 async def run_hq_worker(
-    cluster: Cluster, settings: Settings, relay: RelaySettings, place_order: PlaceOrder
+    cluster: Cluster,
+    settings: Settings,
+    relay: RelaySettings,
+    place_order: PlaceOrder,
+    apply_menu_version: ApplyMenuVersion,
 ) -> None:
-    """Give every region its own task and HQ pool so failures stay independent."""
+    """Drain orders and publish menus independently for every region."""
 
     async def drain_region(region_id: str) -> None:
         conninfo = node_conninfo(cluster, HQ_PRIMARY, direct=True, settings=settings)
         async with make_pool(conninfo, settings) as hq_pool:
             while True:
+                try:
+                    await publish_menu(hq_pool, cluster, region_id, settings, apply_menu_version)
+                except (RegionUnreachableError, StaleEpochError) as exc:
+                    logger.warning("Menu publisher %s will retry: %s", region_id, exc)
                 try:
                     count = await drain_batch(
                         hq_pool, cluster, region_id, settings, relay, place_order

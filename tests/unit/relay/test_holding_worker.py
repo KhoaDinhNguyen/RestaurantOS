@@ -17,6 +17,7 @@ async def test_unreachable_region_does_not_stop_another_region(monkeypatch):
     failed_region_finished = asyncio.Event()
     pools = []
     real_sleep = asyncio.sleep
+    menus = []
 
     @asynccontextmanager
     async def pool(*args):
@@ -37,20 +38,26 @@ async def test_unreachable_region_does_not_stop_another_region(monkeypatch):
         await failed_region_finished.wait()
         return 0
 
+    async def publish(hq_pool, cluster, region_id, settings, apply_menu_version):
+        menus.append(region_id)
+
     async def stop_after_poll(seconds):
         await real_sleep(0)
         raise StopWorker
 
     monkeypatch.setattr(holding, "make_pool", pool)
     monkeypatch.setattr(holding, "drain_batch", drain)
+    monkeypatch.setattr(holding, "publish_menu", publish)
     monkeypatch.setattr(holding.asyncio, "sleep", stop_after_poll)
     settings = Settings(_env_file=None, network="compose", client="hq")
     relay = RelaySettings(_env_file=None, role="hq")
 
     with pytest.raises(StopWorker):
-        await holding.run_hq_worker(Cluster(regions=2), settings, relay, None)
+        await holding.run_hq_worker(Cluster(regions=2), settings, relay, None, None)
 
     assert healthy_region_ran.is_set()
     assert failed_region_finished.is_set()
     assert len(pools) == 2
     assert pools[0] is not pools[1]
+
+    assert set(menus) == {"r1", "r2"}
