@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, FastAPI, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from restaurantos.common.cluster import HQ_PRIMARY, load_cluster
@@ -16,10 +16,12 @@ from restaurantos.common.errors import (
     StaleEpochError,
     UnknownVendorError,
 )
-from restaurantos.common.models import OrderRequest, OrderResponse
+from restaurantos.common.models import OrderRequest, OrderResponse, OrderStatus
 from restaurantos.gateway.config import get_gateway_settings
 from restaurantos.gateway.directory import DirectoryCache, get_regions
+from restaurantos.gateway.dishes import get_dish, search_dishes
 from restaurantos.gateway.edge import EdgePrimary, run_edge
+from restaurantos.gateway.errors import HQUnreachableError
 from restaurantos.gateway.menu import get_vendor_menu
 from restaurantos.gateway.orders import (
     get_order_status,
@@ -31,7 +33,9 @@ from restaurantos.gateway.orders import (
     queued_order_response,
 )
 from restaurantos.gateway.pools import RegionPools
+from restaurantos.gateway.stock import get_vendor_stock
 from restaurantos.gateway.summary import get_region_summary
+from restaurantos.gateway.vendors import search_vendors
 
 
 async def refresh_directory_periodically(
@@ -53,6 +57,31 @@ async def refresh_edge_primary_periodically(
     while True:
         await asyncio.sleep(interval_s)
         await primary.refresh()
+
+
+def parse_order_statuses(status: str | None) -> list[str] | None:
+    """Parse the kitchen-board comma-separated status filter."""
+    if status is None:
+        return None
+
+    values = status.split(",")
+    allowed = {item.value for item in OrderStatus}
+
+    if not values or any(value not in allowed for value in values):
+        raise HTTPException(
+            status_code=422,
+            detail="status must contain only: " + ", ".join(item.value for item in OrderStatus),
+        )
+
+    return values
+
+
+async def run_hq(work):
+    """Run HQ work and translate database unavailability."""
+    try:
+        return await work()
+    except RegionUnreachableError as exc:
+        raise HQUnreachableError() from exc
 
 
 def create_app() -> FastAPI:
@@ -167,6 +196,16 @@ def create_app() -> FastAPI:
             content={"error": "not_found"},
         )
 
+    @app.exception_handler(HQUnreachableError)
+    async def hq_unreachable_handler(
+        request: Request,
+        exc: HQUnreachableError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "hq_unreachable"},
+        )
+
     def get_place_order():
         place_order = getattr(app.state, "place_order", None)
 
@@ -181,7 +220,202 @@ def create_app() -> FastAPI:
 
     @gateway.get("/regions")
     async def regions(request: Request) -> list[dict[str, object]]:
-        return await get_regions(request.app.state.hq_pool)
+        async def work():
+            return await get_regions(request.app.state.hq_pool)
+
+        return await run_hq(work)
+
+    @gateway.get("/vendors")
+    async def vendor_search(
+        geohash: str,
+        request: Request,
+        q: str | None = None,
+    ) -> list[dict[str, object]]:
+        route = request.app.state.directory.cell_routes.get(geohash)
+
+        if route is None:
+            return []
+
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        return await search_vendors(
+            pool,
+            geohash,
+            q,
+            route.region_id,
+        )
+
+    @edge.get("/vendors")
+    async def edge_vendor_search(
+        geohash: str,
+        request: Request,
+        q: str | None = None,
+    ) -> list[dict[str, object]]:
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        # The edge has no HQ directory. Its local vendors table is its ownership
+        # boundary, so a cell with no local vendors simply produces an empty list.
+        async def work():
+            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+
+            return await search_vendors(
+                pool,
+                geohash,
+                q,
+                region_id,
+            )
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
+
+    @gateway.get("/dishes")
+    async def dish_search(
+        q: str,
+        request: Request,
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        if limit < 1 or limit > 100:
+            raise HTTPException(
+                status_code=422,
+                detail="limit must be between 1 and 100",
+            )
+
+        async def work():
+            return await search_dishes(
+                request.app.state.hq_pool,
+                q,
+                limit,
+            )
+
+        return await run_hq(work)
+
+    @gateway.get("/dishes/{dish_id}")
+    async def dish_lookup(
+        dish_id: str,
+        request: Request,
+    ):
+        async def work():
+            return await get_dish(
+                request.app.state.hq_pool,
+                dish_id,
+            )
+
+        dish = await run_hq(work)
+
+        if dish is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found"},
+            )
+
+        return dish
+
+    @edge.get("/dishes")
+    async def edge_dish_search(
+        q: str,
+        request: Request,
+        limit: int = 20,
+    ) -> list[dict[str, object]]:
+        if limit < 1 or limit > 100:
+            raise HTTPException(
+                status_code=422,
+                detail="limit must be between 1 and 100",
+            )
+
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work():
+            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+
+            return await search_dishes(
+                pool,
+                q,
+                limit,
+                region_id=region_id,
+            )
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
+
+    @edge.get("/dishes/{dish_id}")
+    async def edge_dish_lookup(
+        dish_id: str,
+        request: Request,
+    ):
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work():
+            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+
+            return await get_dish(
+                pool,
+                dish_id,
+                region_id=region_id,
+            )
+
+        dish = await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
+
+        if dish is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found"},
+            )
+
+        return dish
+
+    @gateway.get("/vendors/{vendor_id}/stock")
+    async def vendor_stock(
+        vendor_id: str,
+        request: Request,
+    ) -> list[dict[str, object]]:
+        route = request.app.state.directory.route_vendor(vendor_id)
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        return await get_vendor_stock(
+            pool,
+            vendor_id,
+            route.region_id,
+        )
+
+    @edge.get("/vendors/{vendor_id}/stock")
+    async def edge_vendor_stock(
+        vendor_id: str,
+        request: Request,
+    ) -> list[dict[str, object]]:
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work():
+            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+
+            return await get_vendor_stock(
+                pool,
+                vendor_id,
+                region_id,
+            )
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
 
     @gateway.get("/vendors/{vendor_id}/menu")
     async def vendor_menu(
@@ -252,6 +486,7 @@ def create_app() -> FastAPI:
         vendor_id: str,
         order_id: UUID,
         request: Request,
+        day: int | None = None,
     ) -> dict[str, object]:
         route = request.app.state.directory.route_vendor(vendor_id)
         pool = await request.app.state.region_pools.get(route.primary_node)
@@ -261,6 +496,7 @@ def create_app() -> FastAPI:
             vendor_id,
             order_id,
             route.region_id,
+            day=day,
         )
 
     @edge.get("/vendors/{vendor_id}/orders/{order_id}")
@@ -268,6 +504,7 @@ def create_app() -> FastAPI:
         vendor_id: str,
         order_id: UUID,
         request: Request,
+        day: int | None = None,
     ) -> dict[str, object]:
         region_id = settings.region_id
         if region_id is None:
@@ -281,6 +518,7 @@ def create_app() -> FastAPI:
                 vendor_id,
                 order_id,
                 region_id,
+                day=day,
             )
 
         return await run_edge(
@@ -296,6 +534,8 @@ def create_app() -> FastAPI:
         request: Request,
         status: str | None = None,
     ) -> list[dict[str, object]]:
+        statuses = parse_order_statuses(status)
+
         route = request.app.state.directory.route_vendor(vendor_id)
         pool = await request.app.state.region_pools.get(route.primary_node)
 
@@ -303,7 +543,7 @@ def create_app() -> FastAPI:
             pool,
             vendor_id,
             day,
-            status,
+            statuses,
             route.region_id,
         )
 
@@ -314,6 +554,8 @@ def create_app() -> FastAPI:
         request: Request,
         status: str | None = None,
     ) -> list[dict[str, object]]:
+        statuses = parse_order_statuses(status)
+
         region_id = settings.region_id
         if region_id is None:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
@@ -325,7 +567,7 @@ def create_app() -> FastAPI:
                 pool,
                 vendor_id,
                 day,
-                status,
+                statuses,
                 region_id,
             )
 

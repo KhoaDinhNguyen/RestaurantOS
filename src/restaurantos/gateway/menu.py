@@ -35,8 +35,9 @@ async def get_vendor_menu(
                 "name": row[2],
                 "price_units": row[3],
                 "menu_version": row[4],
-                "reason": row[5],
-                "available": row[6],
+                "dish_id": row[5],
+                "reason": row[6],
+                "available": row[7],
             }
             for row in rows
         ]

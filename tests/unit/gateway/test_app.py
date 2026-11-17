@@ -107,6 +107,7 @@ def test_vendor_menu(monkeypatch) -> None:
                 "name": "Menu item 003",
                 "price_units": 2,
                 "menu_version": 1,
+                "dish_id": "d001",
                 "reason": None,
                 "available": True,
             }
@@ -437,22 +438,34 @@ def test_order_status_routes_to_region_primary(monkeypatch) -> None:
 
     from restaurantos.gateway.directory import DirectoryCache, RegionRoute
 
-    order_id = uuid4()
+    expected_order_id = uuid4()
 
-    async def fake_get_order_status(pool, vendor_id, requested_order_id, region_id):
+    async def fake_get_order_status(
+        pool,
+        vendor_id,
+        order_id,
+        region_id,
+        *,
+        day=None,
+    ):
         assert vendor_id == "v001"
-        assert requested_order_id == order_id
+        assert order_id == expected_order_id
         assert region_id == "r1"
+        assert day is None
 
         return {
             "order_id": order_id,
             "order_day": 14,
+            "order_time": "12:03:29",
             "vendor_id": "v001",
+            "customer_id": "c001",
+            "channel": "dhrd",
             "status": "accepted",
             "status_changed_at": None,
             "menu_version": 1,
             "received_at": None,
             "committed_at": None,
+            "items": [],
         }
 
     monkeypatch.setattr(
@@ -478,10 +491,11 @@ def test_order_status_routes_to_region_primary(monkeypatch) -> None:
     app.state.region_pools = region_pools
 
     client = TestClient(app)
-    response = client.get(f"/api/v1/vendors/v001/orders/{order_id}")
+    response = client.get(f"/api/v1/vendors/v001/orders/{expected_order_id}")
 
     assert response.status_code == 200
     assert response.json()["status"] == "accepted"
+
     region_pools.get.assert_awaited_once_with("r1-primary")
 
 
@@ -718,6 +732,7 @@ def test_edge_vendor_menu_uses_local_primary(monkeypatch) -> None:
                 "name": "Menu item 003",
                 "price_units": 2,
                 "menu_version": 1,
+                "dish_id": "d001",
                 "reason": None,
                 "available": True,
             }
@@ -925,3 +940,531 @@ def test_edge_menu_refreshes_primary_after_database_error(monkeypatch) -> None:
     }
 
     edge_primary.refresh.assert_awaited_once_with()
+
+
+def test_order_status_accepts_optional_day(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    order_id = uuid4()
+
+    async def fake_get_order_status(
+        pool,
+        vendor_id,
+        requested_order_id,
+        region_id,
+        *,
+        day=None,
+    ):
+        assert vendor_id == "v001"
+        assert requested_order_id == order_id
+        assert region_id == "r1"
+        assert day == 14
+
+        return {
+            "order_id": requested_order_id,
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "vendor_id": "v001",
+            "customer_id": "c001",
+            "channel": "dhrd",
+            "status": "accepted",
+            "status_changed_at": None,
+            "menu_version": 1,
+            "received_at": None,
+            "committed_at": None,
+            "items": [],
+        }
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.get_order_status",
+        fake_get_order_status,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.get(f"/api/v1/vendors/v001/orders/{order_id}?day=14")
+
+    assert response.status_code == 200
+
+
+def test_vendor_orders_accepts_multiple_statuses(monkeypatch) -> None:
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    async def fake_get_vendor_orders(
+        pool,
+        vendor_id,
+        day,
+        statuses,
+        region_id,
+    ):
+        assert vendor_id == "v001"
+        assert day == 14
+        assert statuses == ["received", "accepted", "preparing"]
+        assert region_id == "r1"
+
+        return []
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.get_vendor_orders",
+        fake_get_vendor_orders,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.get("/api/v1/vendors/v001/orders?day=14&status=received,accepted,preparing")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_vendor_orders_rejects_unknown_status() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/api/v1/vendors/v001/orders?day=14&status=received,banana")
+
+    assert response.status_code == 422
+
+
+def test_vendor_search_routes_by_geohash(monkeypatch) -> None:
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    async def fake_search_vendors(
+        pool,
+        geohash,
+        query,
+        region_id,
+    ):
+        assert geohash == "w21z7"
+        assert query == "noodle"
+        assert region_id == "r1"
+
+        return [
+            {
+                "vendor_id": "v001",
+                "chain_id": None,
+                "geohash": "w21z7",
+                "primary_cuisine": "noodles",
+            }
+        ]
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.search_vendors",
+        fake_search_vendors,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.get("/api/v1/vendors?geohash=w21z7&q=noodle")
+
+    assert response.status_code == 200
+    assert response.json()[0]["vendor_id"] == "v001"
+    region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_vendor_search_unknown_cell_returns_empty() -> None:
+    from restaurantos.gateway.directory import DirectoryCache
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={},
+        cell_routes={},
+        region_routes={},
+    )
+    app.state.region_pools = AsyncMock()
+
+    client = TestClient(app)
+
+    response = client.get("/api/v1/vendors?geohash=zzzzz")
+
+    assert response.status_code == 200
+    assert response.json() == []
+    app.state.region_pools.get.assert_not_awaited()
+
+
+def test_vendor_search_requires_geohash() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/api/v1/vendors")
+
+    assert response.status_code == 422
+
+
+def test_edge_vendor_search_uses_local_region(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_search_vendors(
+        pool,
+        geohash,
+        query,
+        region_id,
+    ):
+        assert pool == "edge-pool"
+        assert geohash == "w21z7"
+        assert query == "noodle"
+        assert region_id == "r1"
+
+        return [
+            {
+                "vendor_id": "v001",
+                "chain_id": None,
+                "geohash": "w21z7",
+                "primary_cuisine": "noodles",
+            }
+        ]
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "search_vendors",
+        fake_search_vendors,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.get_pool.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = AsyncMock()
+
+    client = TestClient(app)
+
+    response = client.get("/api/v1/vendors?geohash=w21z7&q=noodle")
+
+    assert response.status_code == 200
+    assert response.json()[0]["vendor_id"] == "v001"
+
+    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+
+
+def test_vendor_stock_routes_to_region_primary(monkeypatch) -> None:
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    async def fake_get_vendor_stock(
+        pool,
+        vendor_id,
+        region_id,
+    ):
+        assert vendor_id == "v001"
+        assert region_id == "r1"
+
+        return [
+            {
+                "item_kind": "ingredient",
+                "item_id": "garlic",
+                "name": "garlic",
+                "unit": "portion",
+                "on_hand": 12,
+                "par_level": 35,
+                "updated_at": None,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.get_vendor_stock",
+        fake_get_vendor_stock,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.get("/api/v1/vendors/v001/stock")
+
+    assert response.status_code == 200
+    assert response.json()[0]["item_id"] == "garlic"
+    assert response.json()[0]["on_hand"] == 12
+
+    region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_edge_vendor_stock_uses_local_primary(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_get_vendor_stock(
+        pool,
+        vendor_id,
+        region_id,
+    ):
+        assert pool == "edge-pool"
+        assert vendor_id == "v001"
+        assert region_id == "r1"
+
+        return []
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "get_vendor_stock",
+        fake_get_vendor_stock,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.get_pool.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = AsyncMock()
+
+    client = TestClient(app)
+
+    response = client.get("/api/v1/vendors/v001/stock")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+
+
+def test_hq_unreachable_returns_503(monkeypatch) -> None:
+    from restaurantos.common.errors import RegionUnreachableError
+
+    async def fake_get_regions(pool):
+        raise RegionUnreachableError()
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.get_regions",
+        fake_get_regions,
+    )
+
+    app = create_app()
+    app.state.hq_pool = object()
+
+    client = TestClient(app)
+    response = client.get("/api/v1/regions")
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "hq_unreachable",
+    }
+
+
+def test_dish_search_requires_query() -> None:
+    client = TestClient(create_app())
+
+    response = client.get("/api/v1/dishes")
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+def test_dish_search_rejects_invalid_limit(limit) -> None:
+    client = TestClient(create_app())
+
+    response = client.get(f"/api/v1/dishes?q=laksa&limit={limit}")
+
+    assert response.status_code == 422
+
+
+def test_dish_search_reads_hq(monkeypatch) -> None:
+    async def fake_search_dishes(
+        pool,
+        query,
+        limit,
+        region_id=None,
+    ):
+        assert pool == "hq-pool"
+        assert query == "laksa"
+        assert limit == 20
+        assert region_id is None
+
+        return [
+            {
+                "dish_id": "d001",
+                "dish_name": "Laksa",
+                "example_name": "Laksa Special",
+                "scope": "global",
+                "n_vendors": 42,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.search_dishes",
+        fake_search_dishes,
+    )
+
+    app = create_app()
+    app.state.hq_pool = "hq-pool"
+
+    client = TestClient(app)
+    response = client.get("/api/v1/dishes?q=laksa")
+
+    assert response.status_code == 200
+    assert response.json()[0]["dish_id"] == "d001"
+
+
+def test_dish_lookup_returns_404(monkeypatch) -> None:
+    async def fake_get_dish(
+        pool,
+        dish_id,
+        region_id=None,
+    ):
+        return None
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.get_dish",
+        fake_get_dish,
+    )
+
+    app = create_app()
+    app.state.hq_pool = object()
+
+    client = TestClient(app)
+    response = client.get("/api/v1/dishes/missing")
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "not_found"}
+
+
+def test_edge_dish_search_uses_local_primary(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_search_dishes(
+        pool,
+        query,
+        limit,
+        region_id=None,
+    ):
+        assert pool == "edge-pool"
+        assert query == "laksa"
+        assert limit == 20
+        assert region_id == "r1"
+
+        return [
+            {
+                "dish_id": "d001",
+                "dish_name": "Laksa",
+                "example_name": "Laksa Special",
+                "scope": "global",
+                "n_vendors": 42,
+            }
+        ]
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "search_dishes",
+        fake_search_dishes,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.get_pool.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = AsyncMock()
+
+    client = TestClient(app)
+
+    response = client.get("/api/v1/dishes?q=laksa")
+
+    assert response.status_code == 200
+    assert response.json()[0]["dish_id"] == "d001"
+
+    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)

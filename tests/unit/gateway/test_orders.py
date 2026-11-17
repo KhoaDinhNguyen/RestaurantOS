@@ -175,24 +175,38 @@ def test_queued_order_response() -> None:
 
 async def test_get_order_status(monkeypatch) -> None:
     order_id = uuid4()
+    order_time = datetime.strptime("12:03:29", "%H:%M:%S").time()
     changed_at = datetime(2026, 11, 15, 12, 1, tzinfo=UTC)
     received_at = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
     committed_at = datetime(2026, 11, 15, 12, 0, 1, tzinfo=UTC)
 
     connection = AsyncMock()
-    cursor = AsyncMock()
 
-    cursor.fetchone.return_value = (
+    order_cursor = AsyncMock()
+    order_cursor.fetchone.return_value = (
         order_id,
         14,
+        order_time,
         "v001",
+        "customer-1",
+        "dhrd",
         "received",
         changed_at,
         1,
         received_at,
         committed_at,
     )
-    connection.execute.return_value = cursor
+
+    items_cursor = AsyncMock()
+    items_cursor.fetchall.return_value = [
+        (1, "p003", "Menu item 003", 2, 4),
+        (2, "p006", "Menu item 006", 1, 11),
+    ]
+
+    connection.execute.side_effect = [
+        order_cursor,
+        items_cursor,
+    ]
 
     async def fake_run_on(pool, work, **kwargs):
         assert kwargs["region_id"] == "r1"
@@ -205,13 +219,38 @@ async def test_get_order_status(monkeypatch) -> None:
         "v001",
         order_id,
         "r1",
+        day=14,
     )
 
-    assert result["order_id"] == order_id
-    assert result["vendor_id"] == "v001"
-    assert result["status"] == "received"
-    assert result["order_day"] == 14
-    assert result["menu_version"] == 1
+    assert result == {
+        "order_id": order_id,
+        "order_day": 14,
+        "order_time": order_time,
+        "vendor_id": "v001",
+        "customer_id": "customer-1",
+        "channel": "dhrd",
+        "status": "received",
+        "status_changed_at": changed_at,
+        "menu_version": 1,
+        "received_at": received_at,
+        "committed_at": committed_at,
+        "items": [
+            {
+                "line_no": 1,
+                "product_id": "p003",
+                "name": "Menu item 003",
+                "quantity": 2,
+                "price_units": 4,
+            },
+            {
+                "line_no": 2,
+                "product_id": "p006",
+                "name": "Menu item 006",
+                "quantity": 1,
+                "price_units": 11,
+            },
+        ],
+    }
 
 
 async def test_get_vendor_orders(monkeypatch) -> None:
@@ -220,22 +259,33 @@ async def test_get_vendor_orders(monkeypatch) -> None:
     changed_at = datetime(2026, 11, 15, 12, 4, tzinfo=UTC)
 
     connection = AsyncMock()
-    cursor = AsyncMock()
 
-    cursor.fetchall.return_value = [
+    orders_cursor = AsyncMock()
+    orders_cursor.fetchall.return_value = [
         (
             order_id,
             14,
-            "v001",
-            "accepted",
             order_time,
+            "v001",
+            "customer-1",
+            "dhrd",
+            "accepted",
             changed_at,
             1,
             changed_at,
             changed_at,
         )
     ]
-    connection.execute.return_value = cursor
+
+    items_cursor = AsyncMock()
+    items_cursor.fetchall.return_value = [
+        (1, "p003", "Menu item 003", 1, 4),
+    ]
+
+    connection.execute.side_effect = [
+        orders_cursor,
+        items_cursor,
+    ]
 
     async def fake_run_on(pool, work, **kwargs):
         assert kwargs["region_id"] == "r1"
@@ -247,11 +297,31 @@ async def test_get_vendor_orders(monkeypatch) -> None:
         object(),
         "v001",
         14,
-        "accepted",
+        ["accepted", "preparing"],
         "r1",
     )
 
-    assert len(result) == 1
-    assert result[0]["order_id"] == order_id
-    assert result[0]["vendor_id"] == "v001"
-    assert result[0]["status"] == "accepted"
+    assert result == [
+        {
+            "order_id": order_id,
+            "order_day": 14,
+            "order_time": order_time,
+            "vendor_id": "v001",
+            "customer_id": "customer-1",
+            "channel": "dhrd",
+            "status": "accepted",
+            "status_changed_at": changed_at,
+            "menu_version": 1,
+            "received_at": changed_at,
+            "committed_at": changed_at,
+            "items": [
+                {
+                    "line_no": 1,
+                    "product_id": "p003",
+                    "name": "Menu item 003",
+                    "quantity": 1,
+                    "price_units": 4,
+                }
+            ],
+        }
+    ]
