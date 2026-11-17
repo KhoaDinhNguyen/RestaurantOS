@@ -58,7 +58,12 @@ The fence only stops callers that learned the new epoch from HQ. The edge API an
 
 ### 4. Admin API (Section 6.2)
 
-`/admin/cluster`, `/admin/events`, `/admin/exceptions`, and a manual failover route.
+`/admin/cluster`, `/admin/events`, `/admin/exceptions`, and a manual failover route. Their shapes, the `since` paging and the failover route's answers are in architecture Section 6.2.
+
+- `/admin/exceptions` reads HQ's `analytics_exceptions` and pages on its `seq` column; `/admin/events` pages on `cluster_event_id` (returned as `event_id`).
+- Every transaction that inserts a `cluster_events` row takes `pg_advisory_xact_lock` on that table's fixed key first, so ids follow commit order and `since` cannot skip a row.
+- `holding_queue` is a count of HQ's undelivered `holding_queue` rows per region.
+- The manual failover runs the same resumable promotion as an automatic one, and refuses with `409` when the standby is not up or a promotion of that region is already running.
 
 The per-region figures all come from SQL on the region primary, through `coordinator__<node>`. The relay keeps no position of its own that you could read (architecture Section 5.3), so there is no cursor to ask.
 

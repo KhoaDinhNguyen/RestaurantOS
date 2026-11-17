@@ -1,5 +1,6 @@
 """Exercise the pending batch query against the region schema."""
 
+import asyncio
 import os
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, time
@@ -14,6 +15,7 @@ from restaurantos.common.cluster import HQ_PRIMARY, Cluster
 from restaurantos.common.config import Settings
 from restaurantos.common.db import apply_schema, make_pool
 from restaurantos.common.errors import RegionUnreachableError
+from restaurantos.common.locks import ANALYTICS_EXCEPTIONS_LOCK_KEY
 from restaurantos.common.models import (
     EventType,
     ExceptionLoggedPayload,
@@ -226,3 +228,69 @@ async def test_hq_rolls_back_inbox_and_analytics_if_apply_fails(outbox, hq, payl
         " (SELECT count(*) FROM analytics_order_items)"
     )
     assert await cursor.fetchone() == (0, 0, 0)
+
+
+async def test_exception_sequence_follows_commit_order(hq, payloads):
+    headquarters, hq_pool, settings = hq
+    _, _, exception = payloads
+    first_id, second_id = uuid4(), uuid4()
+    event = OutboxEvent(
+        event_id=second_id,
+        region_id="r2",
+        seq=1,
+        event_type=EventType.EXCEPTION_LOGGED,
+        order_day=14,
+        created_at=exception.attempted_at,
+        payload=exception.model_dump(mode="json"),
+    )
+
+    # Hold the first writer open while a second regional relay tries to apply.
+    # Use a separate connection to observe PostgreSQL's actual lock wait.
+    async with await psycopg.AsyncConnection.connect(hq_pool.conninfo, autocommit=True) as observer:
+        task = None
+        try:
+            async with headquarters.transaction():
+                await headquarters.execute(
+                    "SELECT pg_advisory_xact_lock(%s)", (ANALYTICS_EXCEPTIONS_LOCK_KEY,)
+                )
+                await headquarters.execute(
+                    "INSERT INTO analytics_exceptions "
+                    "(event_id, region_id, order_day, order_id, kind, current_status,"
+                    " current_changed_at, attempted_status, attempted_at) "
+                    "VALUES (%s, 'r1', 14, %s, %s, %s, %s, %s, %s)",
+                    (
+                        first_id,
+                        exception.order_id,
+                        exception.kind,
+                        exception.current_status,
+                        exception.current_changed_at,
+                        exception.attempted_status,
+                        exception.attempted_at,
+                    ),
+                )
+                task = asyncio.create_task(apply_batch(hq_pool, [event], settings=settings))
+                for _ in range(100):
+                    locks = await observer.execute(
+                        "SELECT count(*) FROM pg_locks "
+                        "WHERE locktype = 'advisory' AND objid = %s AND NOT granted",
+                        (ANALYTICS_EXCEPTIONS_LOCK_KEY,),
+                    )
+                    if (await locks.fetchone())[0]:
+                        break
+                    if task.done():
+                        task.result()
+                        pytest.fail("second exception committed before the first writer")
+                    await asyncio.sleep(0.01)
+                else:
+                    pytest.fail("second writer did not wait on the shared exception lock")
+                assert not task.done()
+        finally:
+            # The transaction has released its lock. Let the database call finish.
+            if task is not None:
+                await task
+
+    rows = await headquarters.execute("SELECT event_id, seq FROM analytics_exceptions ORDER BY seq")
+    first, second = await rows.fetchall()
+    assert first[0] == first_id
+    assert second[0] == second_id
+    assert first[1] < second[1]

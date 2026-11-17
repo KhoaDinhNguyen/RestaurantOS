@@ -59,16 +59,17 @@ What each view reads and can do is the contract (Section 8). The notes are thing
 
 | View | Reads | Can do | Worth knowing |
 | --- | --- | --- | --- |
-| **HQ** (head office) | `/query/top-dishes`, `/query/ingredient-usage`, `/admin/cluster`, `/admin/events`, `/admin/exceptions` | manual failover of a region; add a product | Both queries take `mode=live`, `hq` or `baseline`, and ingredient usage also takes `strategy=A`, `B` or `C`. Every answer carries `meta`: how fresh the data is, which nodes were asked, which regions did not answer, how many rows travelled, how long it took. Showing `meta` next to the result is the demonstration |
-| **Region** (regional office, kitchens) | `/regions/{id}/summary`, the kitchen board, menu with availability | change an order's status, switch a product to sold out, restock | Talk to the edge API (see above). The summary's fields are defined in Section 6.1 |
-| **Customer** | `/vendors`, a menu, `/query/nearby`, one order's status | place an order | See "Placing an order" below |
-| **Ops** (the operator, outside the system) | `/sim/clock`, `/sim/playback`, `/sim/links`, `/sim/snapshots` | start, pause and stop playback, change speed, inject and remove faults, kill and start nodes, run a scenario, take and restore snapshots, run the checker | The professor asked for an admin screen showing which nodes are alive and their state. `/admin/cluster` has exactly that: per node its role, `up`, `suspect` or `down`, and last heartbeat; per region its epoch, orders per second, standby lag, lag to HQ and outbox backlog |
+| **HQ** (head office) | `/query/top-dishes`, `/query/ingredient-usage`, `/admin/cluster`, `/admin/events`, `/admin/exceptions` | manual failover of a region; add a product | Both queries take `mode=live`, `hq` or `baseline`, a day or a day range, and an optional time-of-day window; top dishes also takes `rank_by` (`units`, `quantity`, `order_lines` or `sales_units`), and ingredient usage also takes `strategy=A`, `B` or `C`. Every answer carries `meta`: how fresh the data is, which nodes were asked, which regions did not answer, how many rows travelled, how long it took. Showing `meta` next to the result is the demonstration |
+| **Region** (regional office, kitchens) | `/regions/{id}/summary`, the kitchen board, menu with availability, stock counters (`/vendors/{id}/stock`) | change an order's status, switch a product to sold out, restock | Talk to the edge API (see above). The summary's fields are defined in Section 6.1 |
+| **Customer** | `/vendors`, `/dishes`, a menu, `/query/nearby`, one order's status | place an order | See "Placing an order" below |
+| **Ops** (the operator, outside the system) | `/sim/clock`, `/sim/playback`, `/sim/links`, `/sim/snapshots` | start, pause and stop playback, change speed, inject and remove faults, kill and start nodes; if WP6b offers them over HTTP: run a scenario, take and restore snapshots, run the checker | The professor asked for an admin screen showing which nodes are alive and their state. `/admin/cluster` has exactly that: per node its role, `up`, `suspect` or `down`, and last heartbeat; per region its epoch, orders per second, standby lag, lag to HQ and outbox backlog |
 
 ### Rules of the data
 
 - **Ids are text.** Restaurant, product, dish and customer ids are short strings of digits and letters. Some contain only digits and a few start with zeros. Never turn one into a number.
 - **Time is simulated.** "Today" is a day number from 0 to 90, and the clock runs at whatever speed playback is set to. Read it from `GET /sim/clock`. Do not use the browser's clock for anything except showing how long a request took. Routes that take `day=` expect that day number; the replay covers days 14 to 90.
 - **Order status** is one of `received`, `accepted`, `preparing`, `ready`, `picked_up`, `canceled`.
+- **Restaurants have no names** in the dataset. Showing the `vendor_id` as the name is fine.
 - **No calculations.** No sums, no joins, no ranking, no choosing a region in the browser. If a screen needs a number the API does not return, ask for it in the API.
 
 #### Placing an order
@@ -137,7 +138,7 @@ What each line needs is marked in front of it (the marks are explained in `READM
 
 These are not yours to solve alone, but you will hit them first:
 
-1. **Choosing a dish for the nearby search.** `/query/nearby` takes a `dish_id`, and no route lists or searches dishes. This one is yours to design and then ask the backend for. Two ways it could go: the menu answer carries each product's `dish_id` ("who else near me makes this?"); or a search route returns every dish that matches what the customer typed, the UI runs the nearby query once per dish, and shows each dish's matches separately.
-2. **Response shapes** for the restaurant list, the menu, the kitchen board, the three queries, `/admin/cluster` and `/sim/...` are not written down yet. The earlier their owners export them to `docs/api/`, the less you rebuild.
+1. **Choosing a dish for the nearby search** is settled; both ways exist (Section 6.1). Each menu row carries its `dish_id` ("who else near me makes this?"), and `GET /dishes?q=` returns every dish that matches what the customer typed. One name can be several dishes (a chain's own version is a separate dish; see `scope`), so run the nearby query once per dish and show each dish's matches separately.
+2. **Response shapes** are written down in architecture Sections 6.1 to 6.3, for every route. A route that is not built yet may still change in detail; mock from those sections and check with its owner.
 3. **The `web` container** for the final demonstration (Section 4 lists it as "Vite dev server or static build"): a static build needs something in front of it that forwards `/api`, `/admin` and `/sim`, or the services need CORS headers.
-4. **The clock when playback is stopped.** What `/sim/clock` returns then decides what "today" is on your date pickers.
+4. **The clock when playback is stopped** is settled (Section 6.3). Before the first run `/sim/clock` has no day (`null`): ask the user to pick one. While a run is paused or after it has ended, the clock stands at its last moment.

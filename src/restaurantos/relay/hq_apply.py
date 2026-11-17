@@ -6,7 +6,9 @@ from psycopg_pool import AsyncConnectionPool
 
 from restaurantos.common.config import Settings
 from restaurantos.common.db import run_on
+from restaurantos.common.locks import ANALYTICS_EXCEPTIONS_LOCK_KEY
 from restaurantos.common.models import (
+    EventType,
     ExceptionLoggedPayload,
     OrderCreatedPayload,
     OutboxEvent,
@@ -21,6 +23,13 @@ async def apply_batch(
     """Commit each new inbox entry together with its analytics changes."""
 
     async def apply(conn: AsyncConnection) -> None:
+        # Acquire before claiming inbox rows so concurrent retry batches take
+        # locks in the same order. PostgreSQL holds this until commit/rollback.
+        if any(event.event_type == EventType.EXCEPTION_LOGGED for event in events):
+            await conn.execute(
+                load_query("relay/lock_exceptions"),
+                {"lock_key": ANALYTICS_EXCEPTIONS_LOCK_KEY},
+            )
         for event in events:
             key = {"region_id": event.region_id, "event_id": event.event_id}
             claim = await conn.execute(load_query("relay/claim_event"), {**key, "seq": event.seq})
