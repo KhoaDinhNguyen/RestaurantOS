@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
@@ -535,6 +536,55 @@ async def test_pause_parks_scheduled_events(tmp_path: Path) -> None:
     await drive(pb, clock)
     assert pb.status()["state"] == "done"
     assert pb.status()["events_sent"] == 4
+
+
+async def test_stop_ends_the_wait_for_an_unanswered_order(tmp_path: Path) -> None:
+    """CodeRabbit round 1, 3: `await handle.future` did not watch for
+    stop, so a target that never answered held the dispatcher (and
+    `stop`, and the CLI's stop timeout) until the HTTP timeout. The
+    outcome wait now ends on stop; the event that was never dispatched
+    gets no line, and stop returns within the drain timeout."""
+
+    class NeverAnswers(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.inner = httpx.ASGITransport(app=make_stub_app())
+            self.release = asyncio.Event()
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/orders"):
+                await self.release.wait()  # never, within the test
+            return await self.inner.handle_async_request(request)
+
+    transport = NeverAnswers()
+    orders = [make_order(14, 0, 0, 1, "1001"), make_order(14, 0, 0, 2, "1002")]
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=1,
+        speed=1e9,
+        status_events=True,
+        drain_timeout_s=0.3,
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="held")
+    await settle()
+    # order 1 is in flight forever, order 2 sits queued for the only
+    # slot, and the dispatcher waits on order 1's outcome for its event
+    assert pb.status()["inflight"] == 2
+
+    before = time.monotonic()
+    await pb.stop()
+    waited = time.monotonic() - before
+    assert pb.status()["state"] == "stopped"
+    # one drain window for the never-answered order, not the HTTP
+    # timeout on top of it
+    assert waited < 5.0, f"stop waited {waited:.1f}s behind an unanswered target"
+    lines = run_log_lines(tmp_path, pb)
+    # dense, and only the two dispatched orders: their events were
+    # never dispatched, so they have no lines
+    assert [line["seq"] for line in lines] == list(range(len(lines)))
+    assert [line["kind"] for line in lines] == ["order", "order"]
+    assert all(line["error"] == "cancelled" for line in lines)
 
 
 async def test_stop_leaves_a_dense_log_with_events(tmp_path: Path) -> None:

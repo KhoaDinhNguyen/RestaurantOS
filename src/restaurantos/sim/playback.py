@@ -63,7 +63,7 @@ import re
 import sys
 import time
 import traceback
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -613,8 +613,12 @@ class Playback:
                         # a refused order never moves through the
                         # kitchen). The outcome always resolves: every
                         # send finishes, errors within the HTTP
-                        # timeout, or is cancelled by the drain.
-                        await handle.future
+                        # timeout, or is cancelled by the drain - but
+                        # a slow target must not hold a stop hostage,
+                        # so the wait also ends when the run stops.
+                        if not await self._await_or_stop(handle.future):
+                            stopped = True
+                            break
                         if self._state == PAUSED:
                             # the outcome arrived while the run was
                             # paused; the event waits for the resume
@@ -718,6 +722,44 @@ class Playback:
             for task in (sleep_task, wake_task):
                 task.cancel()
             await asyncio.gather(sleep_task, wake_task, return_exceptions=True)
+
+    async def _await_or_stop(self, waiter: Awaitable) -> bool:
+        """Wait for `waiter`, or give up when the run stops.
+
+        The dispatcher uses this for two waits that a target can hold
+        indefinitely: an order's outcome and the restock barrier. A
+        control operation that is not a stop (pause, resume, a speed
+        change) also wakes the wait, but it does not end it: the loop
+        waits again, so a pause keeps today's behavior - the outcome is
+        still awaited, the event only goes out after the resume. A stop
+        ends the wait immediately, so `stop` never sits behind a slow
+        or unanswering target longer than the drain timeout.
+
+        `waiter` may be a future the caller owns (an order's outcome:
+        never cancelled here) or a coroutine private to this call (a
+        restock barrier: cancelled on the way out).
+        """
+        task = waiter if isinstance(waiter, asyncio.Future) else asyncio.ensure_future(waiter)
+        try:
+            while True:
+                wake_task = asyncio.ensure_future(self._wake.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        {task, wake_task}, return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    wake_task.cancel()
+                    await asyncio.gather(wake_task, return_exceptions=True)
+                if self._state == STOPPING:
+                    return False
+                if task.done():
+                    return True
+                # a wake that was not a stop: clear it and keep waiting
+                self._wake.clear()
+        finally:
+            if task is not waiter:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
     def _dispatch_order(self, sim_offset: float, request: OrderRequest) -> None:
         seq = self._next_seq()
