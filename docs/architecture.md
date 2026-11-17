@@ -727,7 +727,7 @@ Exceptions are read from HQ's copy, so an entry appears once the relay has deliv
 
 ### 6.3 Control plane, port 8002 (outside the system)
 
-The Ops view is the only HTTP caller. Everything here is also a `rosctl` command that runs the same code, so tests and scripts do not need the HTTP server.
+The Ops view is the only HTTP caller. Everything here is also a `rosctl` command. Commands that create or read shared state (links, faults, nodes) are clients of this API, not second implementations: they call the control process on port 8002, so the fault list stays in one place. Stateless commands (clock reads, checks) run the same code directly, so tests and scripts do not need the HTTP server.
 
 | Method and path | Purpose | Over HTTP |
 | --- | --- | --- |

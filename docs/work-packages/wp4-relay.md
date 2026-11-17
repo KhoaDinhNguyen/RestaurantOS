@@ -57,7 +57,7 @@ When a new row appears in `menu_versions`, send each affected region its slice w
 
 - Decide what to send from the region itself, not from `region_state`: read `node_state.menu_version` on the region's primary and send when it is below the newest version that touches one of that region's vendors. Check on a timer as well as when a new version appears. This is what repairs a failover: with asynchronous replication the old primary can have applied a version that the promoted standby never received, while `region_state.menu_version` already says it arrived.
 - A region is affected when it owns a vendor with a product whose `menu_version` is that version. Leave the other regions alone: their `region_state.menu_version` then skips numbers, which is fine.
-- Read the slice from HQ's `products` and `product_dish` when you send it, so it always holds every earlier version too. Publish versions in ascending order; the region ignores one at or below its own.
+- Read the slice from HQ's `products` and `product_dish` when you send it, so it always holds every earlier version too. A send therefore always carries the newest state, so send only the newest version that touches the region, never the intermediates it missed: an older version number must not label data that already includes later changes. The region ignores a version at or below its own, so catching up is one send.
 - Versions are created by `POST /menu/products` (architecture Section 6.1), which numbers them in commit order.
 
 ## Run it on its own
