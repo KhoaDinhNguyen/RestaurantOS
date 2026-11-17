@@ -13,12 +13,14 @@ the baseline at the end.
 
 from __future__ import annotations
 
+import dataclasses
 import uuid
 
 import psycopg
 import pytest
 
-from restaurantos.common.cluster import BASELINE, Cluster, host_conninfo, load_cluster
+from restaurantos.common.cluster import BASELINE, Cluster, host_conninfo, load_cluster, primary_of
+from restaurantos.sim import baseline_sync
 from restaurantos.sim.baseline_sync import SYNC_TABLES, BaselineSyncError, sync
 from restaurantos.sim.config import SimSettings
 
@@ -96,11 +98,21 @@ def _remove_test_rows(conn: psycopg.Connection) -> None:
 
 @pytest.fixture
 def seeded(cluster):
+    """r1 with test rows inserted, plus the baseline connection.
+
+    Teardown removes the test rows from BOTH sides (the sync copies
+    them to the baseline, so they land there too) and closes both
+    connections even when an assertion or a cleanup step fails."""
     region = _connect(cluster, "r1-primary")
+    baseline = _connect(cluster, BASELINE)
     _insert_test_rows(region)
-    yield region
-    _remove_test_rows(region)
-    region.close()
+    yield region, baseline
+    try:
+        _remove_test_rows(region)
+        _remove_test_rows(baseline)
+    finally:
+        region.close()
+        baseline.close()
 
 
 def _settings() -> SimSettings:
@@ -111,32 +123,34 @@ def _settings() -> SimSettings:
 
 
 def test_sync_copies_the_regions_counts_to_the_baseline(cluster, seeded):
-    baseline = _connect(cluster, BASELINE)
-    try:
-        counts = sync(cluster, _settings())
-        assert set(counts) == {"r1"}
-        for table in SYNC_TABLES:
-            # what the command copied is what the region holds...
-            assert counts["r1"][table] == _count(seeded, table)
-            # ...and what the baseline now holds
-            assert counts["r1"][table] == _count(baseline, table)
-        # the test's rows really made the trip
-        assert (
-            seeded.execute("SELECT count(*) FROM orders WHERE channel = %s", (CHANNEL,)).fetchone()[
-                0
-            ]
-            == baseline.execute(
-                "SELECT count(*) FROM orders WHERE channel = %s", (CHANNEL,)
-            ).fetchone()[0]
-        )
-    finally:
-        baseline.close()
+    region, baseline = seeded
+    counts = sync(cluster, _settings())
+    assert set(counts) == {"r1"}
+    for table in SYNC_TABLES:
+        # what the command copied is what the region holds...
+        assert counts["r1"][table] == _count(region, table)
+        # ...and what the baseline now holds
+        assert counts["r1"][table] == _count(baseline, table)
+    # the test's rows really made the trip
+    assert (
+        region.execute("SELECT count(*) FROM orders WHERE channel = %s", (CHANNEL,)).fetchone()[0]
+        == baseline.execute(
+            "SELECT count(*) FROM orders WHERE channel = %s", (CHANNEL,)
+        ).fetchone()[0]
+    )
 
 
 def test_a_second_sync_is_idempotent(cluster, seeded):
+    region, baseline = seeded
     first = sync(cluster, _settings())
+    before = {table: _count(baseline, table) for table in SYNC_TABLES}
     second = sync(cluster, _settings())
     assert second == first
+    # the baseline holds the same rows after the second sync, not just
+    # the same reported counts
+    for table in SYNC_TABLES:
+        assert _count(baseline, table) == before[table]
+        assert _count(baseline, table) == _count(region, table)
 
 
 def test_a_region_that_cannot_be_reached_is_an_error_that_leaves_the_baseline_alone(
@@ -147,17 +161,43 @@ def test_a_region_that_cannot_be_reached_is_an_error_that_leaves_the_baseline_al
     baseline exactly as the previous sync left it (the region preflight
     runs before the baseline is touched, and the one transaction covers
     everything after)."""
-    baseline = _connect(cluster, BASELINE)
-    try:
-        sync(cluster, _settings())  # a good sync first, so there is something to lose
-        before = {table: _count(baseline, table) for table in SYNC_TABLES}
+    region, baseline = seeded
+    sync(cluster, _settings())  # a good sync first, so there is something to lose
+    before = {table: _count(baseline, table) for table in SYNC_TABLES}
 
-        missing = Cluster(regions=2, standbys=True, synchronous=False, proxy_base_port=21000)
-        with pytest.raises(BaselineSyncError) as caught:
-            sync(missing, _settings())
+    missing_rid = f"r{cluster.regions + 1}"
+    missing = dataclasses.replace(cluster, regions=cluster.regions + 1)
+    with pytest.raises(BaselineSyncError) as caught:
+        sync(missing, _settings())
 
-        assert "r2-primary" in str(caught.value)
-        for table in SYNC_TABLES:
-            assert _count(baseline, table) == before[table]
-    finally:
-        baseline.close()
+    assert primary_of(missing_rid) in str(caught.value)
+    for table in SYNC_TABLES:
+        assert _count(baseline, table) == before[table]
+
+
+def test_a_copy_failure_after_the_delete_rolls_the_baseline_back(cluster, seeded, monkeypatch):
+    """A region that dies mid-copy is still "a region that cannot be
+    reached": the error names it and the table, and the one transaction
+    puts the baseline back exactly as it was - including the rows the
+    DELETE had already removed."""
+    region, baseline = seeded
+    sync(cluster, _settings())  # a good sync first: there is something to lose
+    before = {table: _count(baseline, table) for table in SYNC_TABLES}
+
+    real_copy = baseline_sync._copy_table
+
+    def fail_on_order_items(source, bs, table):
+        if table == "order_items":
+            raise psycopg.OperationalError("connection reset by peer")
+        return real_copy(source, bs, table)
+
+    monkeypatch.setattr(baseline_sync, "_copy_table", fail_on_order_items)
+
+    with pytest.raises(BaselineSyncError) as caught:
+        sync(cluster, _settings())
+    message = str(caught.value)
+    assert "order_items" in message
+    assert "r1-primary" in message
+    assert "left untouched" in message
+    for table in SYNC_TABLES:
+        assert _count(baseline, table) == before[table]

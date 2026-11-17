@@ -1,7 +1,9 @@
-"""The baseline sync's quiet gate and row-count report, plus the CLI
-wiring. The copy itself is tested against the real generated cluster
+"""The baseline sync's quiet gate (both reads), the re-check before
+commit, the row-count report, and the CLI wiring. The copy itself is
+tested against the real generated cluster
 (tests/cluster/test_baseline_sync.py); here everything runs against a
-faked control endpoint or the in-process control app."""
+faked control endpoint, the in-process control app, or fake database
+connections."""
 
 from __future__ import annotations
 
@@ -11,12 +13,19 @@ import httpx
 import pytest
 from conftest import FakeWallClock, make_playback, sample_orders
 
+from restaurantos.common.cluster import Cluster
+from restaurantos.sim import baseline_sync
 from restaurantos.sim.baseline_sync import (
+    SYNC_TABLES,
     BaselineSyncError,
+    _control_client,
     format_report,
+    gate_recheck,
     playback_refusal,
+    sync,
 )
 from restaurantos.sim.cli import app
+from restaurantos.sim.config import SimSettings
 from restaurantos.sim.control import make_control_app
 
 
@@ -168,6 +177,208 @@ def test_a_bad_in_flight_count_refuses():
 def test_a_missing_status_refuses():
     with status_client({}) as client:
         assert playback_refusal(client) is not None
+
+
+def test_the_gate_client_ignores_the_proxy_environment(monkeypatch):
+    """A dead HTTP_PROXY/ALL_PROXY fails with ECONNREFUSED, which the
+    gate would misread as "no playback process = quiet". The client must
+    not honour the environment."""
+    recorded: dict = {}
+    real_client = httpx.Client
+
+    def spy(**kwargs):
+        recorded.update(kwargs)
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(baseline_sync.httpx, "Client", spy)
+    _control_client(SimSettings(_env_file=None))
+    assert recorded["trust_env"] is False
+
+
+# --- the second gate read -------------------------------------------------------
+
+
+def _status(**overrides) -> dict:
+    body = {
+        "state": "idle",
+        "run_id": "run-1",
+        "inflight": 0,
+        "orders_sent": 10,
+        "orders_acked": 9,
+        "orders_parked": 0,
+        "orders_refused": 1,
+        "orders_failed": 0,
+    }
+    body.update(overrides)
+    return body
+
+
+def test_recheck_passes_when_nothing_changed():
+    assert gate_recheck(None, None) is None
+    assert gate_recheck(_status(), _status()) is None
+
+
+def test_recheck_aborts_when_a_playback_process_appeared():
+    message = gate_recheck(None, _status())
+    assert message is not None
+    assert "appeared" in message
+    assert "left as it was" in message
+
+
+def test_recheck_aborts_when_the_playback_process_disappeared():
+    message = gate_recheck(_status(), None)
+    assert message is not None
+    assert "disappeared" in message
+    assert "'run-1'" in message
+
+
+def test_recheck_aborts_when_the_run_changed():
+    message = gate_recheck(_status(), _status(run_id="run-2"))
+    assert message is not None
+    assert "'run-1' -> 'run-2'" in message
+
+
+def test_recheck_aborts_when_a_counter_advanced():
+    message = gate_recheck(_status(), _status(orders_sent=11, orders_acked=10))
+    assert message is not None
+    assert "orders_sent 10 -> 11" in message
+    assert "orders_acked 9 -> 10" in message
+
+
+def test_recheck_aborts_when_the_second_read_is_not_quiet():
+    message = gate_recheck(_status(), _status(state="running", inflight=2))
+    assert message is not None
+    assert "running" in message
+    assert "left as it was" in message
+
+
+# --- sync, end to end against fake databases ------------------------------------
+
+
+class _FakeCopy:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        if not getattr(self, "_served", False):
+            self._served = True
+            return b"one chunk of rows"
+        return b""
+
+    def write(self, data):
+        pass
+
+
+class _FakeCursor:
+    def __init__(self):
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def copy(self, statement):
+        if "FROM STDIN" in statement:
+            self.rowcount = 3
+        return _FakeCopy()
+
+
+class _FakeConnection:
+    def __init__(self, label: str):
+        self.label = label
+        self.committed = False
+        self.rolled_back = False
+        self.closed = False
+
+    def execute(self, *args, **kwargs):
+        return _FakeCursor()
+
+    def cursor(self):
+        return _FakeCursor()
+
+    def close(self):
+        self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *exc):
+        if exc_type is None:
+            self.committed = True
+        else:
+            self.rolled_back = True
+        return False
+
+
+def _fake_databases(monkeypatch) -> list[_FakeConnection]:
+    connections: list[_FakeConnection] = []
+
+    def connect(dsn, **kwargs):
+        connection = _FakeConnection("baseline" if "port=5509" in dsn else "region")
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(baseline_sync.psycopg, "connect", connect)
+    return connections
+
+
+def _two_reads(first: dict | None, second: dict | None) -> httpx.MockTransport:
+    bodies = iter([first, second])
+
+    def handler(request):
+        return httpx.Response(200, json=next(bodies))
+
+    return httpx.MockTransport(handler)
+
+
+def _cluster() -> Cluster:
+    return Cluster(regions=1, standbys=False)
+
+
+def test_sync_with_an_unchanged_gate_commits(monkeypatch):
+    connections = _fake_databases(monkeypatch)
+    counts = sync(
+        _cluster(),
+        SimSettings(_env_file=None),
+        transport=_two_reads(_status(), _status()),
+    )
+    baseline = [c for c in connections if c.label == "baseline"][0]
+    assert baseline.committed and not baseline.rolled_back
+    assert counts == {"r1": {table: 3 for table in SYNC_TABLES}}
+
+
+def test_sync_aborts_and_rolls_back_when_playback_advanced_during_the_copy(monkeypatch):
+    connections = _fake_databases(monkeypatch)
+    with pytest.raises(BaselineSyncError) as caught:
+        sync(
+            _cluster(),
+            SimSettings(_env_file=None),
+            transport=_two_reads(_status(), _status(orders_sent=11)),
+        )
+    assert "orders_sent 10 -> 11" in str(caught.value)
+    assert "left as it was" in str(caught.value)
+    baseline = [c for c in connections if c.label == "baseline"][0]
+    assert baseline.rolled_back and not baseline.committed
+
+
+def test_sync_refuses_before_touching_any_database(monkeypatch):
+    def no_connect(*args, **kwargs):
+        raise AssertionError("the gate refused, so no connection may be opened")
+
+    monkeypatch.setattr(baseline_sync.psycopg, "connect", no_connect)
+    with pytest.raises(BaselineSyncError) as caught:
+        sync(
+            _cluster(),
+            SimSettings(_env_file=None),
+            transport=_two_reads(_status(state="running", inflight=4), None),
+        )
+    assert str(caught.value).startswith("refusing to sync the baseline:")
+    assert "'run-1'" in str(caught.value)
 
 
 # --- the report ----------------------------------------------------------------
