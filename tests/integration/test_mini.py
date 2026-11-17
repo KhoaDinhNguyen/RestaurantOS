@@ -68,7 +68,9 @@ def test_traps_survive_the_load(conn):
         ("caramel", 3.0, "piece"),
     }
     low = conn.execute("SELECT on_hand, par_level FROM stock WHERE on_hand < par_level").fetchall()
-    assert low == [(2, 10)]
+    # caramel: 6 = one unit of p001 (amount 3 x multiplier 2), the low
+    # counter that the API-review floor rule keeps sellable
+    assert low == [(6, 10)]
 
 
 def test_live_only_columns_are_invented_deterministically(conn):

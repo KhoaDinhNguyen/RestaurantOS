@@ -9,8 +9,12 @@ from the data, never assumed.
 
 A counter exists for every (vendor, item) the vendor's products can
 need, including items never used during warm-up — those start at the
-floor. `per_ingredient` dishes keep an ingredient counter per recipe
-row; `per_item` dishes keep one dish counter, with no recipe involved.
+counter's floor, which is F or the largest amount one unit of any of
+the vendor's products takes from the counter, whichever is higher
+(a flat F can sit below one unit: a set of 6 needs 6, and a counter
+that never holds more than F can never sell it). `per_ingredient`
+dishes keep an ingredient counter per recipe row; `per_item` dishes
+keep one dish counter, with no recipe involved.
 """
 
 from __future__ import annotations
@@ -76,12 +80,21 @@ def warm_up_stock(
             return []
         raise ValueError(f"dish {dish_id}: unknown stock_mode {mode!r}")
 
-    # Every counter a vendor's products can need, before any usage is seen.
-    needed: set[tuple[str, str, str]] = set()
+    # Every counter a vendor's products can need, before any usage is
+    # seen - and the largest single-unit need on that counter, over the
+    # vendor's products that use it: one unit of a product takes
+    # factor x multiplier from it (factor is the recipe amount for an
+    # ingredient counter, 1 for a dish counter). A counter whose floor
+    # sits below that need can never sell the product, so it becomes
+    # the counter's own floor.
+    one_unit_need: dict[tuple[str, str, str], float] = {}
     for vendor_id, product_id in sorted(vendor_products):
-        for dish_id, _ in links.get((vendor_id, product_id), ()):
-            for (kind, item_id), _factor in counters_of(dish_id):
-                needed.add((vendor_id, kind, item_id))
+        for dish_id, multiplier in links.get((vendor_id, product_id), ()):
+            for (kind, item_id), factor in counters_of(dish_id):
+                key = (vendor_id, kind, item_id)
+                need = factor * multiplier
+                if need > one_unit_need.get(key, 0.0):
+                    one_unit_need[key] = need
 
     # Usage in the warm-up window: quantity x multiplier x amount, charged
     # to the vendor that took the order (the one whose stock it comes off).
@@ -106,8 +119,11 @@ def warm_up_stock(
                     usage[key] = usage.get(key, 0.0) + quantity * multiplier * factor
 
     rows: list[tuple[str, str, str, int, int]] = []
-    for vendor_id, item_kind, item_id in sorted(needed):
+    for vendor_id, item_kind, item_id in sorted(one_unit_need):
         average_daily = usage.get((vendor_id, item_kind, item_id), 0.0) / warm_days
-        on_hand = max(floor, math.ceil(average_daily * cover_days))
+        # the counter's floor: F, or one unit of the hungriest product,
+        # whichever is higher
+        counter_floor = max(floor, math.ceil(one_unit_need[(vendor_id, item_kind, item_id)]))
+        on_hand = max(counter_floor, math.ceil(average_daily * cover_days))
         rows.append((vendor_id, item_kind, item_id, on_hand, on_hand))
     return rows
