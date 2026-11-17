@@ -12,6 +12,8 @@ from functools import cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from restaurantos.sim.playback import MIN_EVENT_GAP_S
+
 
 class SimSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ROS_SIM_", env_file=".env", extra="ignore")
@@ -43,10 +45,14 @@ class SimSettings(BaseSettings):
     # of the orders their full event set (an order is in or out, never
     # half). Jitter is uniform in [0, playback_event_jitter_s) simulated
     # seconds per event, drawn per (seed, order, event) - never a shared
-    # generator.
+    # generator. The bound is capped at the smallest gap between two
+    # events of one order (120 s, +1 min to +3 min, derived from the
+    # engine's EVENT_SCHEDULE): jitter is drawn from [0, J), so at or
+    # above the gap it could reorder the events, and the region would
+    # answer conflicts.
     playback_status_events: bool = True
     playback_event_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
-    playback_event_jitter_s: float = Field(default=60.0, ge=0.0)
+    playback_event_jitter_s: float = Field(default=60.0, ge=0.0, le=float(MIN_EVENT_GAP_S))
     # The gateway's API base, as seen from the machine rosctl runs on:
     # POST goes to {target}/orders. Point it at the stub
     # (http://127.0.0.1:8900) until the gateway exists.

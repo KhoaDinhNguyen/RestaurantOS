@@ -354,6 +354,19 @@ async def test_refused_parked_and_failed_orders_skip_their_events(tmp_path: Path
 # --- the flag and the sample rate --------------------------------------------
 
 
+async def test_the_engine_refuses_jitter_and_rate_out_of_range(tmp_path: Path) -> None:
+    """Review item 5: tests and API callers build the engine directly,
+    so the jitter bound and the sample rate validate in the constructor
+    too, not only in the settings."""
+    orders = sample_orders(2)
+    with pytest.raises(ValueError, match="event_jitter_s"):
+        make_playback(orders, tmp_path, status_events=True, event_jitter_s=121)
+    with pytest.raises(ValueError, match="event_sample_rate"):
+        make_playback(orders, tmp_path, status_events=True, event_sample_rate=-0.1)
+    # the bounds are the exact limits, and they still build
+    make_playback(orders, tmp_path, status_events=True, event_jitter_s=120.0)
+
+
 async def test_events_off_and_rate_zero(tmp_path: Path) -> None:
     orders = sample_orders(6)
     variants: list[tuple[str, dict[str, Any]]] = [

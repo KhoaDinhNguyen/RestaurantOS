@@ -64,6 +64,17 @@ def test_negative_jitter_is_rejected():
         SimSettings(playback_event_jitter_s=-1)
 
 
+def test_jitter_above_the_smallest_event_gap_is_rejected():
+    """Review item 5: jitter is drawn from [0, J), so at or above the
+    smallest gap between two events of one order (120 s) it could
+    reorder them; the setting refuses to allow it."""
+    from restaurantos.sim.playback import MIN_EVENT_GAP_S
+
+    assert MIN_EVENT_GAP_S == 120
+    with pytest.raises(ValidationError):
+        SimSettings(playback_event_jitter_s=121)
+
+
 # ---- shards -----------------------------------------------------------------
 
 

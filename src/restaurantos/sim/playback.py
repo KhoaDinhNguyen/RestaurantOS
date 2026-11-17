@@ -113,12 +113,21 @@ RESPONSE_FIELDS = (
 # ...and the ones of a status change (StatusResult in common/models.py).
 EVENT_RESPONSE_FIELDS = ("applied", "duplicate", "conflict")
 
-# The brief's kitchen timeline: (to_status, seconds after the order).
+# The kitchen timeline: (to_status, seconds after the order).
 EVENT_SCHEDULE: tuple[tuple[OrderStatus, int], ...] = (
     (OrderStatus.ACCEPTED, 60),
     (OrderStatus.PREPARING, 180),
     (OrderStatus.READY, 900),
     (OrderStatus.PICKED_UP, 1500),
+)
+
+# The jitter is drawn from [0, J), so it can never reach the smallest
+# gap between two events of one order: at the gap exactly, a later
+# event could draw its full jitter and tie its predecessor. Derived
+# from EVENT_SCHEDULE, not written a second time.
+MIN_EVENT_GAP_S = min(
+    later - earlier
+    for (_, earlier), (_, later) in zip(EVENT_SCHEDULE, EVENT_SCHEDULE[1:], strict=False)
 )
 
 # Dispatch order within one simulated instant: restocks first (they
@@ -298,6 +307,19 @@ class Playback:
         self._status_events = status_events
         self._event_sample_rate = event_sample_rate
         self._event_jitter_s = event_jitter_s
+        # Tests and API callers build the engine directly, so the two
+        # knobs validate here too, not only in the settings: jitter at
+        # or above the smallest event gap could reorder one order's
+        # events (the region would answer conflicts), and a sample rate
+        # outside [0, 1] means nothing.
+        if not 0.0 <= event_jitter_s <= MIN_EVENT_GAP_S:
+            raise ValueError(
+                f"event_jitter_s {event_jitter_s} must be within [0, {MIN_EVENT_GAP_S}]: "
+                "jitter is drawn from [0, J), so at or above the smallest gap "
+                "between two events of one order it could reorder them"
+            )
+        if not 0.0 <= event_sample_rate <= 1.0:
+            raise ValueError(f"event_sample_rate {event_sample_rate} must be within [0, 1]")
         self._restock_every = restock_every
         self._warm_up_days = warm_up_days
         self._restock_vendors = tuple(restock_vendors)
