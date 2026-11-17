@@ -55,7 +55,7 @@ Take names, ports and upstreams only from `restaurantos.common.cluster`; never t
    - give `COPY` the column list from the file's header (`products.csv` and `product_dish.csv` start with `product_id`, the tables with `vendor_id`);
    - load in foreign-key order: `ingredients`, `dishes`, `dish_ingredients`, `vendors`, `products`, `product_dish`;
    - after loading, check that no ingredient appears in `dish_ingredients` with two different units, and stop with a clear message if one does. A stock counter is kept in its ingredient's unit.
-9. Initialise `stock` from the **warm-up window only**: starting stock = max(F, ceil(average daily warm-up usage x C)), also stored as `par_level`. Defaults W = 14 days, C = 7, F = 5, restock every R = 7 days. Usage is `quantity x multiplier x amount`, with `amount` and `multiplier` read from the data. The warm-up window is days 0 to 13: 292,587 orders. Create a row for every counter a vendor's products can need, including ones never used during warm-up; `place_order` treats a missing row as zero.
+9. Initialise `stock` from the **warm-up window only**: starting stock = max(floor, ceil(average daily warm-up usage x C)), also stored as `par_level`. The floor of a counter is max(F, the largest amount one unit of any of the vendor's products takes from it): `amount x multiplier` for a `per_ingredient` dish, `multiplier` for a `per_item` dish. Without that, a product with a multiplier above F whose counter sits at the floor could never be sold. Defaults W = 14 days, C = 7, F = 5, restock every R = 7 days. Usage is `quantity x multiplier x amount`, with `amount` and `multiplier` read from the data. The warm-up window is days 0 to 13: 292,587 orders. Create a row for every counter a vendor's products can need, including ones never used during warm-up; `place_order` treats a missing row as zero.
 
 Data files are read from `ROS_DATA_DIR` (default `data/`). Check them against `MANIFEST.csv` first.
 
@@ -90,7 +90,7 @@ Stretch goal, only if the report needs a write-throughput comparison: no new cod
 - **Scheduling:** an order t simulated seconds after the start goes out t / speed wall-clock seconds after the start. Speed can change mid-run, so keep an anchor (wall-clock now, simulated now) and re-anchor on every change. Do not precompute send times. Default speed 1,000x.
 - Send with a bounded number of requests in flight.
 - **Status events** (on by default): for each accepted order, schedule accepted, preparing, ready and picked-up at +1, +3, +15, +25 simulated minutes plus jitter. Send them to the region's own API.
-- **Restock** every R simulated days: at 00:00:00 of days W + R, W + 2R, and so on, for every vendor, before the first order of that day. In sequential mode, wait for the restock calls to finish before sending that order.
+- **Restock** every R simulated days: at 00:00:00 of days W + R, W + 2R, and so on, for every vendor, before the first order of that day. In sequential mode, wait for the restock calls to finish before sending that order. A restock tops counters up to par and answers `200` (architecture Section 6.1); send no body.
 - **Duplicates and shuffling:** resend a configurable share of orders; optionally reorder delivery.
 - **Randomness:** derive every random value from a hash of (`seed`, `order_id`, purpose). Never draw from one shared generator in send order.
 - **Run log:** one line per order in `runs/<run_id>/orders.jsonl` with the three gateway timestamps and the outcome.

@@ -69,6 +69,15 @@ All the `/vendors/...` routes and `/regions` in Section 6.1, including `/regions
 - Edge mode: run the search on your local primary. Your node only holds your region's vendors, so a cell from another region returns no rows by itself; no directory lookup needed.
 - One SQL file in `db/queries/gateway/` serves both modes: vendors with `geohash = %(geohash)s` where `q` is empty, or `primary_cuisine ILIKE` the pattern, or an `EXISTS` on that vendor's `products` with `name ILIKE` the pattern. Build the pattern in Python as `%` + `q` + `%`, escaping `%`, `_` and `\` in `q` so they match literally. Use `EXISTS`, not a join, so each vendor comes back once. Order by `vendor_id`.
 
+The contracts of the routes below are in Section 6.1, each with its body and answers:
+
+- `PUT /vendors/{vendor_id}/products/{product_id}/availability` and `POST /vendors/{vendor_id}/restock`: call `region.set_availability` and `region.restock` and return what they return, with `vendor_id` (and `region_id` for a restock) added. A restock answers `200`; playback counts nothing else as success. The restock body is optional to build.
+- `GET /vendors/{vendor_id}/stock`: one SQL file, routed like the menu.
+- `GET /dishes?q=&limit=` and `GET /dishes/{dish_id}`: gateway mode reads HQ, edge mode reads its local node (every region has the full `dishes` table). Escape `q` as for the vendor search.
+- `GET /vendors/{vendor_id}/menu`: add `dish_id` to each row (join `product_dish`).
+- `POST /menu/products` (gateway mode only): make the id of a new product, take `LOCK TABLE menu_versions IN EXCLUSIVE MODE`, insert the next version, upsert `products` and `product_dish`, all in one transaction at HQ, and answer `202`. The lock keeps version numbers in commit order; without it the publisher could send version 5, then skip a later-committed 4 as old.
+- When HQ's database cannot be answered in time on a route that only reads or writes HQ, answer `503` with `{"error": "hq_unreachable"}`.
+
 ### When the region cannot be reached
 
 Only orders are parked. Everything else fails fast and says which region is missing:
@@ -78,7 +87,7 @@ Only orders are parked. Everything else fails fast and says which region is miss
 | `POST /orders` | gateway mode: park it, `202` (step 5 above). Edge mode: `503` |
 | any other write: status change, sold-out switch, restock | `503`, not parked. The holding queue holds orders only |
 | any read of region data: order status, kitchen board, menu, `/vendors`, the summary | `503`. Never answered from HQ: its copy may be stale and has no stock or availability |
-| `GET /regions`, `POST /menu/products` | not affected, they only touch HQ |
+| `GET /regions`, `POST /menu/products`, `GET /dishes` | not affected, they only touch HQ |
 
 The `503` body is `{"error": "region_unreachable", "region_id": "r1"}`. `run_on` raises `RegionUnreachableError` with the `region_id` you gave it; turn it into the response in one exception handler. The other answers are in the table under the routes in Section 6.1: `404` for an unknown vendor, order or region, `409` for a refused order or a status change that lost.
 

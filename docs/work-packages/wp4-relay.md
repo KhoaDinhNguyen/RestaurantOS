@@ -53,7 +53,11 @@ Reach the primary through `hq__<node>`, where `<node>` is `region_state.primary_
 
 ### 3. Menu publisher (HQ to region)
 
-When a new row appears in `menu_versions`, send each region its slice with `region.apply_menu_version` (through `hq__<node>` as above, with the current epoch) in one transaction, then record the version in `region_state`. If the connection resets halfway, the region's transaction rolls back and it keeps serving the old version; retry.
+When a new row appears in `menu_versions`, send each affected region its slice with `region.apply_menu_version` (through `hq__<node>` as above, with the current epoch) in one transaction, then record the version in `region_state`. If the connection resets halfway, the region's transaction rolls back and it keeps serving the old version; retry.
+
+- A region is affected when it owns a vendor with a product whose `menu_version` is that version. Leave the other regions alone: their `region_state.menu_version` then skips numbers, which is fine.
+- Read the slice from HQ's `products` and `product_dish` when you send it, so it always holds every earlier version too. Publish versions in ascending order; the region ignores one at or below its own.
+- Versions are created by `POST /menu/products` (architecture Section 6.1), which numbers them in commit order.
 
 ## Run it on its own
 
