@@ -21,8 +21,18 @@ from restaurantos.gateway.config import get_gateway_settings
 from restaurantos.gateway.directory import DirectoryCache, get_regions
 from restaurantos.gateway.dishes import get_dish, search_dishes
 from restaurantos.gateway.edge import EdgePrimary, run_edge
-from restaurantos.gateway.errors import HQUnreachableError
+from restaurantos.gateway.errors import (
+    DishLinkFixedError,
+    HQUnreachableError,
+    MenuNotFoundError,
+    ProductExistsError,
+)
 from restaurantos.gateway.menu import get_vendor_menu
+from restaurantos.gateway.menu_publish import (
+    MenuPublishRequest,
+    MenuPublishResponse,
+    publish_menu,
+)
 from restaurantos.gateway.orders import (
     get_order_status,
     get_vendor_orders,
@@ -204,6 +214,40 @@ def create_app() -> FastAPI:
         return JSONResponse(
             status_code=503,
             content={"error": "hq_unreachable"},
+        )
+
+    @app.exception_handler(MenuNotFoundError)
+    async def menu_not_found_handler(
+        request: Request,
+        exc: MenuNotFoundError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "not_found"},
+        )
+
+    @app.exception_handler(ProductExistsError)
+    async def product_exists_handler(
+        request: Request,
+        exc: ProductExistsError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "product_exists",
+                "vendor_id": exc.vendor_id,
+                "product_id": exc.product_id,
+            },
+        )
+
+    @app.exception_handler(DishLinkFixedError)
+    async def dish_link_fixed_handler(
+        request: Request,
+        exc: DishLinkFixedError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=409,
+            content={"error": "dish_link_fixed"},
         )
 
     def get_place_order():
@@ -714,6 +758,23 @@ def create_app() -> FastAPI:
             status_code=order_status_code(result),
             content=response.model_dump(mode="json"),
         )
+
+    @gateway.post(
+        "/menu/products",
+        response_model=MenuPublishResponse,
+        status_code=202,
+    )
+    async def publish_menu_products(
+        body: MenuPublishRequest,
+        request: Request,
+    ) -> MenuPublishResponse:
+        async def work():
+            return await publish_menu(
+                request.app.state.hq_pool,
+                body,
+            )
+
+        return await run_hq(work)
 
     if settings.mode == "gateway":
         app.include_router(gateway)

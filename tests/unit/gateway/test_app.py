@@ -1468,3 +1468,155 @@ def test_edge_dish_search_uses_local_primary(monkeypatch) -> None:
     assert response.json()[0]["dish_id"] == "d001"
 
     edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+
+
+def test_publish_menu_products_returns_202(monkeypatch) -> None:
+    from restaurantos.gateway.menu_publish import (
+        MenuPublishResponse,
+        PublishedProduct,
+    )
+
+    async def fake_publish_menu(pool, body):
+        assert pool == "hq-pool"
+        assert body.note == "new product"
+        assert len(body.products) == 1
+
+        product = body.products[0]
+
+        assert product.vendor_id == "v001"
+        assert product.name == "Laksa"
+        assert product.price_units == 30
+        assert product.dish_id == "d001"
+        assert product.multiplier == 1
+
+        return MenuPublishResponse(
+            menu_version=2,
+            products=[
+                PublishedProduct(
+                    vendor_id="v001",
+                    product_id="abc123def456",
+                    region_id="r1",
+                    created=True,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.publish_menu",
+        fake_publish_menu,
+    )
+
+    app = create_app()
+    app.state.hq_pool = "hq-pool"
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/menu/products",
+        json={
+            "note": "new product",
+            "products": [
+                {
+                    "vendor_id": "v001",
+                    "name": "Laksa",
+                    "price_units": 30,
+                    "dish_id": "d001",
+                    "multiplier": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.json() == {
+        "menu_version": 2,
+        "products": [
+            {
+                "vendor_id": "v001",
+                "product_id": "abc123def456",
+                "region_id": "r1",
+                "created": True,
+            }
+        ],
+    }
+
+
+def test_publish_menu_products_product_exists_returns_409(
+    monkeypatch,
+) -> None:
+    from restaurantos.gateway.errors import ProductExistsError
+
+    async def fake_publish_menu(pool, body):
+        raise ProductExistsError("v001", "abc123def456")
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.publish_menu",
+        fake_publish_menu,
+    )
+
+    app = create_app()
+    app.state.hq_pool = object()
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/menu/products",
+        json={
+            "products": [
+                {
+                    "vendor_id": "v001",
+                    "name": "Laksa",
+                    "price_units": 30,
+                    "dish_id": "d001",
+                    "multiplier": 1,
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": "product_exists",
+        "vendor_id": "v001",
+        "product_id": "abc123def456",
+    }
+
+
+def test_publish_menu_products_dish_link_fixed_returns_409(
+    monkeypatch,
+) -> None:
+    from restaurantos.gateway.errors import DishLinkFixedError
+
+    async def fake_publish_menu(pool, body):
+        raise DishLinkFixedError()
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.publish_menu",
+        fake_publish_menu,
+    )
+
+    app = create_app()
+    app.state.hq_pool = object()
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/menu/products",
+        json={
+            "products": [
+                {
+                    "vendor_id": "v001",
+                    "product_id": "p001",
+                    "name": "Laksa",
+                    "price_units": 30,
+                    "dish_id": "different-dish",
+                    "multiplier": 1,
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "error": "dish_link_fixed",
+    }
