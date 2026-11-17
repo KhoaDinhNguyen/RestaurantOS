@@ -234,11 +234,17 @@ class RunLog:
         # Drain guarantees every live send task added its record; a gap
         # here is a bug. Write a placeholder line for the missing send
         # so the gap is visible in the file, and leave the records that
-        # did complete unchanged.
+        # did complete unchanged. The placeholder carries the same
+        # `kind` every line has - `missing`, for a send that produced
+        # no result at all.
         while self._pending:
             record = self._pending.pop(self._next, None)
             if record is None:
-                record = {"seq": self._next, "error": "missing: the send task produced no result"}
+                record = {
+                    "kind": "missing",
+                    "seq": self._next,
+                    "error": "missing: the send task produced no result",
+                }
             self._f.write(json.dumps(record, separators=(",", ":")) + "\n")
             self._next += 1
         self._f.close()
@@ -356,6 +362,7 @@ class Playback:
         self._events_conflicted = 0
         self._events_failed = 0
         self._events_skipped = 0
+        self._events_duplicate = 0
         self._restocks_sent = 0
         self._restocks_acked = 0
         self._restocks_failed = 0
@@ -497,6 +504,7 @@ class Playback:
         self._events_conflicted = 0
         self._events_failed = 0
         self._events_skipped = 0
+        self._events_duplicate = 0
         self._restocks_sent = 0
         self._restocks_acked = 0
         self._restocks_failed = 0
@@ -561,6 +569,10 @@ class Playback:
     # --- reporting ---------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
+        """The run's counters. `events_acked` counts the events the
+        region applied; a replayed event the region already knew
+        (same event id, answered with duplicate) counts as
+        `events_duplicate` instead."""
         return {
             "state": self._state,
             "run_id": self._run_id or None,
@@ -578,6 +590,7 @@ class Playback:
             "events_conflicted": self._events_conflicted,
             "events_failed": self._events_failed,
             "events_skipped": self._events_skipped,
+            "events_duplicate": self._events_duplicate,
             "restocks_sent": self._restocks_sent,
             "restocks_acked": self._restocks_acked,
             "restocks_failed": self._restocks_failed,
@@ -884,7 +897,8 @@ class Playback:
         self._events_sent += 1
         # The house style for event ids: deterministic, so the same
         # replayed window produces the same event ids and a re-run is
-        # idempotent at the region (409 conflict, logged and counted).
+        # idempotent at the region (the same id answers as a duplicate;
+        # a 409 would mean a real state-machine rejection).
         record: dict[str, Any] = {
             "kind": "status_event",
             "seq": seq,
@@ -1041,14 +1055,19 @@ class Playback:
                     if is_event:
                         record.update(_response_fields(response, EVENT_RESPONSE_FIELDS))
                     if response.status_code in (200, 201):
-                        if is_event:
+                        if is_event and record.get("duplicate"):
+                            # the region already knew this event id: a
+                            # re-replayed window is idempotent through
+                            # the duplicate flag, not through conflict
+                            self._events_duplicate += 1
+                        elif is_event:
                             self._events_acked += 1
                         else:
                             self._restocks_acked += 1
                     elif is_event and response.status_code == 409:
-                        # a status change that lost to an earlier one:
-                        # the architecture says 409 on conflict, and a
-                        # re-replayed window hits it on purpose
+                        # a status change that lost to an earlier one is
+                        # the architecture's conflict answer; it means a
+                        # real state-machine rejection, never a replay
                         self._events_conflicted += 1
                     else:
                         self._count_aux_failed(record)

@@ -415,7 +415,8 @@ def test_runlog_writes_in_sequence_order(tmp_path: Path) -> None:
 
 def test_runlog_close_marks_only_the_missing_sends(tmp_path: Path) -> None:
     """A gap gets a placeholder line; the records that did complete are
-    written unchanged, not relabelled as missing (review A3)."""
+    written unchanged, not relabelled as missing (review A3). The
+    placeholder carries a kind like every other line (review item 10)."""
     log = RunLog(tmp_path / "orders.jsonl")
     log.add(0, {"seq": 0, "http_status": 201})
     log.add(2, {"seq": 2, "http_status": 201})
@@ -423,6 +424,7 @@ def test_runlog_close_marks_only_the_missing_sends(tmp_path: Path) -> None:
     lines = [json.loads(line) for line in (tmp_path / "orders.jsonl").read_text().splitlines()]
     assert [line["seq"] for line in lines] == [0, 1, 2]
     assert lines[0]["http_status"] == 201 and "error" not in lines[0]
+    assert lines[1]["kind"] == "missing"
     assert lines[1]["error"] == "missing: the send task produced no result"
     assert lines[2]["http_status"] == 201 and "error" not in lines[2]
 

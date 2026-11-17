@@ -77,7 +77,15 @@ def make_stub_app(delay_seconds: float = 0.0) -> FastAPI:
 
     async def restock(vendor_id: str) -> dict[str, object]:
         await slow_down()
-        return {"vendor_id": vendor_id, "restocked": True}
+        # The shape decided in the API review (api-gaps 1.2): 200 with
+        # what the region did. The stub has no stock, so the counts are
+        # zero; playback counts both 200 and 201 as an ack.
+        return {
+            "vendor_id": vendor_id,
+            "region_id": "r-stub",
+            "counters_restocked": 0,
+            "products_back_on": 0,
+        }
 
     # The gateway serves its routes behind the /api/v1 prefix
     # (architecture Section 6.1); both paths work so the stub is a
@@ -92,7 +100,7 @@ def make_stub_app(delay_seconds: float = 0.0) -> FastAPI:
             status_code=201,
         )
         app.add_api_route(
-            f"{prefix}/vendors/{{vendor_id}}/restock", restock, methods=["POST"], status_code=201
+            f"{prefix}/vendors/{{vendor_id}}/restock", restock, methods=["POST"], status_code=200
         )
 
     @app.get("/sim/stub/health")

@@ -120,11 +120,18 @@ async def test_status_change_is_a_pure_function_of_the_request(client):
     assert first == second
 
 
-async def test_restock_answers_201_on_both_paths(client):
+async def test_restock_answers_the_decided_shape_on_both_paths(client):
+    """api-gaps 1.2: 200 with {vendor_id, region_id, counters_restocked,
+    products_back_on}. The stub has no stock, so the counts are zero."""
     for path in ("/vendors/v1/restock", "/api/v1/vendors/v1/restock"):
         response = await client.post(path)
-        assert response.status_code == 201, response.text
-        assert response.json() == {"vendor_id": "v1", "restocked": True}
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "vendor_id": "v1",
+            "region_id": "r-stub",
+            "counters_restocked": 0,
+            "products_back_on": 0,
+        }
 
 
 async def test_delay_slows_the_new_routes_too():

@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import math
 import signal
 import sys
 from collections.abc import Iterator
@@ -57,6 +58,16 @@ def restock_vendors(data_dir: Path) -> list[str]:
 
 
 async def start_command(args: argparse.Namespace) -> int:
+    # The CLI override skips SimSettings validation, so it is checked
+    # here, before anything is built: a NaN or a share outside [0, 1]
+    # would otherwise silently drop or keep every event (review item 6).
+    rate_arg = args.event_sample_rate
+    if rate_arg is not None and not (math.isfinite(rate_arg) and 0.0 <= rate_arg <= 1.0):
+        print(
+            f"rosctl playback start: --event-sample-rate {rate_arg} must be a number in [0, 1]",
+            file=sys.stderr,
+        )
+        return 1
     common = get_settings()
     sim = get_sim_settings()
     data_dir = common.data_dir
@@ -85,7 +96,7 @@ async def start_command(args: argparse.Namespace) -> int:
     try:
         banner_days = restock_days(meta.warm_up_days, restock_every, from_day, last_day)
         vendors = restock_vendors(data_dir)
-    except (OSError, RuntimeError) as error:
+    except (OSError, RuntimeError, ValueError) as error:
         print(f"rosctl playback start: {error}", file=sys.stderr)
         return 1
     playback = Playback(

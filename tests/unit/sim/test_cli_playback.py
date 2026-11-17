@@ -200,6 +200,16 @@ def test_restock_vendors_are_sorted_and_header_checked(tmp_path):
         restock_vendors(tmp_path)
 
 
+def test_start_refuses_a_sample_rate_outside_zero_to_one(capsys):
+    """Review item 6: the CLI override skips SimSettings validation;
+    a negative rate would silently drop every event, a rate above 1
+    silently keep them all. Both refuse before anything is built."""
+    for bad in ("1.5", "-0.1", "nan", "inf"):
+        rc = app(["playback", "start", "--event-sample-rate", bad, "--port", "1"])
+        assert rc == 1, bad
+        assert "must be a number in [0, 1]" in capsys.readouterr().err, bad
+
+
 def test_start_refuses_a_window_inside_the_warmup(tmp_path, monkeypatch, capsys, fresh_settings):
     # a tiny valid data directory whose cache starts at day 14
     import hashlib

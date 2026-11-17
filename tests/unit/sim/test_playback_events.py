@@ -409,9 +409,38 @@ async def test_the_sample_is_a_stable_per_order_decision(tmp_path: Path) -> None
     assert other != subset  # the sample follows the seed
 
 
-async def test_status_conflicts_are_counted_not_failed(tmp_path: Path) -> None:
+async def test_a_replayed_event_counts_as_a_duplicate_not_a_conflict(tmp_path: Path) -> None:
+    """Review item 7: a replayed event id is answered with
+    duplicate: true (usually 2xx), not 409 - 409 is a real state-machine
+    rejection. The counter says which is which."""
+
+    class DuplicateStatus(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.inner = httpx.ASGITransport(app=make_stub_app())
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/status"):
+                return httpx.Response(200, json={"applied": False, "duplicate": True})
+            return await self.inner.handle_async_request(request)
+
+    orders = [make_order(14, 0, 0, 1, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders, tmp_path, clock=clock, status_events=True, transport=DuplicateStatus()
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="replay")
+    await drive(pb, clock)
+    status = pb.status()
+    assert status["events_duplicate"] == 4
+    assert status["events_conflicted"] == 0
+    assert status["events_acked"] == 0
+    events = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
+    assert all(line["http_status"] == 200 and line["duplicate"] is True for line in events)
+
+
+async def test_conflicts_are_counted_not_failed(tmp_path: Path) -> None:
     """A 409 from the status route is the architecture's conflict
-    answer, not an error - a re-replayed window meets it on purpose."""
+    answer - a state-machine rejection - not an error."""
 
     class ConflictingStatus(httpx.AsyncBaseTransport):
         def __init__(self) -> None:
@@ -466,7 +495,7 @@ async def test_restock_goes_out_before_the_days_first_order(tmp_path: Path) -> N
     assert [line["vendor_id"] for line in lines[:2]] == ["v002", "v001"]
     assert [line["restock_day"] for line in lines[:2]] == [21, 21]
     assert [line["sim_sent_at"] for line in lines[:2]] == [0.0, 0.0]
-    assert [line["http_status"] for line in lines[:2]] == [201, 201]
+    assert [line["http_status"] for line in lines[:2]] == [200, 200]
     assert [line["kind"] for line in lines[2:]] == ["order"] * 3
     status = pb.status()
     assert status["restocks_sent"] == 2
