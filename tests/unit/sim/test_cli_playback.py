@@ -103,6 +103,55 @@ async def test_status_reports_http_errors_as_messages(capsys, monkeypatch):
     assert "rosctl playback status:" in capsys.readouterr().err
 
 
+async def test_a_wrong_state_prints_the_message_field(capsys, monkeypatch):
+    """API review 4.5: the control plane's 409 body carries `message`;
+    the CLI prints it, falling back to `detail` for any other 409
+    shape."""
+    import argparse
+
+    import httpx
+
+    from restaurantos.sim import playback_cli
+
+    class Server:
+        def __init__(self, timeout=None, body=None):
+            self.body = body
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, json=None):
+            return httpx.Response(409, json=self.body)
+
+    from restaurantos.sim.playback_cli import control_command
+
+    async def run(body: dict) -> str:
+        monkeypatch.setattr(
+            playback_cli.httpx,
+            "AsyncClient",
+            lambda timeout=None: Server(timeout=timeout, body=body),
+        )
+        args = argparse.Namespace(port=1, play_command="pause")
+        rc = await control_command(args, method="POST", body={"action": "pause"})
+        assert rc == 1
+        return capsys.readouterr().err
+
+    err = await run(
+        {
+            "error": "invalid_state",
+            "state": "running",
+            "message": "cannot pause while the run is running",
+        }
+    )
+    assert "cannot pause while the run is running" in err
+
+    err = await run({"detail": "an old-shaped conflict"})
+    assert "an old-shaped conflict" in err
+
+
 def test_build_cache_reports_a_missing_manifest(tmp_path, capsys, monkeypatch, fresh_settings):
     monkeypatch.setenv("ROS_DATA_DIR", str(tmp_path / "empty"))
     rc = app(["playback", "build-cache"])

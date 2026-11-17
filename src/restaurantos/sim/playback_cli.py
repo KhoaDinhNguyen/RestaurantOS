@@ -236,7 +236,14 @@ async def control_command(args: argparse.Namespace, *, method: str, body: dict[s
         print(f"rosctl playback {command}: {error}", file=sys.stderr)
         return 1
     if response.status_code == 409:
-        print(f"rosctl playback {command}: {response.json()['detail']}", file=sys.stderr)
+        # the control plane's project error body carries `message`
+        # ({"error": "invalid_state", "state": ..., "message": ...});
+        # fall back to detail for any other 409 shape
+        body = response.json()
+        print(
+            f"rosctl playback {command}: {body.get('message') or body.get('detail')}",
+            file=sys.stderr,
+        )
         return 1
     if response.status_code >= 400:
         print(f"rosctl playback {command}: {response.text}", file=sys.stderr)
