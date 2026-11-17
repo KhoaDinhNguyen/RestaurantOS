@@ -53,9 +53,16 @@ One transaction, in this order:
 
 ### The rest
 
-- `restock`: set `on_hand = par_level` for one vendor, then delete that vendor's `product_availability` rows with `reason = 'stock'` (every counter is back at par; the stock check in `place_order` still decides each order).
-- `set_availability`: manual sold-out switch. Off: upsert a row with `reason = 'manual'`. On: delete the row. A restock must not undo a manual sold-out.
-- `apply_menu_version`: epoch check, then replace this region's `products` and `product_dish` rows where `origin = 'hq'`, and set `node_state.menu_version`, all in one transaction. Never touch rows with `origin = 'region'`.
+The contracts of the routes behind these three are in architecture Section 6.1. All three need the same question answered: **can one unit of this product be made right now?** It is the rule the nearby query uses (WP3 brief): `per_ingredient` dish, `on_hand >= amount x multiplier` for every recipe row; `per_item`, `on_hand >= multiplier`; `none`, always; a missing `stock` row counts as zero. Write it once, for example as a SQL function `can_make_one(vendor_id, product_id)` in `db/region/`, and read the stock rows `FOR SHARE` so an order committing at the same moment cannot slip past.
+
+- `restock(conn, vendor_id, epoch, *, items=None)`:
+  - without `items`: top every counter of the vendor up to par, `on_hand = max(on_hand, par_level)`, never down. Then delete all of that vendor's `product_availability` rows with `reason = 'stock'`. That is right because bootstrap and `apply_menu_version` keep every par level at or above what one unit of any product using the counter needs.
+  - with `items` (optional to build): add each amount to its counter, creating a missing counter with `par_level = 0`; an item that is not in `ingredients` or `dishes` is an error (`unknown_item`). Then delete the `stock` rows only of products that can now make one unit.
+  - return two numbers: counters whose `on_hand` went up, and `stock` rows deleted. Never touch a `manual` row.
+- `set_availability`: the manual sold-out switch. Off: upsert a row with `reason = 'manual'`. On: delete the `manual` row, then check `can_make_one`; if it fails, insert a row with `reason = 'stock'`. Return the product's state (`available`, `reason`). An unknown product for this vendor is an error (`404`). The switch-on check matters because a product that runs out while it is switched off never gets a `stock` row (the `manual` row is in the way).
+- `apply_menu_version`: epoch check; if `version` is not above `node_state.menu_version`, do nothing. Otherwise upsert this region's `products` and `product_dish` rows with `origin = 'hq'` from `rows` (upsert, not delete and insert, so `product_availability` rows survive), and set `node_state.menu_version`, all in one transaction. Never touch rows with `origin = 'region'`. For every product the version **adds** (no row for it before): create the stock counters it lacks with `on_hand = 0`; raise each needed counter's `par_level` to at least `max(F, the product's need for one unit)` without touching `on_hand`; and if `can_make_one` fails, insert a `stock` row with `ON CONFLICT DO NOTHING`. A product the version only changes keeps its counters and marks: its `dish_id` and `multiplier` cannot change (architecture Section 6.1), so what it needs is the same. If `rows` ever carries a different dish link for an existing product, raise an error; do not apply it. F is the bootstrap floor (`docs/replay-stock-parameters.md`); take it from a shared setting, not a literal.
+
+Availability blocks new orders only. Nothing here cancels or changes an order that already exists.
 
 `product_availability` holds a row only while a product is switched off, so `available` is `false` on every row you write. Readers (the menu, the nearby query) still test `available = false` rather than "a row exists".
 
