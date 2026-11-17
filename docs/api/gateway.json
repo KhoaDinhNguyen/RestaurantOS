@@ -1,670 +1,1058 @@
 {
-  "openapi": "3.1.0",
-  "info": {
-    "title": "RestaurantOS Gateway",
-    "description": "RestaurantOS HTTP gateway.",
-    "version": "0.1.0"
-  },
-  "paths": {
-    "/health": {
-      "get": {
-        "summary": "Health",
-        "operationId": "health_health_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": {
-                    "type": "string"
-                  },
-                  "type": "object",
-                  "title": "Response Health Health Get"
-                }
-              }
-            }
-          }
-        }
-      }
+    "openapi": "3.1.0",
+    "info": {
+        "title": "RestaurantOS Gateway",
+        "description": "RestaurantOS HTTP gateway.",
+        "version": "0.1.0"
     },
-    "/internal/probe/{node_id}": {
-      "get": {
-        "summary": "Internal Probe",
-        "operationId": "internal_probe_internal_probe__node_id__get",
-        "parameters": [
-          {
-            "name": "node_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Node Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Internal Probe Internal Probe  Node Id  Get"
+    "paths": {
+        "/health": {
+            "get": {
+                "summary": "Health",
+                "operationId": "health_health_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "additionalProperties": {
+                                        "type": "string"
+                                    },
+                                    "type": "object",
+                                    "title": "Response Health Health Get"
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+        },
+        "/internal/probe/{node_id}": {
+            "get": {
+                "summary": "Internal Probe",
+                "operationId": "internal_probe_internal_probe__node_id__get",
+                "parameters": [
+                    {
+                        "name": "node_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Node Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response Internal Probe Internal Probe  Node Id  Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          }
-        }
-      }
-    },
-    "/api/v1/regions": {
-      "get": {
-        "summary": "Regions",
-        "operationId": "regions_api_v1_regions_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "additionalProperties": true,
-                    "type": "object"
-                  },
-                  "type": "array",
-                  "title": "Response Regions Api V1 Regions Get"
+        },
+        "/api/v1/regions": {
+            "get": {
+                "summary": "Regions",
+                "operationId": "regions_api_v1_regions_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "items": {
+                                        "additionalProperties": true,
+                                        "type": "object"
+                                    },
+                                    "type": "array",
+                                    "title": "Response Regions Api V1 Regions Get"
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          }
-        }
-      }
-    },
-    "/api/v1/vendors/{vendor_id}/menu": {
-      "get": {
-        "summary": "Vendor Menu",
-        "operationId": "vendor_menu_api_v1_vendors__vendor_id__menu_get",
-        "parameters": [
-          {
-            "name": "vendor_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Vendor Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "additionalProperties": true
-                  },
-                  "title": "Response Vendor Menu Api V1 Vendors  Vendor Id  Menu Get"
+        },
+        "/api/v1/vendors": {
+            "get": {
+                "summary": "Vendor Search",
+                "operationId": "vendor_search_api_v1_vendors_get",
+                "parameters": [
+                    {
+                        "name": "geohash",
+                        "in": "query",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Geohash"
+                        }
+                    },
+                    {
+                        "name": "q",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Q"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": true
+                                    },
+                                    "title": "Response Vendor Search Api V1 Vendors Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+        },
+        "/api/v1/dishes": {
+            "get": {
+                "summary": "Dish Search",
+                "operationId": "dish_search_api_v1_dishes_get",
+                "parameters": [
+                    {
+                        "name": "q",
+                        "in": "query",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Q"
+                        }
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "default": 20,
+                            "title": "Limit"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": true
+                                    },
+                                    "title": "Response Dish Search Api V1 Dishes Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          }
-        }
-      }
-    },
-    "/api/v1/vendors/{vendor_id}/orders/{order_id}": {
-      "get": {
-        "summary": "Order Status",
-        "operationId": "order_status_api_v1_vendors__vendor_id__orders__order_id__get",
-        "parameters": [
-          {
-            "name": "vendor_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Vendor Id"
-            }
-          },
-          {
-            "name": "order_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "format": "uuid",
-              "title": "Order Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Order Status Api V1 Vendors  Vendor Id  Orders  Order Id  Get"
+        },
+        "/api/v1/dishes/{dish_id}": {
+            "get": {
+                "summary": "Dish Lookup",
+                "operationId": "dish_lookup_api_v1_dishes__dish_id__get",
+                "parameters": [
+                    {
+                        "name": "dish_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Dish Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+        },
+        "/api/v1/vendors/{vendor_id}/stock": {
+            "get": {
+                "summary": "Vendor Stock",
+                "operationId": "vendor_stock_api_v1_vendors__vendor_id__stock_get",
+                "parameters": [
+                    {
+                        "name": "vendor_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Vendor Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": true
+                                    },
+                                    "title": "Response Vendor Stock Api V1 Vendors  Vendor Id  Stock Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
                 }
-              }
             }
-          }
-        }
-      }
-    },
-    "/api/v1/vendors/{vendor_id}/orders": {
-      "get": {
-        "summary": "Vendor Orders",
-        "operationId": "vendor_orders_api_v1_vendors__vendor_id__orders_get",
-        "parameters": [
-          {
-            "name": "vendor_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Vendor Id"
+        },
+        "/api/v1/vendors/{vendor_id}/menu": {
+            "get": {
+                "summary": "Vendor Menu",
+                "operationId": "vendor_menu_api_v1_vendors__vendor_id__menu_get",
+                "parameters": [
+                    {
+                        "name": "vendor_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Vendor Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": true
+                                    },
+                                    "title": "Response Vendor Menu Api V1 Vendors  Vendor Id  Menu Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
             }
-          },
-          {
-            "name": "day",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Day"
+        },
+        "/api/v1/vendors/{vendor_id}/orders/{order_id}": {
+            "get": {
+                "summary": "Order Status",
+                "operationId": "order_status_api_v1_vendors__vendor_id__orders__order_id__get",
+                "parameters": [
+                    {
+                        "name": "vendor_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Vendor Id"
+                        }
+                    },
+                    {
+                        "name": "order_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "format": "uuid",
+                            "title": "Order Id"
+                        }
+                    },
+                    {
+                        "name": "day",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "integer"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Day"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response Order Status Api V1 Vendors  Vendor Id  Orders  Order Id  Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
             }
-          },
-          {
-            "name": "status",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
+        },
+        "/api/v1/vendors/{vendor_id}/orders": {
+            "get": {
+                "summary": "Vendor Orders",
+                "operationId": "vendor_orders_api_v1_vendors__vendor_id__orders_get",
+                "parameters": [
+                    {
+                        "name": "vendor_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Vendor Id"
+                        }
+                    },
+                    {
+                        "name": "day",
+                        "in": "query",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "title": "Day"
+                        }
+                    },
+                    {
+                        "name": "status",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Status"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "additionalProperties": true
+                                    },
+                                    "title": "Response Vendor Orders Api V1 Vendors  Vendor Id  Orders Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/regions/{region_id}/summary": {
+            "get": {
+                "summary": "Region Summary",
+                "operationId": "region_summary_api_v1_regions__region_id__summary_get",
+                "parameters": [
+                    {
+                        "name": "region_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Region Id"
+                        }
+                    },
+                    {
+                        "name": "day",
+                        "in": "query",
+                        "required": true,
+                        "schema": {
+                            "type": "integer",
+                            "title": "Day"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response Region Summary Api V1 Regions  Region Id  Summary Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/orders": {
+            "post": {
+                "summary": "Create Order",
+                "operationId": "create_order_api_v1_orders_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/OrderRequest"
+                            }
+                        }
+                    },
+                    "required": true
                 },
-                {
-                  "type": "null"
+                "responses": {
+                    "201": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/OrderResponse"
+                                }
+                            }
+                        }
+                    },
+                    "200": {
+                        "description": "Duplicate order; same result as the original request.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/OrderResponse"
+                                }
+                            }
+                        }
+                    },
+                    "202": {
+                        "description": "Region unreachable; order parked in the HQ holding queue.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/OrderResponse"
+                                }
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Order refused.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/OrderResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
                 }
-              ],
-              "title": "Status"
             }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "additionalProperties": true
-                  },
-                  "title": "Response Vendor Orders Api V1 Vendors  Vendor Id  Orders Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/regions/{region_id}/summary": {
-      "get": {
-        "summary": "Region Summary",
-        "operationId": "region_summary_api_v1_regions__region_id__summary_get",
-        "parameters": [
-          {
-            "name": "region_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string",
-              "title": "Region Id"
-            }
-          },
-          {
-            "name": "day",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Day"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Region Summary Api V1 Regions  Region Id  Summary Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/orders": {
-      "post": {
-        "summary": "Create Order",
-        "operationId": "create_order_api_v1_orders_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/OrderRequest"
-              }
-            }
-          },
-          "required": true
         },
-        "responses": {
-          "201": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OrderResponse"
-                }
-              }
-            }
-          },
-          "200": {
-            "description": "Duplicate order; same result as the original request.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OrderResponse"
-                }
-              }
-            }
-          },
-          "202": {
-            "description": "Region unreachable; order parked in the HQ holding queue.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OrderResponse"
-                }
-              }
-            }
-          },
-          "409": {
-            "description": "Order refused.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OrderResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-  },
-  "components": {
-    "schemas": {
-      "HTTPValidationError": {
-        "properties": {
-          "detail": {
-            "items": {
-              "$ref": "#/components/schemas/ValidationError"
-            },
-            "type": "array",
-            "title": "Detail"
-          }
-        },
-        "type": "object",
-        "title": "HTTPValidationError"
-      },
-      "OrderItemIn": {
-        "properties": {
-          "product_id": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Product Id"
-          },
-          "quantity": {
-            "type": "integer",
-            "minimum": 1.0,
-            "title": "Quantity"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "product_id",
-          "quantity"
-        ],
-        "title": "OrderItemIn"
-      },
-      "OrderOutcome": {
-        "type": "string",
-        "enum": [
-          "accepted",
-          "refused"
-        ],
-        "title": "OrderOutcome"
-      },
-      "OrderRequest": {
-        "properties": {
-          "channel": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Channel"
-          },
-          "external_order_id": {
-            "type": "string",
-            "minLength": 1,
-            "title": "External Order Id"
-          },
-          "vendor_id": {
-            "type": "string",
-            "minLength": 1,
-            "title": "Vendor Id"
-          },
-          "customer_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Customer Id"
-          },
-          "customer_geohash": {
-            "anyOf": [
-              {
-                "type": "string",
-                "pattern": "^[0-9a-z]{5}$"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Customer Geohash"
-          },
-          "order_day": {
-            "type": "integer",
-            "minimum": 0.0,
-            "title": "Order Day"
-          },
-          "order_time": {
-            "type": "string",
-            "format": "time",
-            "title": "Order Time"
-          },
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/OrderItemIn"
-            },
-            "type": "array",
-            "minItems": 1,
-            "title": "Items"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "channel",
-          "external_order_id",
-          "vendor_id",
-          "order_day",
-          "order_time",
-          "items"
-        ],
-        "title": "OrderRequest",
-        "description": "Body of POST /orders. order_day and order_time are simulated time."
-      },
-      "OrderResponse": {
-        "properties": {
-          "outcome": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/OrderOutcome"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "duplicate": {
-            "type": "boolean",
-            "title": "Duplicate",
-            "default": false
-          },
-          "order_id": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "uuid"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Order Id"
-          },
-          "order_day": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Order Day"
-          },
-          "status": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/OrderStatus"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "menu_version": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Menu Version"
-          },
-          "committed_at": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date-time"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Committed At"
-          },
-          "refusal_reason": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/RefusalReason"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "queued": {
-            "type": "boolean",
-            "title": "Queued",
-            "default": false
-          },
-          "region_id": {
-            "type": "string",
-            "title": "Region Id"
-          },
-          "received_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Received At"
-          },
-          "acked_at": {
-            "type": "string",
-            "format": "date-time",
-            "title": "Acked At"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "region_id",
-          "received_at",
-          "acked_at"
-        ],
-        "title": "OrderResponse",
-        "description": "What POST /orders returns: the region's result plus gateway facts.\n\nqueued=True means the region was unreachable and the order is parked in\nHQ's holding queue; outcome is then not known yet."
-      },
-      "OrderStatus": {
-        "type": "string",
-        "enum": [
-          "received",
-          "accepted",
-          "preparing",
-          "ready",
-          "picked_up",
-          "canceled"
-        ],
-        "title": "OrderStatus"
-      },
-      "RefusalReason": {
-        "type": "string",
-        "enum": [
-          "out_of_stock",
-          "unavailable",
-          "unknown_product"
-        ],
-        "title": "RefusalReason"
-      },
-      "ValidationError": {
-        "properties": {
-          "loc": {
-            "items": {
-              "anyOf": [
-                {
-                  "type": "string"
+        "/api/v1/menu/products": {
+            "post": {
+                "summary": "Publish Menu Products",
+                "operationId": "publish_menu_products_api_v1_menu_products_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/MenuPublishRequest"
+                            }
+                        }
+                    },
+                    "required": true
                 },
-                {
-                  "type": "integer"
+                "responses": {
+                    "202": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/MenuPublishResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
                 }
-              ]
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "HTTPValidationError": {
+                "properties": {
+                    "detail": {
+                        "items": {
+                            "$ref": "#/components/schemas/ValidationError"
+                        },
+                        "type": "array",
+                        "title": "Detail"
+                    }
+                },
+                "type": "object",
+                "title": "HTTPValidationError"
             },
-            "type": "array",
-            "title": "Location"
-          },
-          "msg": {
-            "type": "string",
-            "title": "Message"
-          },
-          "type": {
-            "type": "string",
-            "title": "Error Type"
-          },
-          "input": {
-            "title": "Input"
-          },
-          "ctx": {
-            "type": "object",
-            "title": "Context"
-          }
-        },
-        "type": "object",
-        "required": [
-          "loc",
-          "msg",
-          "type"
-        ],
-        "title": "ValidationError"
-      }
+            "MenuProductInput": {
+                "properties": {
+                    "vendor_id": {
+                        "type": "string",
+                        "title": "Vendor Id"
+                    },
+                    "name": {
+                        "type": "string",
+                        "title": "Name"
+                    },
+                    "price_units": {
+                        "type": "integer",
+                        "minimum": 0.0,
+                        "title": "Price Units"
+                    },
+                    "dish_id": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Dish Id"
+                    },
+                    "multiplier": {
+                        "anyOf": [
+                            {
+                                "type": "integer",
+                                "minimum": 1.0
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Multiplier"
+                    },
+                    "product_id": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Product Id"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "vendor_id",
+                    "name",
+                    "price_units"
+                ],
+                "title": "MenuProductInput",
+                "description": "One product to create or change at HQ."
+            },
+            "MenuPublishRequest": {
+                "properties": {
+                    "note": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Note"
+                    },
+                    "products": {
+                        "items": {
+                            "$ref": "#/components/schemas/MenuProductInput"
+                        },
+                        "type": "array",
+                        "minItems": 1,
+                        "title": "Products"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "products"
+                ],
+                "title": "MenuPublishRequest",
+                "description": "One atomic HQ menu-version request."
+            },
+            "MenuPublishResponse": {
+                "properties": {
+                    "menu_version": {
+                        "type": "integer",
+                        "title": "Menu Version"
+                    },
+                    "products": {
+                        "items": {
+                            "$ref": "#/components/schemas/PublishedProduct"
+                        },
+                        "type": "array",
+                        "title": "Products"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "menu_version",
+                    "products"
+                ],
+                "title": "MenuPublishResponse",
+                "description": "HQ result after storing one new menu version."
+            },
+            "OrderItemIn": {
+                "properties": {
+                    "product_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "title": "Product Id"
+                    },
+                    "quantity": {
+                        "type": "integer",
+                        "minimum": 1.0,
+                        "title": "Quantity"
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "product_id",
+                    "quantity"
+                ],
+                "title": "OrderItemIn"
+            },
+            "OrderOutcome": {
+                "type": "string",
+                "enum": [
+                    "accepted",
+                    "refused"
+                ],
+                "title": "OrderOutcome"
+            },
+            "OrderRequest": {
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "minLength": 1,
+                        "title": "Channel"
+                    },
+                    "external_order_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "title": "External Order Id"
+                    },
+                    "vendor_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "title": "Vendor Id"
+                    },
+                    "customer_id": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Customer Id"
+                    },
+                    "customer_geohash": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "pattern": "^[0-9a-z]{5}$"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Customer Geohash"
+                    },
+                    "order_day": {
+                        "type": "integer",
+                        "minimum": 0.0,
+                        "title": "Order Day"
+                    },
+                    "order_time": {
+                        "type": "string",
+                        "format": "time",
+                        "title": "Order Time"
+                    },
+                    "items": {
+                        "items": {
+                            "$ref": "#/components/schemas/OrderItemIn"
+                        },
+                        "type": "array",
+                        "minItems": 1,
+                        "title": "Items"
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "channel",
+                    "external_order_id",
+                    "vendor_id",
+                    "order_day",
+                    "order_time",
+                    "items"
+                ],
+                "title": "OrderRequest",
+                "description": "Body of POST /orders. order_day and order_time are simulated time."
+            },
+            "OrderResponse": {
+                "properties": {
+                    "outcome": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/OrderOutcome"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ]
+                    },
+                    "duplicate": {
+                        "type": "boolean",
+                        "title": "Duplicate",
+                        "default": false
+                    },
+                    "order_id": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "format": "uuid"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Order Id"
+                    },
+                    "order_day": {
+                        "anyOf": [
+                            {
+                                "type": "integer"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Order Day"
+                    },
+                    "status": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/OrderStatus"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ]
+                    },
+                    "menu_version": {
+                        "anyOf": [
+                            {
+                                "type": "integer"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Menu Version"
+                    },
+                    "committed_at": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "format": "date-time"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Committed At"
+                    },
+                    "refusal_reason": {
+                        "anyOf": [
+                            {
+                                "$ref": "#/components/schemas/RefusalReason"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ]
+                    },
+                    "queued": {
+                        "type": "boolean",
+                        "title": "Queued",
+                        "default": false
+                    },
+                    "region_id": {
+                        "type": "string",
+                        "title": "Region Id"
+                    },
+                    "received_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Received At"
+                    },
+                    "acked_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "title": "Acked At"
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "region_id",
+                    "received_at",
+                    "acked_at"
+                ],
+                "title": "OrderResponse",
+                "description": "What POST /orders returns: the region's result plus gateway facts.\n\nqueued=True means the region was unreachable and the order is parked in\nHQ's holding queue; outcome is then not known yet."
+            },
+            "OrderStatus": {
+                "type": "string",
+                "enum": [
+                    "received",
+                    "accepted",
+                    "preparing",
+                    "ready",
+                    "picked_up",
+                    "canceled"
+                ],
+                "title": "OrderStatus"
+            },
+            "PublishedProduct": {
+                "properties": {
+                    "vendor_id": {
+                        "type": "string",
+                        "title": "Vendor Id"
+                    },
+                    "product_id": {
+                        "type": "string",
+                        "title": "Product Id"
+                    },
+                    "region_id": {
+                        "type": "string",
+                        "title": "Region Id"
+                    },
+                    "created": {
+                        "type": "boolean",
+                        "title": "Created"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "vendor_id",
+                    "product_id",
+                    "region_id",
+                    "created"
+                ],
+                "title": "PublishedProduct",
+                "description": "Result for one product in a published version."
+            },
+            "RefusalReason": {
+                "type": "string",
+                "enum": [
+                    "out_of_stock",
+                    "unavailable",
+                    "unknown_product"
+                ],
+                "title": "RefusalReason"
+            },
+            "ValidationError": {
+                "properties": {
+                    "loc": {
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "integer"
+                                }
+                            ]
+                        },
+                        "type": "array",
+                        "title": "Location"
+                    },
+                    "msg": {
+                        "type": "string",
+                        "title": "Message"
+                    },
+                    "type": {
+                        "type": "string",
+                        "title": "Error Type"
+                    },
+                    "input": {
+                        "title": "Input"
+                    },
+                    "ctx": {
+                        "type": "object",
+                        "title": "Context"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "loc",
+                    "msg",
+                    "type"
+                ],
+                "title": "ValidationError"
+            }
+        }
     }
-  }
 }
