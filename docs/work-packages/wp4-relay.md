@@ -55,6 +55,7 @@ Reach the primary through `hq__<node>`, where `<node>` is `region_state.primary_
 
 When a new row appears in `menu_versions`, send each affected region its slice with `region.apply_menu_version` (through `hq__<node>` as above, with the current epoch) in one transaction, then record the version in `region_state`. If the connection resets halfway, the region's transaction rolls back and it keeps serving the old version; retry.
 
+- Decide what to send from the region itself, not from `region_state`: read `node_state.menu_version` on the region's primary and send when it is below the newest version that touches one of that region's vendors. Check on a timer as well as when a new version appears. This is what repairs a failover: with asynchronous replication the old primary can have applied a version that the promoted standby never received, while `region_state.menu_version` already says it arrived.
 - A region is affected when it owns a vendor with a product whose `menu_version` is that version. Leave the other regions alone: their `region_state.menu_version` then skips numbers, which is fine.
 - Read the slice from HQ's `products` and `product_dish` when you send it, so it always holds every earlier version too. Publish versions in ascending order; the region ignores one at or below its own.
 - Versions are created by `POST /menu/products` (architecture Section 6.1), which numbers them in commit order.
@@ -98,6 +99,7 @@ What each line needs is marked in front of it (the marks are explained in `READM
 ## Watch out for
 
 - Do not replace the `relayed_at` flag with a "last seq sent" cursor: concurrent commits can land out of `seq` order and a cursor would skip rows.
+- The transaction that inserts into `analytics_exceptions` takes `pg_advisory_xact_lock` on that table's fixed key first, so `seq` follows commit order and `/admin/exceptions?since=` cannot skip a row (architecture Section 6.2). Put the key in `common/`, next to the one for `cluster_events`.
 - Apply events in `seq` order. A status change must not reach HQ before its order.
 - Make pools with `common.db.make_pool(common.db.node_conninfo(cluster, node))` and run every database call through `common.db.run_on`. A silenced or slowed link must make a worker back off and retry, not hang, and only the deadline in `run_on` gives you that (architecture Section 5.2). Treat `RegionUnreachableError` as "try again later"; every write here is safe to repeat.
 - Only switch local nodes when `find_local_primary` says so. Never guess from a failed query that the other node must be the primary.

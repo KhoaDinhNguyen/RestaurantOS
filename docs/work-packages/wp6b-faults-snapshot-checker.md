@@ -57,7 +57,7 @@ After queues drain, compare three numbers that must match: orders acknowledged i
 
 Thin HTTP wrappers over all of the above and over playback (Section 6.3), so the Ops view in the UI can drive them. Every action must also work as a `rosctl` command. Section 6.3 has every body and answer.
 
-- **Required over HTTP:** links, faults and nodes. Give each fault's toxics a name that contains the fault id, so the list of faults can be rebuilt from Toxiproxy if the control process restarts.
+- **Required over HTTP:** links, faults and nodes. The list of faults lives in the control process. It is not rebuilt after a restart (a `cut` leaves no toxic to rebuild it from): faults still in Toxiproxy then no longer have an id, and `heal-all`, which resets Toxiproxy itself, is how to clear them. Say so in the answer of `GET /sim/links` by listing a group's disabled proxies and toxics even when no known fault explains them.
 - **Optional over HTTP:** scenarios, snapshots and the checker. They take too long for one request, so they run as jobs: the `POST` answers `202`, `GET /sim/jobs/{job_id}` reports progress, and only one job runs at a time. `rosctl` runs the same code and waits.
 - WP6a's playback routes (`sim/control.py`) are hosted by the playback process until your control process exists; then yours takes the port and serves them too.
 

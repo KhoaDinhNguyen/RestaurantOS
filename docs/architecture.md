@@ -309,7 +309,7 @@ Note: the Phase 2 document (Table 12) says `recipe` and `recipe_ingredient`. The
 | `region_state` | `region_id` | `epoch`, `primary_node`, `standby_node`, `menu_version` |
 | `menu_versions` | `version` | `created_at`, `note` |
 | `analytics_orders`, `analytics_order_items` | as regional + `region_id` | the read-only copy; adds `hq_applied_at` |
-| `analytics_exceptions` | `event_id` | copy of regional exception-log entries; `seq` numbers them in arrival order |
+| `analytics_exceptions` | `event_id` | copy of regional exception-log entries; `seq` numbers them in arrival order (added 2026-11-16: a cluster bootstrapped before that needs a fresh `rosctl bootstrap`) |
 | `hq_inbox` | (`region_id`, `event_id`) | `seq`, `applied_at`; dedupes relayed events |
 | `holding_queue` | `holding_id`, UNIQUE (`channel`, `external_order_id`) | `region_id`, `request` jsonb, `received_at`, `delivered_at`, `delivered_outcome` |
 | `cluster_events` | `cluster_event_id` | timeline: failovers, partitions, recoveries |
@@ -509,8 +509,9 @@ Dish names in answers: where a dish is what the answer is about and nothing else
 }
 ```
 
-- **No `product_id`: a new product.** The gateway makes the id: the first 12 hexadecimal characters of SHA-1 of `vendor_id|name`. Dataset ids come from DHRD; an id only has to be unique within its vendor. The same request sent again lands on the same id and changes nothing (`created: false`). If the id exists under a different name, the answer is `409` with `{"error": "product_exists", "vendor_id": "...", "product_id": "..."}`.
-- **With `product_id`: a change** to that product's name, price or dish link. `404` when the vendor does not have it. Renaming keeps the id. Products cannot be removed; the sold-out switch hides one.
+- **No `product_id`: a new product.** The gateway makes the id: the first 12 hexadecimal characters of SHA-1 of `vendor_id|name`. Dataset ids come from DHRD; an id only has to be unique within its vendor. The same request sent again lands on the same id and creates nothing (`created: false`); a different price in it is applied as a change. If the id exists under a different name, the answer is `409` with `{"error": "product_exists", "vendor_id": "...", "product_id": "..."}`.
+- **With `product_id`: a change** to that product's name or price. `404` when the vendor does not have it. Renaming keeps the id. Products cannot be removed; the sold-out switch hides one.
+- **A product's dish link never changes.** `dish_id` and `multiplier` are set when the product is created. On a change they may be left out; if they are sent and differ from the stored ones, the answer is `409` with `{"error": "dish_link_fixed"}`. A product that should count as another dish is a new product. This is what keeps history true: stock, `top-dishes` and `ingredient-usage` all read the dish and multiplier of an old order line from `product_dish`, so those rows must still say what they said when the order was placed.
 - `dish_id` must be an existing dish (find it with `GET /dishes?q=`); new dishes and recipes are out of scope. `multiplier` is a whole number, 1 or more. `unit_price` is stored as `price_units / 2500`. New rows get `origin = 'hq'`.
 - At HQ, in one transaction: lock `menu_versions` so versions are numbered in commit order, insert the next version, upsert `products` and `product_dish`.
 - Answer: `202`. HQ has stored the version; a region has it once its `menu_version` (in `GET /regions` or its summary) reaches that number.
@@ -520,7 +521,8 @@ Dish names in answers: where a dish is what the answer is about and nothing else
 ```
 
 - `hq-worker` sends a version only to the regions that own a changed vendor, so another region's `menu_version` can skip numbers. A region ignores a version at or below its own.
-- When a region applies a version, each added or changed product gets the stock counters it lacks, with `on_hand = 0` and a par level of at least `max(F, the product's need for one unit)` (Section 7.1). A product that cannot make one unit is marked unavailable (`stock`); the next restock fills its counters and switches it on.
+- What a region has is what its own primary says (`node_state.menu_version`), not what HQ recorded. After a failover the new primary can be a version behind, and `hq-worker` sends it again.
+- When a region applies a version, each added product gets the stock counters it lacks, with `on_hand = 0` and a par level of at least `max(F, the product's need for one unit)` (Section 7.1). An added product that cannot make one unit is marked unavailable (`stock`); the next restock fills its counters and switches it on. A changed product keeps its marks: a new name or price does not change what it needs.
 
 The three `/query/...` routes answer with the parameters they were given, a `results` list and `meta`.
 
@@ -584,7 +586,7 @@ Day 20's own hours before 04:00 are not in either: they belong to the night of d
 }
 ```
 
-`amount` is `sum(quantity x multiplier x amount)`. Canceled orders count here, on purpose: the sale is void but the ingredients were used. Rows are grouped by (`ingredient_id`, `unit`) and ordered by `amount` descending, then `ingredient_id`, then `unit`; there is no `limit`. `strategy` is `null` unless `mode=live`. Strategy B ships every order line in the range, so a long range is slow; that cost is what B is there to show.
+`amount` is `sum(quantity x multiplier x amount)`, with `multiplier` and the recipe read from `product_dish` and `dish_ingredients`; a product's dish link never changes (see `POST /menu/products`), so this is the multiplier the order was placed with. Canceled orders count here, on purpose: the sale is void but the ingredients were used. Rows are grouped by (`ingredient_id`, `unit`) and ordered by `amount` descending, then `ingredient_id`, then `unit`; there is no `limit`. `strategy` is `null` unless `mode=live`. Strategy B ships every order line in the range, so a long range is slow; that cost is what B is there to show.
 
 The read routes for orders, the menu and the regions:
 
@@ -697,6 +699,8 @@ Only `POST /orders` is parked when its region is unreachable (`202`). Every othe
 
 `GET /admin/events` and `GET /admin/exceptions` page the same way: `since` is the `event_id` (events) or `seq` (exceptions) of the last entry the caller has, and the answer is the entries after it, oldest first, at most `limit` (default 100, at most 1,000). Without `since`, the newest `limit` entries, oldest first. All times are wall-clock: the coordinator does not know simulated time.
 
+A `since` cursor is only safe when numbers are handed out in commit order (Section 5.3 explains why the relay does not use one). So every transaction that inserts into `cluster_events` or `analytics_exceptions` first takes a transaction-level advisory lock, one fixed key per table (`pg_advisory_xact_lock`). Both tables get few rows, so writers queueing behind each other costs nothing.
+
 ```json
 [ { "event_id": 17, "occurred_at": "...", "kind": "failover", "region_id": "r1", "node_id": "r1-standby", "detail": {} } ]
 ```
@@ -801,7 +805,7 @@ It answers `201` with the fault; `404` for an unknown link group; `409` with `{"
 `rosctl bootstrap` reads `infra/cluster.toml` (number of regions, standbys on or off, sync or async) and:
 
 1. generates the Compose file and the Toxiproxy proxy list into `infra/generated/` (Section 4);
-2. starts the nodes from empty volumes. Each primary applies its own schema on first start (`infra/postgres/init-primary.sh`) and each standby clones its primary through its proxy, so bootstrap applies no schema itself. It then writes one `region_state` row per region at HQ;
+2. starts the nodes from empty volumes. There are no schema migrations: after a change under `db/`, bootstrap again. Each primary applies its own schema on first start (`infra/postgres/init-primary.sh`) and each standby clones its primary through its proxy, so bootstrap applies no schema itself. It then writes one `region_state` row per region at HQ;
 3. counts **vendors** per geohash cell from `vendors.csv`, sorts the cells, cuts them into N contiguous ranges with roughly equal vendor counts, and writes `shard_directory`. Order data is deliberately not used here: sizing regions from the orders we then replay would leak future information. (Phase 2 Section 2.2 says "order volume"; update that wording in the final report.);
 4. loads reference data: masters into HQ, slices into each region, everything into `baseline` (orders and stock reach the baseline later, see below);
 5. initialises `stock` from the warm-up window (see `docs/replay-stock-parameters.md`: W = 14 days, C = 7, F = 5, R = 7). No counter starts below what one unit of the largest product using it needs, so every product can be sold at least once per restock.

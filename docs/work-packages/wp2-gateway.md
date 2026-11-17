@@ -76,7 +76,7 @@ The contracts of the routes below are in Section 6.1, each with its body and ans
 - `GET /dishes?q=&limit=` and `GET /dishes/{dish_id}`: gateway mode reads HQ, edge mode reads its local node (every region has the full `dishes` table). Escape `q` as for the vendor search.
 - `GET /vendors/{vendor_id}/menu`: add `dish_id` to each row (join `product_dish`).
 - Order status and the kitchen board: add `order_time` (order status), `customer_id`, `channel` and an `items` list (`order_items` joined to `products` for the name) to each order. The kitchen board's `status` takes several values separated by commas. Order status takes an optional `day` and then filters on `order_day`, so one partition is read.
-- `POST /menu/products` (gateway mode only): make the id of a new product, take `LOCK TABLE menu_versions IN EXCLUSIVE MODE`, insert the next version, upsert `products` and `product_dish`, all in one transaction at HQ, and answer `202`. The lock keeps version numbers in commit order; without it the publisher could send version 5, then skip a later-committed 4 as old.
+- `POST /menu/products` (gateway mode only): refuse a change that sends a different `dish_id` or `multiplier` than the stored ones (`409`, `dish_link_fixed`); make the id of a new product, take `LOCK TABLE menu_versions IN EXCLUSIVE MODE`, insert the next version, upsert `products` and `product_dish`, all in one transaction at HQ, and answer `202`. The lock keeps version numbers in commit order; without it the publisher could send version 5, then skip a later-committed 4 as old.
 - When HQ's database cannot be answered in time on a route that only reads or writes HQ, answer `503` with `{"error": "hq_unreachable"}`.
 
 ### When the region cannot be reached
@@ -88,7 +88,7 @@ Only orders are parked. Everything else fails fast and says which region is miss
 | `POST /orders` | gateway mode: park it, `202` (step 5 above). Edge mode: `503` |
 | any other write: status change, sold-out switch, restock | `503`, not parked. The holding queue holds orders only |
 | any read of region data: order status, kitchen board, menu, `/vendors`, the summary | `503`. Never answered from HQ: its copy may be stale and has no stock or availability |
-| `GET /regions`, `POST /menu/products`, `GET /dishes` | not affected, they only touch HQ |
+| `GET /regions`, `POST /menu/products`, and `GET /dishes` in gateway mode | not affected, they only touch HQ (in edge mode `GET /dishes` reads the local node and never HQ) |
 
 The `503` body is `{"error": "region_unreachable", "region_id": "r1"}`. `run_on` raises `RegionUnreachableError` with the `region_id` you gave it; turn it into the response in one exception handler. The other answers are in the table under the routes in Section 6.1: `404` for an unknown vendor, order or region, `409` for a refused order or a status change that lost.
 
