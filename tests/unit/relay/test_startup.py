@@ -1,7 +1,12 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 from pydantic import ValidationError
 
+from restaurantos.common.cluster import Cluster
 from restaurantos.common.config import get_settings
+from restaurantos.relay import __main__ as entry
 from restaurantos.relay.__main__ import main
 from restaurantos.relay.config import RelaySettings
 
@@ -59,12 +64,28 @@ def test_rejects_invalid_relay_settings(monkeypatch, name, value):
         RelaySettings()
 
 
-def test_hq_startup_validates_identity(monkeypatch, capsys):
+def test_hq_startup_runs_worker_with_wp1(monkeypatch):
     monkeypatch.setenv("ROS_RELAY_ROLE", "hq")
     monkeypatch.setenv("ROS_CLIENT", "hq")
+    monkeypatch.setattr(entry, "load_cluster", lambda _: Cluster())
+    place_order = AsyncMock()
+    worker = AsyncMock()
+    monkeypatch.setattr(entry, "import_module", lambda _: SimpleNamespace(place_order=place_order))
+    monkeypatch.setattr(entry, "run_hq_worker", worker)
 
     assert main() == 0
-    assert capsys.readouterr().out == "HQ worker configuration is valid.\n"
+    worker.assert_awaited_once()
+    assert worker.await_args.args[3] is place_order
+
+
+def test_hq_startup_explains_missing_wp1(monkeypatch, capsys):
+    monkeypatch.setenv("ROS_RELAY_ROLE", "hq")
+    monkeypatch.setenv("ROS_CLIENT", "hq")
+    monkeypatch.setattr(entry, "load_cluster", lambda _: Cluster())
+    monkeypatch.setattr(entry, "import_module", lambda _: SimpleNamespace())
+
+    assert main() == 1
+    assert "needs WP1: restaurantos.region.place_order" in capsys.readouterr().err
 
 
 def test_hq_startup_rejects_wrong_client(monkeypatch, capsys):
