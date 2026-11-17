@@ -309,7 +309,7 @@ Note: the Phase 2 document (Table 12) says `recipe` and `recipe_ingredient`. The
 | `region_state` | `region_id` | `epoch`, `primary_node`, `standby_node`, `menu_version` |
 | `menu_versions` | `version` | `created_at`, `note` |
 | `analytics_orders`, `analytics_order_items` | as regional + `region_id` | the read-only copy; adds `hq_applied_at` |
-| `analytics_exceptions` | `event_id` | copy of regional exception-log entries |
+| `analytics_exceptions` | `event_id` | copy of regional exception-log entries; `seq` numbers them in arrival order |
 | `hq_inbox` | (`region_id`, `event_id`) | `seq`, `applied_at`; dedupes relayed events |
 | `holding_queue` | `holding_id`, UNIQUE (`channel`, `external_order_id`) | `region_id`, `request` jsonb, `received_at`, `delivered_at`, `delivered_outcome` |
 | `cluster_events` | `cluster_event_id` | timeline: failovers, partitions, recoveries |
@@ -669,28 +669,130 @@ Only `POST /orders` is parked when its region is unreachable (`202`). Every othe
 
 | Method and path | Purpose |
 | --- | --- |
-| `GET /admin/cluster` | per node: role, status (`up`, `suspect`, `down`), last heartbeat. Per region: epoch, menu version, orders/s, standby lag, region-to-HQ lag, outbox backlog |
-| `GET /admin/events?since=` | timeline of failovers, partitions, recoveries |
-| `GET /admin/exceptions?since=` | exception log |
+| `GET /admin/cluster` | which nodes are alive, and each region's figures |
+| `GET /admin/events?since=&limit=` | timeline of failovers, partitions, recoveries |
+| `GET /admin/exceptions?since=&limit=` | status changes that lost to an earlier one |
 | `POST /admin/regions/{region_id}/failover` | manual promotion from the UI |
+
+`GET /admin/cluster`:
+
+```json
+{
+  "as_of": "...",
+  "nodes": [
+    { "node_id": "r1-primary", "region_id": "r1", "role": "standby", "status": "up", "last_heartbeat_at": "..." }
+  ],
+  "regions": [
+    { "region_id": "r1", "epoch": 2, "menu_version": 4, "primary_node": "r1-standby", "standby_node": "r1-primary",
+      "replication": "async", "orders_per_s": 41.5, "standby_lag_s": 0.2, "hq_lag_s": 1.1,
+      "outbox_backlog": 12, "holding_queue": 0, "figures_as_of": "..." }
+  ]
+}
+```
+
+- `status` is `up`, `suspect` or `down`. HQ's two nodes are listed with `region_id: null`.
+- `replication` is `sync` or `async` as it runs now (synchronous mode can fall back). `standby_lag_s` is `null` when the standby is not connected; that is not zero lag.
+- `holding_queue` is the number of orders parked at HQ for the region and not yet delivered.
+- `figures_as_of` is when the region's figures were last read. When the coordinator cannot reach a region primary it keeps showing the last values, and this field shows their age.
+
+`GET /admin/events` and `GET /admin/exceptions` page the same way: `since` is the `event_id` (events) or `seq` (exceptions) of the last entry the caller has, and the answer is the entries after it, oldest first, at most `limit` (default 100, at most 1,000). Without `since`, the newest `limit` entries, oldest first. All times are wall-clock: the coordinator does not know simulated time.
+
+```json
+[ { "event_id": 17, "occurred_at": "...", "kind": "failover", "region_id": "r1", "node_id": "r1-standby", "detail": {} } ]
+```
+
+`kind` is one of `node_suspect`, `node_down`, `node_up`, `failover`, `partition`, `sync_downgrade`; the coordinator's owner may add more.
+
+```json
+[ { "seq": 3, "region_id": "r1", "order_day": 85, "order_id": "uuid", "kind": "status_conflict",
+    "current_status": "picked_up", "current_changed_at": "...", "attempted_status": "ready", "attempted_at": "...",
+    "hq_applied_at": "..." } ]
+```
+
+Exceptions are read from HQ's copy, so an entry appears once the relay has delivered it.
+
+`POST /admin/regions/{region_id}/failover` takes no body. It answers `200` when the promotion's steps are done:
+
+```json
+{ "region_id": "r1", "epoch": 3, "primary_node": "r1-standby", "standby_node": "r1-primary", "event_id": 18 }
+```
+
+- `409` with `{"error": "standby_unavailable"}` when the standby is not up; `409` with `{"error": "failover_in_progress"}` when a promotion of that region is already running; `404` for an unknown region.
+- It is allowed while the primary is healthy: the operator decides, and the old primary is fenced off by the epoch. With asynchronous replication the last orders may be lost, which the checker reports as "lost at failover".
+- HQ has no such route; promoting HQ's standby is a `rosctl` command (D10).
 
 ### 6.3 Control plane, port 8002 (outside the system)
 
-| Method and path | Purpose |
-| --- | --- |
-| `GET /sim/clock` | current simulated day and time, speed, state |
-| `POST /sim/playback` | `{action: start\|pause\|resume\|stop, from_day, to_day, speed, duplicate_rate, shuffle, seed}` |
-| `PATCH /sim/playback` | `{speed}`: change speed on the fly (UI slider) |
-| `GET /sim/playback` | progress: orders sent, acked, refused, parked |
-| `GET /sim/links` | link groups and the toxics on them |
-| `POST /sim/faults` | `{target: "<link group>", fault: cut\|silence\|latency\|reset, params}` |
-| `DELETE /sim/faults/{id}`, `POST /sim/faults/heal-all` | remove faults |
-| `POST /sim/nodes/{node_id}/{kill\|start}` | real crash (T1b) |
-| `POST /sim/scenarios/{T1..T6}` | run a scripted scenario |
-| `GET /sim/snapshots`, `POST /sim/snapshots`, `POST /sim/snapshots/{name}/restore` | Section 7.4 |
-| `POST /sim/check` | run the invariant checker |
+The Ops view is the only HTTP caller. Everything here is also a `rosctl` command that runs the same code, so tests and scripts do not need the HTTP server.
 
-Everything here is also a `rosctl` command, so tests and scripts do not need the HTTP server.
+| Method and path | Purpose | Over HTTP |
+| --- | --- | --- |
+| `GET /sim/clock` | current simulated day and time, speed, state | built (WP6a) |
+| `GET /sim/playback` | the run's state and counters | built (WP6a) |
+| `POST /sim/playback` | `{action: start\|pause\|resume\|stop, from_day, to_day, speed, seed, run_id}` | built (WP6a) |
+| `PATCH /sim/playback` | `{speed}`: change speed on the fly (UI slider) | built (WP6a) |
+| `GET /sim/links` | link groups and the faults on them | required |
+| `POST /sim/faults` | break a link group | required |
+| `DELETE /sim/faults/{fault_id}`, `POST /sim/faults/heal-all` | remove faults | required |
+| `POST /sim/nodes/{node_id}/kill`, `POST /sim/nodes/{node_id}/start` | real crash (T1b) and restart | required |
+| `POST /sim/scenarios/{name}` | run a scripted scenario (`T1`, `T1b`, `T2` to `T6`) | optional |
+| `GET /sim/snapshots`, `POST /sim/snapshots`, `POST /sim/snapshots/{name}/restore` | Section 7.4 | optional |
+| `POST /sim/check` | run the invariant checker | optional |
+| `GET /sim/jobs/{job_id}` | progress of a scenario, snapshot, restore or check | with the optional routes |
+
+"Optional" routes must work as `rosctl` commands; putting them on the Ops view is extra. Their shapes are fixed here either way.
+
+**Playback.** `GET /sim/clock` answers `{"state", "sim_day", "sim_time", "speed"}`. Before the first run the last three are `null`: there is no "today" yet, and a screen should ask for a day. While a run is paused, and after it has ended, the clock stands at its last moment. `state` is `idle`, `running`, `paused`, `stopping`, `done`, `stopped` or `failed`.
+
+`GET /sim/playback`, and every `POST` and `PATCH` on it, answer:
+
+```json
+{
+  "state": "running", "run_id": "2026-11-20-a", "seed": 0, "from_day": 14, "to_day": 20, "speed": 1000.0,
+  "orders_sent": 0, "orders_acked": 0, "orders_parked": 0, "orders_refused": 0, "orders_failed": 0,
+  "events_sent": 0, "events_acked": 0, "events_conflicted": 0, "events_failed": 0, "events_skipped": 0,
+  "restocks_sent": 0, "restocks_acked": 0, "restocks_failed": 0, "inflight": 0
+}
+```
+
+- `start` needs `from_day`; `to_day`, `speed`, `seed` and `run_id` are optional. `duplicate_rate` and `shuffle` (Section 7.2) will join the body when they are built. Status events and restocks are switched on when the playback process starts, not per run.
+- A command the current state does not allow answers `409` with `{"error": "invalid_state", "state": "idle", "message": "..."}`.
+
+**Faults.** `POST /sim/faults` takes `{"target": "<link group>", "fault": "...", "params": {}}`:
+
+| `fault` | `params` |
+| --- | --- |
+| `cut` | none |
+| `silence` | none |
+| `latency` | `latency_ms` (required), `jitter_ms` (default 0) |
+| `reset` | `timeout_ms` (default 0: reset at once) |
+
+It answers `201` with the fault; `404` for an unknown link group; `409` with `{"error": "fault_exists"}` when the group already has a fault of that kind (different kinds may be on one group together).
+
+```json
+{ "fault_id": "f3", "target": "link:r1<->hq", "fault": "latency", "params": { "latency_ms": 4000, "jitter_ms": 0 },
+  "proxies": ["gateway__r1-primary", "gateway__r1-standby"], "created_at": "..." }
+```
+
+`DELETE /sim/faults/{fault_id}` answers `200`, or `404`. `POST /sim/faults/heal-all` answers `200` with `{"healed": 3}`. `GET /sim/links` lists every link group as `{"group", "proxies", "faults"}`, each fault in the shape above.
+
+**Nodes.** `POST /sim/nodes/{node_id}/kill` and `/start` answer `200` with `{"node_id": "r1-primary", "running": false}`, or `404` for an unknown node. Killing a stopped node or starting a running one changes nothing.
+
+**Jobs.** A scenario, a snapshot, a restore and a check take from seconds to minutes. Their `POST` answers `202` with a job, and `GET /sim/jobs/{job_id}` reports on it:
+
+```json
+{ "job_id": "j7", "kind": "scenario", "name": "T2", "state": "running", "started_at": "...", "finished_at": null, "result": null, "error": null }
+```
+
+- `kind` is `scenario`, `snapshot`, `restore` or `check`; `state` is `running`, `done` or `failed`. One job runs at a time: a second `POST` answers `409` with `{"error": "busy", "job_id": "j7"}`.
+- `POST /sim/scenarios/{name}` takes an optional `{"region_id": "r1"}`, the region to break (default `r1`). Its `result` is the checker's result plus the scenario's own numbers, such as T1's failover time.
+- `GET /sim/snapshots` lists `{"name", "created_at", "sim_day", "sim_time", "regions"}`. `POST /sim/snapshots` takes `{"name": "before-t2"}` (`409` when the name is taken). Restoring an unknown name is a `404`.
+- The `result` of `POST /sim/check`:
+
+```json
+{ "passed": true, "acked": 21840, "stored": 21840, "hq": 21840,
+  "lost_at_failover": { "count": 0, "order_ids": [] }, "duplicates": [], "unaccounted": [] }
+```
 
 ## 7. Simulation harness
 

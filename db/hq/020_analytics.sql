@@ -44,8 +44,11 @@ CREATE INDEX analytics_order_items_product_idx ON analytics_order_items (vendor_
 SELECT create_day_partitions('analytics_orders', 0, 90);
 SELECT create_day_partitions('analytics_order_items', 0, 90);
 
+-- seq is a running number in arrival order: GET /admin/exceptions?since=
+-- pages on it, because event_id is random.
 CREATE TABLE analytics_exceptions (
     event_id uuid PRIMARY KEY,
+    seq bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
     region_id text NOT NULL,
     order_day smallint NOT NULL,
     order_id uuid NOT NULL,

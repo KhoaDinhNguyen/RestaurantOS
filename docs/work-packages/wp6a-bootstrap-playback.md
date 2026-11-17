@@ -94,7 +94,7 @@ Stretch goal, only if the report needs a write-throughput comparison: no new cod
 - **Duplicates and shuffling:** resend a configurable share of orders; optionally reorder delivery.
 - **Randomness:** derive every random value from a hash of (`seed`, `order_id`, purpose). Never draw from one shared generator in send order.
 - **Run log:** one line per order in `runs/<run_id>/orders.jsonl` with the three gateway timestamps and the outcome.
-- Controls: start, pause, resume, stop, change speed, `from_day`, `to_day`.
+- Controls: start, pause, resume, stop, change speed, `from_day`, `to_day`. The bodies and answers of `/sim/clock` and `/sim/playback` are in architecture Section 6.3; a command the state does not allow answers `409` with `{"error": "invalid_state", ...}`.
 
 ### Single-region mode
 
