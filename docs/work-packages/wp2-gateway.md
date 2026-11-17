@@ -75,6 +75,7 @@ The contracts of the routes below are in Section 6.1, each with its body and ans
 - `GET /vendors/{vendor_id}/stock`: one SQL file, routed like the menu.
 - `GET /dishes?q=&limit=` and `GET /dishes/{dish_id}`: gateway mode reads HQ, edge mode reads its local node (every region has the full `dishes` table). Escape `q` as for the vendor search.
 - `GET /vendors/{vendor_id}/menu`: add `dish_id` to each row (join `product_dish`).
+- Order status and the kitchen board: add `order_time` (order status), `customer_id`, `channel` and an `items` list (`order_items` joined to `products` for the name) to each order. The kitchen board's `status` takes several values separated by commas. Order status takes an optional `day` and then filters on `order_day`, so one partition is read.
 - `POST /menu/products` (gateway mode only): make the id of a new product, take `LOCK TABLE menu_versions IN EXCLUSIVE MODE`, insert the next version, upsert `products` and `product_dish`, all in one transaction at HQ, and answer `202`. The lock keeps version numbers in commit order; without it the publisher could send version 5, then skip a later-committed 4 as old.
 - When HQ's database cannot be answered in time on a route that only reads or writes HQ, answer `503` with `{"error": "hq_unreachable"}`.
 

@@ -376,9 +376,9 @@ All JSON. No authentication (simulation). FastAPI serves OpenAPI at `/docs` on e
 | Method and path | Purpose | Notes |
 | --- | --- | --- |
 | `POST /orders` | place an order | `201` committed; `200` duplicate (same body as the first time); `202` parked in the holding queue; `409` whole order refused (`refusal_reason` says why) |
-| `GET /vendors/{vendor_id}/orders/{order_id}` | order status | always reads the region primary |
+| `GET /vendors/{vendor_id}/orders/{order_id}?day=` | order status | always reads the region primary; `day` is optional |
 | `POST /vendors/{vendor_id}/orders/{order_id}/status` | status change | body `{event_id, to_status}`; `409` on conflict |
-| `GET /vendors/{vendor_id}/orders?day=&status=` | kitchen board | |
+| `GET /vendors/{vendor_id}/orders?day=&status=` | kitchen board: one restaurant's orders of a day | `status` takes one or several, comma-separated |
 | `GET /vendors/{vendor_id}/menu` | menu with availability | each row carries its `dish_id` |
 | `GET /vendors/{vendor_id}/stock` | stock counters | `on_hand` and `par_level` per counter; details below |
 | `PUT /vendors/{vendor_id}/products/{product_id}/availability` | manual sold-out switch | body `{available}`; changes the manual mark only; details below |
@@ -389,7 +389,7 @@ All JSON. No authentication (simulation). FastAPI serves OpenAPI at `/docs` on e
 | `GET /query/nearby?geohash=&dish=&limit=` | "who near me can make X now" | geohash cell + 8 neighbours; `dish` is a `dish_id`; "can make" means stock for an order of one |
 | `GET /query/top-dishes?day=&limit=&rank_by=&mode=live\|hq\|baseline` | city-wide top dishes | takes a day range and a time window; details below |
 | `GET /query/ingredient-usage?day=&mode=live\|hq\|baseline&strategy=A\|B\|C` | distributed join | `strategy` applies to `mode=live`; takes a day range and a time window; details below |
-| `GET /regions` | shard directory and epochs | reads HQ only |
+| `GET /regions` | shard directory and epochs | reads HQ only; shape below |
 | `GET /regions/{region_id}/summary?day=` | regional office numbers | fields below; reads the region primary |
 | `POST /menu/products` | add or change products | gateway only; writes at HQ and creates a new menu version; `202`; details below |
 
@@ -585,6 +585,42 @@ Day 20's own hours before 04:00 are not in either: they belong to the night of d
 ```
 
 `amount` is `sum(quantity x multiplier x amount)`. Canceled orders count here, on purpose: the sale is void but the ingredients were used. Rows are grouped by (`ingredient_id`, `unit`) and ordered by `amount` descending, then `ingredient_id`, then `unit`; there is no `limit`. `strategy` is `null` unless `mode=live`. Strategy B ships every order line in the range, so a long range is slow; that cost is what B is there to show.
+
+The read routes for orders, the menu and the regions:
+
+`GET /vendors/{vendor_id}/orders/{order_id}` returns one order:
+
+```json
+{
+  "order_id": "uuid", "order_day": 85, "order_time": "12:03:29", "vendor_id": "212753d2",
+  "customer_id": "1ba124d4e5", "channel": "dhrd", "status": "preparing", "status_changed_at": "...",
+  "menu_version": 3, "received_at": "...", "committed_at": "...",
+  "items": [ { "line_no": 1, "product_id": "783e85338f1c", "name": "Laksa", "quantity": 1, "price_units": 30 } ]
+}
+```
+
+- `items` is ordered by `line_no`. `price_units` is the price stored on the order line; `name` is the product's name today, so an old order shows a renamed product's new name.
+- `orders` has one partition per day. With `?day=` (the `order_day` from the `POST /orders` answer) the lookup reads one partition; without it, all of them.
+
+`GET /vendors/{vendor_id}/orders?day=&status=`, the kitchen board, returns a list of the same objects, ordered by `order_time`, then `order_id`. `status` is one status or several separated by commas (`status=received,accepted,preparing` is "everything not finished yet"); without it, every status. An unknown status is a `422`.
+
+`GET /vendors/{vendor_id}/menu` returns a list ordered by `product_id`:
+
+```json
+[
+  { "vendor_id": "212753d2", "product_id": "783e85338f1c", "name": "Laksa", "price_units": 30, "menu_version": 1,
+    "dish_id": "0a1b2c3d4e5f", "available": true, "reason": null }
+]
+```
+
+`GET /regions` returns a list ordered by `region_id`:
+
+```json
+[
+  { "region_id": "r1", "epoch": 1, "primary_node": "r1-primary", "standby_node": "r1-standby", "menu_version": 1,
+    "updated_at": "...", "geohashes": ["w21z6", "w21z7"] }
+]
+```
 
 Answers every route shares:
 
