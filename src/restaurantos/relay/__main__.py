@@ -1,29 +1,15 @@
-"""Run the startup checks for a regional relay or the HQ worker."""
+"""Start the configured relay role."""
 
 import asyncio
+import logging
 import sys
 
 from pydantic import ValidationError
 
-from restaurantos.common.cluster import Cluster, load_cluster
-from restaurantos.common.config import Settings, get_settings
-from restaurantos.common.db import find_local_primary, make_pool, node_conninfo
-from restaurantos.common.errors import RegionUnreachableError
+from restaurantos.common.cluster import load_cluster
+from restaurantos.common.config import get_settings
 from restaurantos.relay.config import RelaySettings
-from restaurantos.relay.outbox import read_pending
-
-
-async def _check_region(
-    cluster: Cluster, region_id: str, settings: Settings, relay: RelaySettings
-) -> str:
-    node = await find_local_primary(cluster, region_id, settings=settings)
-    if node is None:
-        raise RegionUnreachableError("no writable local node", region_id=region_id)
-
-    conninfo = node_conninfo(cluster, node, direct=True, settings=settings)
-    async with make_pool(conninfo, settings) as pool:
-        events = await read_pending(pool, region_id, relay.batch_size, settings=settings)
-    return f"{region_id} relay startup check read {len(events)} pending events from {node}."
+from restaurantos.relay.worker import run_region_relay
 
 
 def main() -> int:
@@ -49,11 +35,11 @@ def main() -> int:
         print(f"Relay configuration error: {exc}", file=sys.stderr)
         return 1
 
+    logging.basicConfig(level=logging.INFO)
     try:
-        print(asyncio.run(_check_region(cluster, region_id, settings, relay)))
-    except RegionUnreachableError as exc:
-        print(f"{region_id} relay startup check failed: {exc}", file=sys.stderr)
-        return 1
+        asyncio.run(run_region_relay(cluster, region_id, settings, relay))
+    except KeyboardInterrupt:
+        return 130
     return 0
 
 
