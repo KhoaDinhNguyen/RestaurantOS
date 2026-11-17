@@ -42,7 +42,9 @@ possibly-live run and refuses the sync. The gate is read a second time
 after the last COPY and before the baseline transaction commits, and
 the sync aborts (rolling the baseline back) unless the second read is
 quiet by the same rules AND unchanged from the first: same
-presence/absence of a process, same run_id, same counters. This is
+presence/absence of a process, same run_id, and every counter in the
+status body (orders today; the events_* and restocks_* fields once the
+extras PR lands - both kinds of request write to the regions). This is
 detection, not prevention: it catches anything playback sent during the
 copy and rolls back, but a `resume` racing the copy still wastes the
 work. Residual, accepted: writers other than the configured playback
@@ -78,17 +80,6 @@ _DELETE_ORDER = ("order_items", "orders", "stock", "product_availability")
 # treated as not quiet: a future state the gate does not know may mean
 # a live run.
 _QUIET_OK_STATES = frozenset({"idle", "paused", "done", "stopped", "failed"})
-
-# What the second gate read compares, beyond presence and run_id: if
-# playback sent, accepted or parked anything during the copy, the
-# baseline must not be committed.
-_STATUS_COUNTERS = (
-    "orders_sent",
-    "orders_acked",
-    "orders_parked",
-    "orders_refused",
-    "orders_failed",
-)
 
 
 class BaselineSyncError(RuntimeError):
@@ -149,8 +140,9 @@ def read_playback_status(client: httpx.Client) -> dict | None:
         raise BaselineSyncError(
             "the playback control endpoint returned a status that is not an object"
         )
-    if body.get("state") not in _QUIET_OK_STATES | {"running", "stopping"}:
-        raise BaselineSyncError(f"playback status has an unknown state {body.get('state')!r}")
+    state = body.get("state")
+    if not isinstance(state, str) or state not in _QUIET_OK_STATES | {"running", "stopping"}:
+        raise BaselineSyncError(f"playback status has an unknown state {state!r}")
     inflight = body.get("inflight")
     if isinstance(inflight, bool) or not isinstance(inflight, int) or inflight < 0:
         raise BaselineSyncError(f"playback status has a bad in-flight count {inflight!r}")
@@ -188,11 +180,36 @@ def playback_refusal(client: httpx.Client) -> str | None:
     return live_refusal(body)
 
 
+def _counter_names(before: dict, after: dict) -> set[str]:
+    """Every key in either body whose value is a counter: an int, not a
+    bool (booleans are flags; state and run_id are compared on their
+    own). Any counter, not a fixed list: the status body grows the
+    events_* and restocks_* counters in the extras PR, and both kinds
+    of request write to the regions, so all of them must match. A key
+    missing from one body counts as a change."""
+    return {
+        name
+        for body in (before, after)
+        for name, value in body.items()
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+
+
+def _shown(value: object) -> str:
+    return "missing" if value is None else str(value)
+
+
 def gate_recheck(before: dict | None, after: dict | None) -> str | None:
     """The second gate read, taken after the last COPY and before the
     baseline transaction commits. None when the system is still quiet
     and nothing changed; otherwise the abort message. Both bodies come
     from read_playback_status (None = no playback process answered).
+
+    Changed means: a playback process appeared or disappeared, the run
+    id moved, or ANY counter in the status body advanced (orders today,
+    the events_* and restocks_* fields once they land) - a resume that
+    only sends status events or a restock still aborts the sync, not
+    just one that sends orders.
 
     Detection, not prevention: an abort here means the copy is thrown
     away (the baseline transaction rolls back), not that it never
@@ -218,9 +235,15 @@ def gate_recheck(before: dict | None, after: dict | None) -> str | None:
             f"({run!r} -> {after.get('run_id')!r}); the baseline was left "
             "as it was; rerun the sync once playback is quiet"
         )
-    changed = [name for name in _STATUS_COUNTERS if before.get(name) != after.get(name)]
+    changed = [
+        name
+        for name in sorted(_counter_names(before, after))
+        if before.get(name) != after.get(name)
+    ]
     if changed:
-        what = ", ".join(f"{name} {before.get(name)} -> {after.get(name)}" for name in changed)
+        what = ", ".join(
+            f"{name} {_shown(before.get(name))} -> {_shown(after.get(name))}" for name in changed
+        )
         return (
             f"playback run {run!r} advanced while the baseline was being "
             f"rebuilt ({what}); the baseline was left as it was; rerun "
@@ -309,20 +332,31 @@ def sync(
                             counts[rid][table] = _copy_table(regions[rid], baseline, table)
                         except psycopg.Error as error:
                             raise BaselineSyncError(
-                                f"copying {table} from {primary_of(rid)} failed: {error}; "
-                                "the baseline was left untouched (the transaction "
-                                "rolled back)"
+                                f"copying {table} from {primary_of(rid)} into the "
+                                f"baseline failed: {error}; the baseline was left "
+                                "untouched (the transaction rolled back)"
                             ) from error
                 # Second gate read, inside the transaction: if playback
                 # sent anything during the copy, or the process came or
                 # went, the baseline rolls back instead of committing a
-                # torn snapshot.
-                with _control_client(settings, transport) as client:
-                    after = read_playback_status(client)
+                # torn snapshot. A read that fails here aborts too - and
+                # the message must say the rollback happened, which is
+                # why it is wrapped separately from the read failures of
+                # the first gate check.
+                try:
+                    with _control_client(settings, transport) as client:
+                        after = read_playback_status(client)
+                except BaselineSyncError as error:
+                    raise BaselineSyncError(f"{error}; the baseline was left as it was") from error
                 abort = gate_recheck(before, after)
                 if abort is not None:
                     raise BaselineSyncError(abort)
         except psycopg.Error as error:
+            # Covers everything up to the COMMIT: connect, DELETE, COPY,
+            # the wrapped failures above. A failure during the COMMIT
+            # itself (the connection lost mid-commit) has an unknown
+            # outcome - the message below would then overstate what is
+            # known, but that window is a fraction of a second.
             raise BaselineSyncError(
                 f"the baseline node failed during the sync: {error}; it was "
                 "left untouched (the transaction rolled back)"

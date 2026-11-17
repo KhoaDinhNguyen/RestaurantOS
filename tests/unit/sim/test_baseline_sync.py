@@ -13,7 +13,7 @@ import httpx
 import pytest
 from conftest import FakeWallClock, make_playback, sample_orders
 
-from restaurantos.common.cluster import Cluster
+from restaurantos.common.cluster import BASELINE, Cluster, host_port
 from restaurantos.sim import baseline_sync
 from restaurantos.sim.baseline_sync import (
     SYNC_TABLES,
@@ -167,6 +167,22 @@ def test_an_unknown_state_refuses():
     assert "unknown state" in refusal
 
 
+@pytest.mark.parametrize("bad_state", [["running"], {"a": 1}])
+def test_a_non_string_state_is_a_refusal_not_a_crash(bad_state):
+    """A list or dict state must not TypeError the gate (a regression
+    the round 1 refactor introduced); it is an unknown state."""
+    body = {"state": bad_state, "run_id": "probe", "inflight": 0}
+    with (
+        status_client(body) as client,
+        pytest.raises(BaselineSyncError) as caught,
+    ):
+        baseline_sync.read_playback_status(client)
+    assert "unknown state" in str(caught.value)
+    with status_client(body) as client:
+        refusal = playback_refusal(client)
+    assert "unknown state" in refusal
+
+
 def test_a_bad_in_flight_count_refuses():
     with status_client({"state": "idle", "run_id": "probe", "inflight": "many"}) as client:
         refusal = playback_refusal(client)
@@ -245,8 +261,34 @@ def test_recheck_aborts_when_a_counter_advanced():
     assert "orders_acked 9 -> 10" in message
 
 
+def test_recheck_aborts_when_only_status_events_advanced():
+    """The extras PR adds events_* and restocks_* counters; both kinds
+    of request write to the regions, so they abort the sync even with
+    no orders_* change."""
+    message = gate_recheck(_status(events_sent=5), _status(events_sent=6))
+    assert message is not None
+    assert "events_sent 5 -> 6" in message
+
+
+def test_recheck_aborts_when_only_a_restock_landed():
+    message = gate_recheck(_status(restocks_acked=0), _status(restocks_acked=1))
+    assert message is not None
+    assert "restocks_acked 0 -> 1" in message
+
+
+def test_recheck_aborts_when_a_counter_appeared_or_vanished():
+    appeared = gate_recheck(_status(), _status(events_sent=3))
+    assert appeared is not None
+    assert "events_sent missing -> 3" in appeared
+    vanished = gate_recheck(_status(events_sent=3), _status())
+    assert vanished is not None
+    assert "events_sent 3 -> missing" in vanished
+
+
 def test_recheck_aborts_when_the_second_read_is_not_quiet():
-    message = gate_recheck(_status(), _status(state="running", inflight=2))
+    """State running, counters unchanged: the not-quiet branch, not the
+    counter branch (a changed inflight is caught as a counter first)."""
+    message = gate_recheck(_status(), _status(state="running"))
     assert message is not None
     assert "running" in message
     assert "left as it was" in message
@@ -308,6 +350,8 @@ class _FakeConnection:
         return self
 
     def __exit__(self, exc_type, *exc):
+        # like psycopg: leaving the with-block closes the connection
+        self.closed = True
         if exc_type is None:
             self.committed = True
         else:
@@ -315,11 +359,12 @@ class _FakeConnection:
         return False
 
 
-def _fake_databases(monkeypatch) -> list[_FakeConnection]:
+def _fake_databases(monkeypatch, cluster: Cluster) -> list[_FakeConnection]:
     connections: list[_FakeConnection] = []
+    baseline_port = f"port={host_port(cluster, BASELINE)}"
 
     def connect(dsn, **kwargs):
-        connection = _FakeConnection("baseline" if "port=5509" in dsn else "region")
+        connection = _FakeConnection("baseline" if baseline_port in dsn else "region")
         connections.append(connection)
         return connection
 
@@ -327,11 +372,16 @@ def _fake_databases(monkeypatch) -> list[_FakeConnection]:
     return connections
 
 
-def _two_reads(first: dict | None, second: dict | None) -> httpx.MockTransport:
+def _two_reads(first: dict | None, second: dict | int | None) -> httpx.MockTransport:
+    """Serve `first` on the gate's first read and `second` on the second:
+    a dict is a 200 status body, an int is that HTTP status code."""
     bodies = iter([first, second])
 
     def handler(request):
-        return httpx.Response(200, json=next(bodies))
+        body = next(bodies)
+        if isinstance(body, int):
+            return httpx.Response(body)
+        return httpx.Response(200, json=body)
 
     return httpx.MockTransport(handler)
 
@@ -341,26 +391,47 @@ def _cluster() -> Cluster:
 
 
 def test_sync_with_an_unchanged_gate_commits(monkeypatch):
-    connections = _fake_databases(monkeypatch)
+    cluster = _cluster()
+    connections = _fake_databases(monkeypatch, cluster)
     counts = sync(
-        _cluster(),
+        cluster,
         SimSettings(_env_file=None),
         transport=_two_reads(_status(), _status()),
     )
     baseline = [c for c in connections if c.label == "baseline"][0]
     assert baseline.committed and not baseline.rolled_back
+    assert all(c.closed for c in connections), "every connection must be closed"
     assert counts == {"r1": {table: 3 for table in SYNC_TABLES}}
 
 
 def test_sync_aborts_and_rolls_back_when_playback_advanced_during_the_copy(monkeypatch):
-    connections = _fake_databases(monkeypatch)
+    cluster = _cluster()
+    connections = _fake_databases(monkeypatch, cluster)
     with pytest.raises(BaselineSyncError) as caught:
         sync(
-            _cluster(),
+            cluster,
             SimSettings(_env_file=None),
             transport=_two_reads(_status(), _status(orders_sent=11)),
         )
     assert "orders_sent 10 -> 11" in str(caught.value)
+    assert "left as it was" in str(caught.value)
+    baseline = [c for c in connections if c.label == "baseline"][0]
+    assert baseline.rolled_back and not baseline.committed
+
+
+def test_a_failed_second_read_rolls_back_and_says_so(monkeypatch):
+    """A timeout, 503 or bad body on the second read aborts the sync;
+    the user must be told the baseline was left as it was, because the
+    transaction did roll back."""
+    cluster = _cluster()
+    connections = _fake_databases(monkeypatch, cluster)
+    with pytest.raises(BaselineSyncError) as caught:
+        sync(
+            cluster,
+            SimSettings(_env_file=None),
+            transport=_two_reads(_status(), 503),
+        )
+    assert "HTTP 503" in str(caught.value)
     assert "left as it was" in str(caught.value)
     baseline = [c for c in connections if c.label == "baseline"][0]
     assert baseline.rolled_back and not baseline.committed
