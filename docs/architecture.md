@@ -387,8 +387,8 @@ All JSON. No authentication (simulation). FastAPI serves OpenAPI at `/docs` on e
 | `GET /dishes?q=&limit=` | search dishes by name | gateway reads HQ, edge reads its own node; details below |
 | `GET /dishes/{dish_id}` | one dish | `404` if unknown |
 | `GET /query/nearby?geohash=&dish=&limit=` | "who near me can make X now" | geohash cell + 8 neighbours; `dish` is a `dish_id`; "can make" means stock for an order of one |
-| `GET /query/top-dishes?day=&limit=&mode=live\|hq\|baseline` | city-wide top dishes | |
-| `GET /query/ingredient-usage?day=&mode=live\|hq\|baseline&strategy=A\|B\|C` | distributed join | `strategy` applies to `mode=live` |
+| `GET /query/top-dishes?day=&limit=&rank_by=&mode=live\|hq\|baseline` | city-wide top dishes | takes a day range and a time window; details below |
+| `GET /query/ingredient-usage?day=&mode=live\|hq\|baseline&strategy=A\|B\|C` | distributed join | `strategy` applies to `mode=live`; takes a day range and a time window; details below |
 | `GET /regions` | shard directory and epochs | reads HQ only |
 | `GET /regions/{region_id}/summary?day=` | regional office numbers | fields below; reads the region primary |
 | `POST /menu/products` | add or change products | gateway only; writes at HQ and creates a new menu version; `202`; details below |
@@ -521,6 +521,70 @@ Dish names in answers: where a dish is what the answer is about and nothing else
 
 - `hq-worker` sends a version only to the regions that own a changed vendor, so another region's `menu_version` can skip numbers. A region ignores a version at or below its own.
 - When a region applies a version, each added or changed product gets the stock counters it lacks, with `on_hand = 0` and a par level of at least `max(F, the product's need for one unit)` (Section 7.1). A product that cannot make one unit is marked unavailable (`stock`); the next restock fills its counters and switches it on.
+
+The three `/query/...` routes answer with the parameters they were given, a `results` list and `meta`.
+
+**Day range and time window** (`top-dishes` and `ingredient-usage`):
+
+- `from_day=&to_day=`, both included. `day=N` is the short form of `from_day=N&to_day=N`; sending `day` together with either of the others is a `422`. There is no "today" on the server: for the last 7 days a caller reads the day from `/sim/clock` and sends `from_day = today - 6`, `to_day = today`.
+- `from_time=&to_time=` (`HH:MM:SS`), optional and only together; `from_time` is included, `to_time` is not. The window repeats on **each day** of the range, so a week of lunches is one request and a week of dinners is another.
+- A window that crosses midnight (`from_time` later than `to_time`) belongs to the day it starts on:
+
+| Request, with `from_time=22:00:00&to_time=04:00:00` | Covers |
+| --- | --- |
+| `day=20`, or `from_day=20&to_day=20` | one night: day 20 at 22:00 up to day 21 at 04:00 |
+| `from_day=20&to_day=21` | two nights: that one, and day 21 at 22:00 up to day 22 at 04:00 |
+
+Day 20's own hours before 04:00 are not in either: they belong to the night of day 19.
+
+`GET /query/nearby?geohash=&dish=&limit=`:
+
+```json
+{
+  "geohash": "w21z7", "dish_id": "0a1b2c3d4e5f", "dish_name": "laksa", "example_name": "Laksa", "limit": 10,
+  "results": [
+    { "vendor_id": "212753d2", "chain_id": null, "primary_cuisine": "noodles", "geohash": "w21z6", "distance_m": 4890.0,
+      "product_id": "783e85338f1c", "name": "Laksa", "price_units": 30, "multiplier": 1, "region_id": "r1" }
+  ],
+  "meta": { "mode": "live", "nodes_contacted": ["r1-primary"], "missing_regions": [], "rows_transferred": 1, "data_as_of": "...", "elapsed_ms": 12.5 }
+}
+```
+
+`distance_m` is the distance in metres between the centre of the customer's cell and the centre of the vendor's cell, so every vendor in the customer's own cell has 0. Rows are ordered by distance, then `vendor_id`, then `product_id`.
+
+`GET /query/top-dishes`, with `limit`, `mode`, the range and window above, and `rank_by=units|quantity|order_lines|sales_units` (default `units`):
+
+```json
+{
+  "from_day": 14, "to_day": 20, "from_time": null, "to_time": null, "limit": 10, "rank_by": "units",
+  "results": [
+    { "dish_id": "0a1b2c3d4e5f", "dish_name": "laksa", "example_name": "Laksa", "units": 412, "quantity": 398, "order_lines": 371, "sales_units": 11940 }
+  ],
+  "meta": { "...": "..." }
+}
+```
+
+| Field | Sum over the order lines in the range and window | One line "3 x set of 6" at 20 adds |
+| --- | --- | --- |
+| `units` | `quantity x multiplier`: units of the dish | 18 |
+| `quantity` | `quantity`: menu items | 3 |
+| `order_lines` | number of lines | 1 |
+| `sales_units` | `quantity x price_units` | 60 |
+
+- Canceled orders are left out, as in the region summary's `sales_units`: the sale is void. So while a cancel is still on its way to HQ, `mode=hq` can differ from `mode=live`; `meta.data_as_of` shows how old HQ's copy is.
+- Order: the `rank_by` number descending, then `dish_id`. The second key decides which dishes make the cut at `limit` when several tie, so the cluster and the baseline return the same rows. A screen may show ties in any order.
+
+`GET /query/ingredient-usage`, with `mode`, `strategy` and the range and window above:
+
+```json
+{
+  "from_day": 14, "to_day": 14, "from_time": null, "to_time": null, "strategy": "C",
+  "results": [ { "ingredient_id": "garlic", "amount": 1830, "unit": "portion" } ],
+  "meta": { "...": "..." }
+}
+```
+
+`amount` is `sum(quantity x multiplier x amount)`. Canceled orders count here, on purpose: the sale is void but the ingredients were used. Rows are grouped by (`ingredient_id`, `unit`) and ordered by `amount` descending, then `ingredient_id`, then `unit`; there is no `limit`. `strategy` is `null` unless `mode=live`. Strategy B ships every order line in the range, so a long range is slow; that cost is what B is there to show.
 
 Answers every route shares:
 

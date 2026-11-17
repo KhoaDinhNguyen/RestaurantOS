@@ -34,15 +34,19 @@
    This is the rule `place_order` applies to an order line with quantity 1 (WP1 steps 3 to 6), so a vendor returned here would accept that order at this moment. Each region returns at most `limit` rows, in the order of step 4.
 4. Merge and return the top `limit`, in one total order: distance between cell centres, then `vendor_id`, then `product_id`. Send each cell together with its distance, so every region sorts the same way. Without the tie-break, the cluster and the baseline can return different rows for the same `limit`.
 
-### City-wide: `GET /query/top-dishes?day=&limit=&mode=`
+The answer's fields are in architecture Section 6.1: each row has the vendor's and the product's columns, `multiplier`, `distance_m` and `region_id`; the dish's names go once at the top level.
 
-- `mode=live`: every region groups and sums its own order lines for that day and returns **one row per dish**. The router adds the partial sums and sorts.
+### City-wide: `GET /query/top-dishes?day=&limit=&rank_by=&mode=`
+
+- `mode=live`: every region groups its own order lines in the requested range and window and returns **one row per dish** with four sums: `units` (`quantity x multiplier`), `quantity`, `order_lines` (a count) and `sales_units` (`quantity x price_units`). The router adds the partial sums, sorts by the one `rank_by` names (default `units`) descending, then `dish_id`, and cuts at `limit`. Because every region returns every sum, any `rank_by` gives a correct top-N.
+- Leave out orders whose status is `canceled`.
+- Return `dish_name` and `example_name` with each `dish_id`.
 - Never take a local top-N in a region: a dish spread over regions can miss every local top-N and still be in the city-wide top-N.
 - `mode=hq`: one query on HQ's analytics copy.
 
 ### Distributed join: `GET /query/ingredient-usage?day=&mode=&strategy=`
 
-The number is the same for every strategy and mode: per `ingredient_id`, `sum(quantity x multiplier x amount)`, returned together with the ingredient's `unit`, over every order line with `order_day = day` whose dish has rows in `dish_ingredients`. Count canceled orders too: stock is not given back on a cancel, and a status filter would make `mode=hq` disagree with `mode=live` whenever a status event is still on its way to HQ.
+The number is the same for every strategy and mode: per (`ingredient_id`, `unit`), `sum(quantity x multiplier x amount)`, returned as `{ingredient_id, amount, unit}`, over every order line in the requested range and window whose dish has rows in `dish_ingredients`. Count canceled orders too: stock is not given back on a cancel, and a status filter would make `mode=hq` disagree with `mode=live` whenever a status event is still on its way to HQ.
 
 The order lines are split across the regions. `product_dish` is split the same way, so the step from product to dish is always next to the lines. What differs is where `dish_ingredients` is read and what has to travel:
 
@@ -65,7 +69,7 @@ All three must return identical numbers. `mode=hq` is one query on HQ's analytic
 - `mode=baseline` runs the same SQL on the single `baseline` node. Connect to it directly (`common.db.node_conninfo(cluster, "baseline", direct=True)`): it has no Toxiproxy proxy because it is not part of the system under test.
 - The baseline holds a copy of what the regions hold, made by `rosctl baseline sync` after a run (architecture Section 7.1). The data on both sides is therefore identical, and a different answer can only come from how you split and merge. On the mini fixture the test loads the same rows into the regions and the baseline itself.
 - Each scatter call goes through `common.db.run_on`, so one silent region costs the query the request deadline at most, and then shows up in `meta.missing_regions`.
-- `day` is always a parameter. Never "today" from the clock.
+- The day is always a parameter, never "today" from the clock. `top-dishes` and `ingredient-usage` take `day`, or `from_day` and `to_day`, and an optional `from_time` and `to_time` window that repeats on each day (architecture Section 6.1). A window that crosses midnight belongs to the day it starts on: the filter is (`order_day` in the range and `order_time >= from_time`) or (`order_day` in the range moved one day later and `order_time < to_time`). Write that condition once and use it in every query, mode and strategy, and keep `order_day` in it so partitions are pruned.
 
 ## Run it on its own
 

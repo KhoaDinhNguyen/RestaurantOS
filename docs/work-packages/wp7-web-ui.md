@@ -59,7 +59,7 @@ What each view reads and can do is the contract (Section 8). The notes are thing
 
 | View | Reads | Can do | Worth knowing |
 | --- | --- | --- | --- |
-| **HQ** (head office) | `/query/top-dishes`, `/query/ingredient-usage`, `/admin/cluster`, `/admin/events`, `/admin/exceptions` | manual failover of a region; add a product | Both queries take `mode=live`, `hq` or `baseline`, and ingredient usage also takes `strategy=A`, `B` or `C`. Every answer carries `meta`: how fresh the data is, which nodes were asked, which regions did not answer, how many rows travelled, how long it took. Showing `meta` next to the result is the demonstration |
+| **HQ** (head office) | `/query/top-dishes`, `/query/ingredient-usage`, `/admin/cluster`, `/admin/events`, `/admin/exceptions` | manual failover of a region; add a product | Both queries take `mode=live`, `hq` or `baseline`, a day or a day range, and an optional time-of-day window; top dishes also takes `rank_by` (`units`, `quantity`, `order_lines` or `sales_units`), and ingredient usage also takes `strategy=A`, `B` or `C`. Every answer carries `meta`: how fresh the data is, which nodes were asked, which regions did not answer, how many rows travelled, how long it took. Showing `meta` next to the result is the demonstration |
 | **Region** (regional office, kitchens) | `/regions/{id}/summary`, the kitchen board, menu with availability, stock counters (`/vendors/{id}/stock`) | change an order's status, switch a product to sold out, restock | Talk to the edge API (see above). The summary's fields are defined in Section 6.1 |
 | **Customer** | `/vendors`, `/dishes`, a menu, `/query/nearby`, one order's status | place an order | See "Placing an order" below |
 | **Ops** (the operator, outside the system) | `/sim/clock`, `/sim/playback`, `/sim/links`, `/sim/snapshots` | start, pause and stop playback, change speed, inject and remove faults, kill and start nodes, run a scenario, take and restore snapshots, run the checker | The professor asked for an admin screen showing which nodes are alive and their state. `/admin/cluster` has exactly that: per node its role, `up`, `suspect` or `down`, and last heartbeat; per region its epoch, orders per second, standby lag, lag to HQ and outbox backlog |
@@ -69,6 +69,7 @@ What each view reads and can do is the contract (Section 8). The notes are thing
 - **Ids are text.** Restaurant, product, dish and customer ids are short strings of digits and letters. Some contain only digits and a few start with zeros. Never turn one into a number.
 - **Time is simulated.** "Today" is a day number from 0 to 90, and the clock runs at whatever speed playback is set to. Read it from `GET /sim/clock`. Do not use the browser's clock for anything except showing how long a request took. Routes that take `day=` expect that day number; the replay covers days 14 to 90.
 - **Order status** is one of `received`, `accepted`, `preparing`, `ready`, `picked_up`, `canceled`.
+- **Restaurants have no names** in the dataset. Showing the `vendor_id` as the name is fine.
 - **No calculations.** No sums, no joins, no ranking, no choosing a region in the browser. If a screen needs a number the API does not return, ask for it in the API.
 
 #### Placing an order
