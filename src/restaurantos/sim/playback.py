@@ -153,7 +153,7 @@ class _OrderOutcome:
 class _OrderHandle:
     """The per-order link between the send and its scheduled events."""
 
-    __slots__ = ("future", "order_seq", "outcome", "request", "sim_time")
+    __slots__ = ("future", "last_event", "order_seq", "outcome", "request", "sim_time")
 
     def __init__(
         self,
@@ -167,6 +167,9 @@ class _OrderHandle:
         self.sim_time = sim_time  # the order's simulated instant, absolute
         self.order_seq = order_seq
         self.outcome: _OrderOutcome | None = None
+        # the send task of this order's previous event: the kitchen
+        # events of one order go out strictly one after another
+        self.last_event: asyncio.Task | None = None
 
     def resolve(self, outcome: _OrderOutcome) -> None:
         self.outcome = outcome
@@ -872,7 +875,11 @@ class Playback:
             "jitter_s": round(jitter, 3),
             "wall_sent_at": None,
         }
-        task = asyncio.create_task(self._send_event(seq, record))
+        task = asyncio.create_task(self._send_event(seq, record, handle.last_event))
+        # the next event of this order waits for this task: the region's
+        # state machine is first-committed-change-wins, so preparing must
+        # not be able to commit before accepted
+        handle.last_event = task
         self._send_tasks.add(task)
         task.add_done_callback(self._send_tasks.discard)
 
@@ -961,18 +968,21 @@ class Playback:
         self._log.add(seq, record)
         self._log.flush()
 
-    async def _send_event(self, seq: int, record: dict[str, Any]) -> None:
+    async def _send_event(
+        self, seq: int, record: dict[str, Any], previous: asyncio.Task | None
+    ) -> None:
         url = f"{self._api_base}/vendors/{record['vendor_id']}/orders/{record['order_id']}/status"
         await self._send_aux(
             seq,
             record,
             url,
             {"event_id": record["event_id"], "to_status": record["to_status"]},
+            previous,
         )
 
     async def _send_restock(self, seq: int, record: dict[str, Any]) -> None:
         url = f"{self._api_base}/vendors/{record['vendor_id']}/restock"
-        await self._send_aux(seq, record, url, None)
+        await self._send_aux(seq, record, url, None, None)
 
     async def _send_aux(
         self,
@@ -980,12 +990,27 @@ class Playback:
         record: dict[str, Any],
         url: str,
         body: dict[str, Any] | None,
+        previous: asyncio.Task | None = None,
     ) -> None:
         """Send one event or restock: the same slot, log and failure
-        discipline as an order send, with counters picked by kind."""
+        discipline as an order send, with counters picked by kind.
+
+        An event waits here for the previous event of its own order
+        (the kitchen timeline is first-committed-change-wins), without
+        blocking the dispatcher and without holding a slot while it
+        waits: the wait sits before the semaphore, inside the cancel
+        handling, so a task cancelled by the drain while waiting still
+        writes its line. If the previous event failed, conflicted or
+        was cancelled, this one still goes out: the region decides,
+        and the answer is logged and counted as usual."""
         assert self._log is not None and self._client is not None and self._slots is not None
         is_event = record["kind"] == "status_event"
         try:
+            if is_event and previous is not None and not previous.done():
+                # asyncio.wait returns on completion even when the
+                # previous task failed or was cancelled; it does not
+                # re-raise
+                await asyncio.wait({previous})
             async with self._slots:
                 record["wall_sent_at"] = round(self._wall.now(), 3)
                 try:

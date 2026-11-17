@@ -191,6 +191,102 @@ async def test_an_event_waits_for_its_orders_outcome(tmp_path: Path) -> None:
     assert min(event_posts) > max(order_posts)
 
 
+class HoldingEvent(httpx.AsyncBaseTransport):
+    """Holds the status event with the given event id until released,
+    recording every event POST on the wire in order."""
+
+    def __init__(self, hold: str) -> None:
+        self.inner = httpx.ASGITransport(app=make_stub_app())
+        self.release = asyncio.Event()
+        self.hold = hold
+        self.wire: list[tuple[str, str]] = []  # (to_status, event_id)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/status"):
+            body = json.loads(request.content)
+            self.wire.append((body["to_status"], body["event_id"]))
+            if body["event_id"] == self.hold:
+                await self.release.wait()
+        return await self.inner.handle_async_request(request)
+
+
+async def test_one_orders_events_go_out_strictly_one_after_another(tmp_path: Path) -> None:
+    """CodeRabbit round 2: the four events of one order must not commit
+    out of order on a slow target - the region's state machine is
+    first-committed-change-wins, so preparing committing before accepted
+    would make both conflict. Each event now waits, inside its own send
+    task, for the previous event of the same order; a second order's
+    events are not held up by the first order's slow event."""
+    hold = expected_event_id("1001", "accepted")
+    transport = HoldingEvent(hold)
+    orders = [make_order(14, 0, 0, 1, "1001"), make_order(14, 0, 0, 2, "1002")]
+    pb = make_playback(
+        orders, tmp_path, inflight=8, speed=1e9, status_events=True, transport=transport
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="chained")
+    # enough rounds for both orders' outcomes and the first due events:
+    # with this seed 1002's accepted is due before 1001's, so the
+    # dispatcher must get past it to reach the held one
+    await settle(20)
+
+    on_wire = {event_id for _status, event_id in transport.wire}
+    # order 1001's accepted is on the wire, held; nothing later of
+    # 1001 may have reached the wire behind it
+    assert expected_event_id("1001", "accepted") in on_wire
+    assert expected_event_id("1001", "preparing") not in on_wire
+    assert expected_event_id("1001", "ready") not in on_wire
+    # and order 1002's first event was not held up by 1001's slow one
+    assert expected_event_id("1002", "accepted") in on_wire
+
+    transport.release.set()
+    await pb.wait_done()
+    assert pb.status()["state"] == "done"
+    assert pb.status()["events_acked"] == 8
+    # on the wire, each order's events follow the kitchen order
+    for external_id in ("1001", "1002"):
+        mine = [
+            status
+            for status, event_id in transport.wire
+            if event_id == expected_event_id(external_id, status)
+        ]
+        assert mine == KITCHEN, external_id
+
+
+async def test_stop_while_an_event_waits_for_its_predecessor(tmp_path: Path) -> None:
+    """A stop while a chained event sits behind its held predecessor:
+    the run ends stopped, the waiting task is cancelled by the drain and
+    still writes its line, and the log stays dense - every dispatched
+    event has exactly one line."""
+    hold = expected_event_id("1001", "accepted")
+    transport = HoldingEvent(hold)
+    orders = [make_order(14, 0, 0, 1, "1001"), make_order(14, 0, 0, 2, "1002")]
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=8,
+        speed=1e9,
+        status_events=True,
+        drain_timeout_s=0.3,
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="chained-stop")
+    await settle()
+
+    before = time.monotonic()
+    await pb.stop()
+    assert pb.status()["state"] == "stopped"
+    assert time.monotonic() - before < 5.0
+
+    lines = run_log_lines(tmp_path, pb)
+    assert [line["seq"] for line in lines] == list(range(len(lines)))
+    event_lines = [line for line in lines if line["kind"] == "status_event"]
+    # one line per dispatched event, sent or cancelled
+    assert len(event_lines) == pb.status()["events_sent"]
+    assert all(
+        line.get("error") == "cancelled" or line.get("http_status") == 201 for line in event_lines
+    )
+
+
 async def test_refused_parked_and_failed_orders_skip_their_events(tmp_path: Path) -> None:
     """Only accepted orders move through the kitchen; every scheduled
     event of the others still gets its line, with the reason."""
