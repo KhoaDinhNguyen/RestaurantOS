@@ -421,10 +421,11 @@ async def test_publish_menu_rejects_unknown_explicit_product(
     product_cursor.fetchone.return_value = None
 
     connection.execute.side_effect = [
-        AsyncMock(),
-        version_cursor,
-        vendor_cursor,
-        product_cursor,
+        AsyncMock(),  # LOCK
+        version_cursor,  # SELECT next version
+        AsyncMock(),  # INSERT menu_versions
+        vendor_cursor,  # vendor lookup
+        product_cursor,  # explicit product lookup
     ]
 
     async def fake_run_on(pool, work, **kwargs):
@@ -448,3 +449,11 @@ async def test_publish_menu_rejects_unknown_explicit_product(
 
     with pytest.raises(MenuNotFoundError):
         await publish_menu(object(), request)
+
+    assert connection.execute.await_count == 5
+
+    product_call = connection.execute.await_args_list[4]
+    assert product_call.args[1] == {
+        "vendor_id": "v001",
+        "product_id": "missing",
+    }

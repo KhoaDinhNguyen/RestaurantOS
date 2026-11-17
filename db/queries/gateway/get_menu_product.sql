@@ -10,4 +10,5 @@ INNER JOIN product_dish AS pd
         AND p.product_id = pd.product_id
 WHERE
     p.vendor_id = %(vendor_id)s  -- noqa: RF02
-    AND p.product_id = %(product_id)s;  -- noqa: RF02
+    AND p.product_id = %(product_id)s  -- noqa: RF02
+    AND p.origin = 'hq';

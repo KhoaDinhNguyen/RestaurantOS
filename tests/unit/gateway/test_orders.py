@@ -279,7 +279,15 @@ async def test_get_vendor_orders(monkeypatch) -> None:
 
     items_cursor = AsyncMock()
     items_cursor.fetchall.return_value = [
-        (1, "p003", "Menu item 003", 1, 4),
+        (
+            14,
+            order_id,
+            1,
+            "p003",
+            "Menu item 003",
+            1,
+            4,
+        ),
     ]
 
     connection.execute.side_effect = [
@@ -325,3 +333,106 @@ async def test_get_vendor_orders(monkeypatch) -> None:
             ],
         }
     ]
+
+
+async def test_get_vendor_orders_fetches_items_in_bulk(monkeypatch) -> None:
+    first_order = uuid4()
+    second_order = uuid4()
+    order_time = datetime.strptime("12:03:29", "%H:%M:%S").time()
+    changed_at = datetime(2026, 11, 15, 12, 4, tzinfo=UTC)
+
+    connection = AsyncMock()
+
+    orders_cursor = AsyncMock()
+    orders_cursor.fetchall.return_value = [
+        (
+            first_order,
+            14,
+            order_time,
+            "v001",
+            "customer-1",
+            "dhrd",
+            "accepted",
+            changed_at,
+            1,
+            changed_at,
+            changed_at,
+        ),
+        (
+            second_order,
+            14,
+            order_time,
+            "v001",
+            "customer-2",
+            "dhrd",
+            "preparing",
+            changed_at,
+            1,
+            changed_at,
+            changed_at,
+        ),
+    ]
+
+    items_cursor = AsyncMock()
+    items_cursor.fetchall.return_value = [
+        (14, first_order, 1, "p001", "First item", 1, 4),
+        (14, first_order, 2, "p002", "Second item", 2, 5),
+        (14, second_order, 1, "p003", "Third item", 1, 6),
+    ]
+
+    connection.execute.side_effect = [
+        orders_cursor,
+        items_cursor,
+    ]
+
+    async def fake_run_on(pool, work, **kwargs):
+        return await work(connection)
+
+    monkeypatch.setattr(orders, "run_on", fake_run_on)
+
+    result = await orders.get_vendor_orders(
+        object(),
+        "v001",
+        14,
+        None,
+        "r1",
+    )
+
+    assert connection.execute.await_count == 2
+
+    assert [item["line_no"] for item in result[0]["items"]] == [1, 2]
+    assert result[1]["items"] == [
+        {
+            "line_no": 1,
+            "product_id": "p003",
+            "name": "Third item",
+            "quantity": 1,
+            "price_units": 6,
+        }
+    ]
+
+
+async def test_get_vendor_orders_empty_board_skips_item_query(
+    monkeypatch,
+) -> None:
+    connection = AsyncMock()
+
+    orders_cursor = AsyncMock()
+    orders_cursor.fetchall.return_value = []
+    connection.execute.return_value = orders_cursor
+
+    async def fake_run_on(pool, work, **kwargs):
+        return await work(connection)
+
+    monkeypatch.setattr(orders, "run_on", fake_run_on)
+
+    result = await orders.get_vendor_orders(
+        object(),
+        "v001",
+        14,
+        None,
+        "r1",
+    )
+
+    assert result == []
+    assert connection.execute.await_count == 1

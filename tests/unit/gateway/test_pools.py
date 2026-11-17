@@ -129,3 +129,40 @@ async def test_region_pool_drop_closes_and_forgets_pool(monkeypatch) -> None:
     first_pool.close.assert_awaited_once()
     first_pool.open.assert_awaited_once()
     second_pool.open.assert_awaited_once()
+
+
+async def test_drop_if_same_does_not_drop_replacement_pool() -> None:
+    manager = object.__new__(pools.RegionPools)
+
+    old_pool = AsyncMock()
+    replacement_pool = AsyncMock()
+
+    manager._pools = {
+        "r1-primary": replacement_pool,
+    }
+
+    await manager.drop_if_same(
+        "r1-primary",
+        old_pool,
+    )
+
+    assert manager._pools["r1-primary"] is replacement_pool
+    old_pool.close.assert_not_awaited()
+    replacement_pool.close.assert_not_awaited()
+
+
+async def test_drop_if_same_drops_matching_pool() -> None:
+    manager = object.__new__(pools.RegionPools)
+
+    pool = AsyncMock()
+    manager._pools = {
+        "r1-primary": pool,
+    }
+
+    await manager.drop_if_same(
+        "r1-primary",
+        pool,
+    )
+
+    assert "r1-primary" not in manager._pools
+    pool.close.assert_awaited_once_with()

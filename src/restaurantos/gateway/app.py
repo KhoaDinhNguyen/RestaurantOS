@@ -25,6 +25,7 @@ from restaurantos.gateway.errors import (
     DishLinkFixedError,
     HQUnreachableError,
     MenuNotFoundError,
+    MenuValidationError,
     ProductExistsError,
 )
 from restaurantos.gateway.menu import get_vendor_menu
@@ -56,7 +57,11 @@ async def refresh_directory_periodically(
     """Refresh the Gateway shard directory on its configured interval."""
     while True:
         await asyncio.sleep(interval_s)
-        await directory.refresh(hq_pool)
+
+        try:
+            await directory.refresh(hq_pool)
+        except RegionUnreachableError:
+            continue
 
 
 async def refresh_edge_primary_periodically(
@@ -226,6 +231,16 @@ def create_app() -> FastAPI:
             content={"error": "not_found"},
         )
 
+    @app.exception_handler(MenuValidationError)
+    async def menu_validation_handler(
+        request: Request,
+        exc: MenuValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "invalid_request"},
+        )
+
     @app.exception_handler(ProductExistsError)
     async def product_exists_handler(
         request: Request,
@@ -301,9 +316,7 @@ def create_app() -> FastAPI:
 
         # The edge has no HQ directory. Its local vendors table is its ownership
         # boundary, so a cell with no local vendors simply produces an empty list.
-        async def work():
-            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
-
+        async def work(pool):
             return await search_vendors(
                 pool,
                 geohash,
@@ -375,9 +388,7 @@ def create_app() -> FastAPI:
         if region_id is None:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
 
-        async def work():
-            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
-
+        async def work(pool):
             return await search_dishes(
                 pool,
                 q,
@@ -400,9 +411,7 @@ def create_app() -> FastAPI:
         if region_id is None:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
 
-        async def work():
-            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
-
+        async def work(pool):
             return await get_dish(
                 pool,
                 dish_id,
@@ -446,9 +455,7 @@ def create_app() -> FastAPI:
         if region_id is None:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
 
-        async def work():
-            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
-
+        async def work(pool):
             return await get_vendor_stock(
                 pool,
                 vendor_id,
@@ -484,9 +491,7 @@ def create_app() -> FastAPI:
         if region_id is None:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
 
-        async def work():
-            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
-
+        async def work(pool):
             return await get_vendor_menu(
                 pool,
                 vendor_id,
@@ -554,9 +559,7 @@ def create_app() -> FastAPI:
         if region_id is None:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
 
-        async def work():
-            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
-
+        async def work(pool):
             return await get_order_status(
                 pool,
                 vendor_id,
@@ -604,8 +607,14 @@ def create_app() -> FastAPI:
         if region_id is None:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
 
-        async def work():
-            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+        async def work(pool):
+            return await get_vendor_orders(
+                pool,
+                vendor_id,
+                day,
+                statuses,
+                region_id,
+            )
 
             return await get_vendor_orders(
                 pool,
@@ -661,8 +670,12 @@ def create_app() -> FastAPI:
                 content={"error": "not_found"},
             )
 
-        async def work():
-            pool = await request.app.state.edge_primary.get_pool(request.app.state.region_pools)
+        async def work(pool):
+            return await get_region_summary(
+                pool,
+                region_id,
+                day,
+            )
 
             return await get_region_summary(
                 pool,

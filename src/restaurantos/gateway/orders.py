@@ -212,15 +212,38 @@ async def get_vendor_orders(
         )
         rows = await cursor.fetchall()
 
+        if not rows:
+            return []
+
+        order_ids = [row[0] for row in rows]
+
+        items_cursor = await conn.execute(
+            load_query("gateway/get_order_items_bulk"),
+            {
+                "vendor_id": vendor_id,
+                "order_day": day,
+                "order_ids": order_ids,
+            },
+        )
+        item_rows = await items_cursor.fetchall()
+
+        items_by_order: dict[tuple[object, object], list[dict[str, object]]] = {}
+
+        for item in item_rows:
+            key = (item[0], item[1])
+            items_by_order.setdefault(key, []).append(
+                {
+                    "line_no": item[2],
+                    "product_id": item[3],
+                    "name": item[4],
+                    "quantity": item[5],
+                    "price_units": item[6],
+                }
+            )
+
         result = []
 
         for row in rows:
-            items = await get_order_items(
-                conn,
-                row[1],
-                row[0],
-            )
-
             result.append(
                 {
                     "order_id": row[0],
@@ -234,7 +257,7 @@ async def get_vendor_orders(
                     "menu_version": row[8],
                     "received_at": row[9],
                     "committed_at": row[10],
-                    "items": items,
+                    "items": items_by_order.get((row[1], row[0]), []),
                 }
             )
 

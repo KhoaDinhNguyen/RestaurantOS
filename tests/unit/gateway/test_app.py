@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi.testclient import TestClient
 
+from restaurantos.common.errors import RegionUnreachableError
 from restaurantos.gateway.app import create_app
 
 
@@ -650,6 +651,40 @@ async def test_periodic_directory_refresh(monkeypatch) -> None:
     directory.refresh.assert_awaited_once_with(hq_pool)
 
 
+async def test_periodic_directory_refresh_survives_hq_outage(
+    monkeypatch,
+) -> None:
+    from restaurantos.gateway import app as gateway_app
+
+    directory = AsyncMock()
+    directory.refresh.side_effect = [
+        RegionUnreachableError(),
+        None,
+    ]
+    hq_pool = object()
+    sleeps = 0
+
+    async def fake_sleep(delay):
+        nonlocal sleeps
+        sleeps += 1
+
+        assert delay == 5.0
+
+        if sleeps > 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(gateway_app.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await gateway_app.refresh_directory_periodically(
+            directory,
+            hq_pool,
+            5.0,
+        )
+
+    assert directory.refresh.await_count == 2
+
+
 async def test_periodic_edge_primary_refresh(monkeypatch) -> None:
     from restaurantos.gateway import app as gateway_app
 
@@ -752,10 +787,13 @@ def test_edge_vendor_menu_uses_local_primary(monkeypatch) -> None:
     app = gateway_app.create_app()
 
     edge_primary = AsyncMock()
-    edge_primary.get_pool.return_value = "edge-pool"
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
 
     app.state.edge_primary = edge_primary
-    app.state.region_pools = AsyncMock()
+    app.state.region_pools = region_pools
 
     client = TestClient(app)
     response = client.get("/api/v1/vendors/v001/menu")
@@ -763,12 +801,11 @@ def test_edge_vendor_menu_uses_local_primary(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()[0]["product_id"] == "p003"
 
-    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+    region_pools.get.assert_awaited_once_with("r1-primary")
 
 
 def test_edge_vendor_menu_returns_503_without_primary(monkeypatch) -> None:
     from restaurantos.common.config import Settings
-    from restaurantos.common.errors import RegionUnreachableError
     from restaurantos.gateway import app as gateway_app
 
     edge_settings = Settings(
@@ -787,12 +824,16 @@ def test_edge_vendor_menu_returns_503_without_primary(monkeypatch) -> None:
     app = gateway_app.create_app()
 
     edge_primary = AsyncMock()
-    edge_primary.get_pool.side_effect = RegionUnreachableError(region_id="r1")
+    edge_primary.current = None
+    edge_primary.region_id = "r1"
+
+    region_pools = AsyncMock()
 
     app.state.edge_primary = edge_primary
-    app.state.region_pools = AsyncMock()
+    app.state.region_pools = region_pools
 
     client = TestClient(app)
+
     response = client.get("/api/v1/vendors/v001/menu")
 
     assert response.status_code == 503
@@ -800,6 +841,8 @@ def test_edge_vendor_menu_returns_503_without_primary(monkeypatch) -> None:
         "error": "region_unreachable",
         "region_id": "r1",
     }
+
+    region_pools.get.assert_not_awaited()
 
 
 def test_edge_summary_rejects_other_region(monkeypatch) -> None:
@@ -880,10 +923,13 @@ def test_edge_summary_uses_local_primary(monkeypatch) -> None:
     app = gateway_app.create_app()
 
     edge_primary = AsyncMock()
-    edge_primary.get_pool.return_value = "edge-pool"
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
 
     app.state.edge_primary = edge_primary
-    app.state.region_pools = AsyncMock()
+    app.state.region_pools = region_pools
 
     client = TestClient(app)
     response = client.get("/api/v1/regions/r1/summary?day=14")
@@ -892,7 +938,7 @@ def test_edge_summary_uses_local_primary(monkeypatch) -> None:
     assert response.json()["region_id"] == "r1"
     assert response.json()["orders"]["total"] == 3
 
-    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+    region_pools.get.assert_awaited_once_with("r1-primary")
 
 
 def test_edge_menu_refreshes_primary_after_database_error(monkeypatch) -> None:
@@ -1187,10 +1233,13 @@ def test_edge_vendor_search_uses_local_region(monkeypatch) -> None:
     app = gateway_app.create_app()
 
     edge_primary = AsyncMock()
-    edge_primary.get_pool.return_value = "edge-pool"
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
 
     app.state.edge_primary = edge_primary
-    app.state.region_pools = AsyncMock()
+    app.state.region_pools = region_pools
 
     client = TestClient(app)
 
@@ -1199,7 +1248,7 @@ def test_edge_vendor_search_uses_local_region(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()[0]["vendor_id"] == "v001"
 
-    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+    region_pools.get.assert_awaited_once_with("r1-primary")
 
 
 def test_vendor_stock_routes_to_region_primary(monkeypatch) -> None:
@@ -1294,10 +1343,13 @@ def test_edge_vendor_stock_uses_local_primary(monkeypatch) -> None:
     app = gateway_app.create_app()
 
     edge_primary = AsyncMock()
-    edge_primary.get_pool.return_value = "edge-pool"
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
 
     app.state.edge_primary = edge_primary
-    app.state.region_pools = AsyncMock()
+    app.state.region_pools = region_pools
 
     client = TestClient(app)
 
@@ -1306,7 +1358,7 @@ def test_edge_vendor_stock_uses_local_primary(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json() == []
 
-    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+    region_pools.get.assert_awaited_once_with("r1-primary")
 
 
 def test_hq_unreachable_returns_503(monkeypatch) -> None:
@@ -1455,10 +1507,13 @@ def test_edge_dish_search_uses_local_primary(monkeypatch) -> None:
     app = gateway_app.create_app()
 
     edge_primary = AsyncMock()
-    edge_primary.get_pool.return_value = "edge-pool"
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
 
     app.state.edge_primary = edge_primary
-    app.state.region_pools = AsyncMock()
+    app.state.region_pools = region_pools
 
     client = TestClient(app)
 
@@ -1467,7 +1522,7 @@ def test_edge_dish_search_uses_local_primary(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()[0]["dish_id"] == "d001"
 
-    edge_primary.get_pool.assert_awaited_once_with(app.state.region_pools)
+    region_pools.get.assert_awaited_once_with("r1-primary")
 
 
 def test_publish_menu_products_returns_202(monkeypatch) -> None:

@@ -6,4 +6,5 @@ SET
     menu_version = %(menu_version)s
 WHERE
     vendor_id = %(vendor_id)s  -- noqa: RF02
-    AND product_id = %(product_id)s;  -- noqa: RF02
+    AND product_id = %(product_id)s  -- noqa: RF02
+    AND origin = 'hq';

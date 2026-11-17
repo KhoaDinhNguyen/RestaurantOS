@@ -109,8 +109,11 @@ async def test_run_edge_refreshes_after_region_unreachable() -> None:
     primary.current = "r1-primary"
 
     pools = AsyncMock()
+    failed_pool = object()
+    pools.get.return_value = failed_pool
 
-    async def work():
+    async def work(pool):
+        assert pool is failed_pool
         raise RegionUnreachableError(region_id="r1")
 
     with pytest.raises(RegionUnreachableError):
@@ -120,7 +123,11 @@ async def test_run_edge_refreshes_after_region_unreachable() -> None:
             work,
         )
 
-    pools.drop.assert_awaited_once_with("r1-primary")
+    pools.get.assert_awaited_once_with("r1-primary")
+    pools.drop_if_same.assert_awaited_once_with(
+        "r1-primary",
+        failed_pool,
+    )
     primary.refresh.assert_awaited_once_with()
 
 
@@ -131,8 +138,11 @@ async def test_run_edge_refreshes_after_stale_epoch() -> None:
     primary.current = "r1-primary"
 
     pools = AsyncMock()
+    failed_pool = object()
+    pools.get.return_value = failed_pool
 
-    async def work():
+    async def work(pool):
+        assert pool is failed_pool
         raise StaleEpochError()
 
     with pytest.raises(StaleEpochError):
@@ -142,7 +152,11 @@ async def test_run_edge_refreshes_after_stale_epoch() -> None:
             work,
         )
 
-    pools.drop.assert_awaited_once_with("r1-primary")
+    pools.get.assert_awaited_once_with("r1-primary")
+    pools.drop_if_same.assert_awaited_once_with(
+        "r1-primary",
+        failed_pool,
+    )
     primary.refresh.assert_awaited_once_with()
 
 
@@ -151,8 +165,11 @@ async def test_run_edge_does_not_refresh_after_success() -> None:
     primary.current = "r1-primary"
 
     pools = AsyncMock()
+    expected_pool = object()
+    pools.get.return_value = expected_pool
 
-    async def work():
+    async def work(pool):
+        assert pool is expected_pool
         return "ok"
 
     result = await edge.run_edge(
@@ -162,5 +179,6 @@ async def test_run_edge_does_not_refresh_after_success() -> None:
     )
 
     assert result == "ok"
-    pools.drop.assert_not_awaited()
+    pools.get.assert_awaited_once_with("r1-primary")
+    pools.drop_if_same.assert_not_awaited()
     primary.refresh.assert_not_awaited()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 
 from psycopg_pool import AsyncConnectionPool
@@ -26,16 +27,18 @@ class EdgePrimary:
         self.region_id = region_id
         self.settings = settings
         self.current: str | None = None
+        self._refresh_lock = asyncio.Lock()
 
     async def refresh(self) -> str | None:
         """Probe the local nodes and update the current primary."""
-        self.current = await find_local_primary(
-            self.cluster,
-            self.region_id,
-            self.current,
-            self.settings,
-        )
-        return self.current
+        async with self._refresh_lock:
+            self.current = await find_local_primary(
+                self.cluster,
+                self.region_id,
+                self.current,
+                self.settings,
+            )
+            return self.current
 
     async def get_pool(
         self,
@@ -51,16 +54,18 @@ class EdgePrimary:
 async def run_edge[T](
     primary: EdgePrimary,
     pools: RegionPools,
-    work: Callable[[], Awaitable[T]],
+    work: Callable[[AsyncConnectionPool], Awaitable[T]],
 ) -> T:
     """Run edge work and re-probe immediately after a database routing error."""
+    if primary.current is None:
+        raise RegionUnreachableError(region_id=primary.region_id)
+
+    node = primary.current
+    pool = await pools.get(node)
+
     try:
-        return await work()
+        return await work(pool)
     except RegionUnreachableError, StaleEpochError:
-        failed_node = primary.current
-
-        if failed_node is not None:
-            await pools.drop(failed_node)
-
+        await pools.drop_if_same(node, pool)
         await primary.refresh()
         raise

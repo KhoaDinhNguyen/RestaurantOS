@@ -20,7 +20,7 @@ async def get_vendor_stock(
 
     async def work(conn) -> list[dict[str, Any]]:
         vendor_cursor = await conn.execute(
-            "SELECT 1 FROM vendors WHERE vendor_id = %(vendor_id)s",
+            load_query("gateway/vendor_exists"),
             {"vendor_id": vendor_id},
         )
 
