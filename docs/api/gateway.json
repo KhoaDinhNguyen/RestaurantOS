@@ -289,6 +289,47 @@
                 }
             }
         },
+        "/api/v1/vendors/{vendor_id}/restock": {
+            "post": {
+                "summary": "Restock Vendor",
+                "operationId": "restock_vendor_api_v1_vendors__vendor_id__restock_post",
+                "parameters": [
+                    {
+                        "name": "vendor_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Vendor Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response Restock Vendor Api V1 Vendors  Vendor Id  Restock Post"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/vendors/{vendor_id}/menu": {
             "get": {
                 "summary": "Vendor Menu",
@@ -386,6 +427,71 @@
                                 }
                             }
                         }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/vendors/{vendor_id}/orders/{order_id}/status": {
+            "post": {
+                "summary": "Change Order Status",
+                "operationId": "change_order_status_api_v1_vendors__vendor_id__orders__order_id__status_post",
+                "parameters": [
+                    {
+                        "name": "vendor_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Vendor Id"
+                        }
+                    },
+                    {
+                        "name": "order_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "format": "uuid",
+                            "title": "Order Id"
+                        }
+                    }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/StatusChangeRequest"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/StatusResult"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Vendor or order not found."
+                    },
+                    "409": {
+                        "description": "Status change conflicts with the current state."
                     },
                     "422": {
                         "description": "Validation Error",
@@ -655,10 +761,84 @@
                     }
                 }
             }
+        },
+        "/api/v1/vendors/{vendor_id}/products/{product_id}/availability": {
+            "put": {
+                "summary": "Update Product Availability",
+                "operationId": "update_product_availability_api_v1_vendors__vendor_id__products__product_id__availability_put",
+                "parameters": [
+                    {
+                        "name": "vendor_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Vendor Id"
+                        }
+                    },
+                    {
+                        "name": "product_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Product Id"
+                        }
+                    }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/AvailabilityRequest"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response Update Product Availability Api V1 Vendors  Vendor Id  Products  Product Id  Availability Put"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     },
     "components": {
         "schemas": {
+            "AvailabilityRequest": {
+                "properties": {
+                    "available": {
+                        "type": "boolean",
+                        "title": "Available"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "available"
+                ],
+                "title": "AvailabilityRequest",
+                "description": "Manual product availability change."
+            },
             "HTTPValidationError": {
                 "properties": {
                     "detail": {
@@ -1045,6 +1225,61 @@
                     "unknown_product"
                 ],
                 "title": "RefusalReason"
+            },
+            "StatusChangeRequest": {
+                "properties": {
+                    "event_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Event Id"
+                    },
+                    "to_status": {
+                        "$ref": "#/components/schemas/OrderStatus"
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "event_id",
+                    "to_status"
+                ],
+                "title": "StatusChangeRequest",
+                "description": "Body of POST /vendors/{vendor_id}/orders/{order_id}/status."
+            },
+            "StatusResult": {
+                "properties": {
+                    "order_id": {
+                        "type": "string",
+                        "format": "uuid",
+                        "title": "Order Id"
+                    },
+                    "status": {
+                        "$ref": "#/components/schemas/OrderStatus"
+                    },
+                    "applied": {
+                        "type": "boolean",
+                        "title": "Applied"
+                    },
+                    "duplicate": {
+                        "type": "boolean",
+                        "title": "Duplicate",
+                        "default": false
+                    },
+                    "conflict": {
+                        "type": "boolean",
+                        "title": "Conflict",
+                        "default": false
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "order_id",
+                    "status",
+                    "applied"
+                ],
+                "title": "StatusResult",
+                "description": "What region.change_status returns."
             },
             "ValidationError": {
                 "properties": {

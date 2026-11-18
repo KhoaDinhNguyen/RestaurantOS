@@ -436,3 +436,80 @@ async def test_get_vendor_orders_empty_board_skips_item_query(
 
     assert result == []
     assert connection.execute.await_count == 1
+
+
+async def test_change_region_order_status(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from restaurantos.common.models import (
+        OrderStatus,
+        StatusChangeRequest,
+        StatusResult,
+    )
+
+    order_id = uuid4()
+    event_id = uuid4()
+    connection = AsyncMock()
+
+    async def fake_change_status(
+        conn,
+        vendor_id,
+        requested_order_id,
+        requested_event_id,
+        to_status,
+        epoch,
+    ):
+        assert conn is connection
+        assert vendor_id == "v001"
+        assert requested_order_id == order_id
+        assert requested_event_id == event_id
+        assert to_status == OrderStatus.ACCEPTED
+        assert epoch == 3
+
+        return StatusResult(
+            order_id=order_id,
+            status=OrderStatus.ACCEPTED,
+            applied=True,
+        )
+
+    async def fake_run_on(pool, work, **kwargs):
+        assert kwargs["region_id"] == "r1"
+        return await work(connection)
+
+    monkeypatch.setattr(orders, "run_on", fake_run_on)
+
+    result = await orders.change_region_order_status(
+        object(),
+        "v001",
+        order_id,
+        StatusChangeRequest(
+            event_id=event_id,
+            to_status=OrderStatus.ACCEPTED,
+        ),
+        "r1",
+        3,
+        fake_change_status,
+    )
+
+    assert result.applied is True
+    assert result.status == OrderStatus.ACCEPTED
+
+
+async def test_read_region_epoch(monkeypatch) -> None:
+    connection = AsyncMock()
+    cursor = AsyncMock()
+    cursor.fetchone.return_value = (4,)
+    connection.execute.return_value = cursor
+
+    async def fake_run_on(pool, work, **kwargs):
+        assert kwargs["region_id"] == "r1"
+        return await work(connection)
+
+    monkeypatch.setattr(orders, "run_on", fake_run_on)
+
+    result = await orders.read_region_epoch(
+        object(),
+        "r1",
+    )
+
+    assert result == 4

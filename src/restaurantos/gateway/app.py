@@ -7,6 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from restaurantos.common.cluster import HQ_PRIMARY, load_cluster
 from restaurantos.common.config import get_settings
@@ -16,7 +17,14 @@ from restaurantos.common.errors import (
     StaleEpochError,
     UnknownVendorError,
 )
-from restaurantos.common.models import OrderRequest, OrderResponse, OrderStatus
+from restaurantos.common.models import (
+    OrderRequest,
+    OrderResponse,
+    OrderStatus,
+    StatusChangeRequest,
+    StatusResult,
+)
+from restaurantos.gateway.availability import set_region_availability
 from restaurantos.gateway.config import get_gateway_settings
 from restaurantos.gateway.directory import DirectoryCache, get_regions
 from restaurantos.gateway.dishes import get_dish, search_dishes
@@ -35,6 +43,7 @@ from restaurantos.gateway.menu_publish import (
     publish_menu,
 )
 from restaurantos.gateway.orders import (
+    change_region_order_status,
     get_order_status,
     get_vendor_orders,
     order_response,
@@ -42,11 +51,19 @@ from restaurantos.gateway.orders import (
     park_order,
     place_region_order,
     queued_order_response,
+    read_region_epoch,
 )
 from restaurantos.gateway.pools import RegionPools
+from restaurantos.gateway.restock import restock_region_vendor
 from restaurantos.gateway.stock import get_vendor_stock
 from restaurantos.gateway.summary import get_region_summary
 from restaurantos.gateway.vendors import search_vendors
+from restaurantos.region import (
+    change_status,
+    place_order,
+    restock,
+    set_availability,
+)
 
 
 async def refresh_directory_periodically(
@@ -97,6 +114,12 @@ async def run_hq(work):
         return await work()
     except RegionUnreachableError as exc:
         raise HQUnreachableError() from exc
+
+
+class AvailabilityRequest(BaseModel):
+    """Manual product availability change."""
+
+    available: bool
 
 
 def create_app() -> FastAPI:
@@ -264,14 +287,6 @@ def create_app() -> FastAPI:
             status_code=409,
             content={"error": "dish_link_fixed"},
         )
-
-    def get_place_order():
-        place_order = getattr(app.state, "place_order", None)
-
-        if place_order is None:
-            raise RuntimeError("restaurantos.region.place_order is not available yet")
-
-        return place_order
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -457,6 +472,79 @@ def create_app() -> FastAPI:
             work,
         )
 
+    @gateway.post("/vendors/{vendor_id}/restock")
+    async def restock_vendor(
+        vendor_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        route = request.app.state.directory.route_vendor(vendor_id)
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        try:
+            result = await restock_region_vendor(
+                pool,
+                vendor_id,
+                route.region_id,
+                route.epoch,
+                restock,
+            )
+        except StaleEpochError:
+            await request.app.state.directory.refresh(request.app.state.hq_pool)
+
+            route = request.app.state.directory.route_vendor(vendor_id)
+            pool = await request.app.state.region_pools.get(route.primary_node)
+
+            result = await restock_region_vendor(
+                pool,
+                vendor_id,
+                route.region_id,
+                route.epoch,
+                restock,
+            )
+
+        return {
+            "vendor_id": vendor_id,
+            "region_id": route.region_id,
+            "counters_restocked": result.counters_restocked,
+            "products_back_on": result.products_back_on,
+        }
+
+    @edge.post("/vendors/{vendor_id}/restock")
+    async def edge_restock_vendor(
+        vendor_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work(pool):
+            epoch = await read_region_epoch(
+                pool,
+                region_id,
+            )
+
+            result = await restock_region_vendor(
+                pool,
+                vendor_id,
+                region_id,
+                epoch,
+                restock,
+            )
+
+            return {
+                "vendor_id": vendor_id,
+                "region_id": region_id,
+                "counters_restocked": result.counters_restocked,
+                "products_back_on": result.products_back_on,
+            }
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
+
     @gateway.get("/vendors/{vendor_id}/menu")
     async def vendor_menu(
         vendor_id: str,
@@ -537,6 +625,57 @@ def create_app() -> FastAPI:
             day=day,
         )
 
+    @gateway.post(
+        "/vendors/{vendor_id}/orders/{order_id}/status",
+        response_model=StatusResult,
+        responses={
+            404: {"description": "Vendor or order not found."},
+            409: {"description": "Status change conflicts with the current state."},
+        },
+    )
+    async def change_order_status(
+        vendor_id: str,
+        order_id: UUID,
+        body: StatusChangeRequest,
+        request: Request,
+    ):
+        route = request.app.state.directory.route_vendor(vendor_id)
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        try:
+            result = await change_region_order_status(
+                pool,
+                vendor_id,
+                order_id,
+                body,
+                route.region_id,
+                route.epoch,
+                change_status,
+            )
+        except StaleEpochError:
+            await request.app.state.directory.refresh(request.app.state.hq_pool)
+
+            route = request.app.state.directory.route_vendor(vendor_id)
+            pool = await request.app.state.region_pools.get(route.primary_node)
+
+            result = await change_region_order_status(
+                pool,
+                vendor_id,
+                order_id,
+                body,
+                route.region_id,
+                route.epoch,
+                change_status,
+            )
+
+        if result.conflict:
+            return JSONResponse(
+                status_code=409,
+                content=result.model_dump(mode="json"),
+            )
+
+        return result
+
     @edge.get("/vendors/{vendor_id}/orders/{order_id}")
     async def edge_order_status(
         vendor_id: str,
@@ -556,6 +695,54 @@ def create_app() -> FastAPI:
                 region_id,
                 day=day,
             )
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
+
+    @edge.post(
+        "/vendors/{vendor_id}/orders/{order_id}/status",
+        response_model=StatusResult,
+        responses={
+            404: {"description": "Vendor or order not found."},
+            409: {"description": "Status change conflicts with the current state."},
+        },
+    )
+    async def edge_change_order_status(
+        vendor_id: str,
+        order_id: UUID,
+        body: StatusChangeRequest,
+        request: Request,
+    ):
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work(pool):
+            epoch = await read_region_epoch(
+                pool,
+                region_id,
+            )
+
+            result = await change_region_order_status(
+                pool,
+                vendor_id,
+                order_id,
+                body,
+                region_id,
+                epoch,
+                change_status,
+            )
+
+            if result.conflict:
+                return JSONResponse(
+                    status_code=409,
+                    content=result.model_dump(mode="json"),
+                )
+
+            return result
 
         return await run_edge(
             request.app.state.edge_primary,
@@ -597,14 +784,6 @@ def create_app() -> FastAPI:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
 
         async def work(pool):
-            return await get_vendor_orders(
-                pool,
-                vendor_id,
-                day,
-                statuses,
-                region_id,
-            )
-
             return await get_vendor_orders(
                 pool,
                 vendor_id,
@@ -666,12 +845,6 @@ def create_app() -> FastAPI:
                 day,
             )
 
-            return await get_region_summary(
-                pool,
-                region_id,
-                day,
-            )
-
         return await run_edge(
             request.app.state.edge_primary,
             request.app.state.region_pools,
@@ -705,7 +878,6 @@ def create_app() -> FastAPI:
 
         route = request.app.state.directory.route_vendor(order.vendor_id)
         pool = await request.app.state.region_pools.get(route.primary_node)
-        place_order = get_place_order()
 
         try:
             try:
@@ -804,6 +976,93 @@ def create_app() -> FastAPI:
             )
 
         return await run_hq(work)
+
+    @gateway.put(
+        "/vendors/{vendor_id}/products/{product_id}/availability",
+    )
+    async def update_product_availability(
+        vendor_id: str,
+        product_id: str,
+        body: AvailabilityRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        route = request.app.state.directory.route_vendor(vendor_id)
+        pool = await request.app.state.region_pools.get(route.primary_node)
+
+        try:
+            state = await set_region_availability(
+                pool,
+                vendor_id,
+                product_id,
+                body.available,
+                route.region_id,
+                route.epoch,
+                set_availability,
+            )
+        except StaleEpochError:
+            await request.app.state.directory.refresh(request.app.state.hq_pool)
+
+            route = request.app.state.directory.route_vendor(vendor_id)
+            pool = await request.app.state.region_pools.get(route.primary_node)
+
+            state = await set_region_availability(
+                pool,
+                vendor_id,
+                product_id,
+                body.available,
+                route.region_id,
+                route.epoch,
+                set_availability,
+            )
+
+        return {
+            "vendor_id": vendor_id,
+            "product_id": product_id,
+            "available": state.available,
+            "reason": state.reason,
+        }
+
+    @edge.put(
+        "/vendors/{vendor_id}/products/{product_id}/availability",
+    )
+    async def edge_update_product_availability(
+        vendor_id: str,
+        product_id: str,
+        body: AvailabilityRequest,
+        request: Request,
+    ) -> dict[str, object]:
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work(pool):
+            epoch = await read_region_epoch(
+                pool,
+                region_id,
+            )
+
+            state = await set_region_availability(
+                pool,
+                vendor_id,
+                product_id,
+                body.available,
+                region_id,
+                epoch,
+                set_availability,
+            )
+
+            return {
+                "vendor_id": vendor_id,
+                "product_id": product_id,
+                "available": state.available,
+                "reason": state.reason,
+            }
+
+        return await run_edge(
+            request.app.state.edge_primary,
+            request.app.state.region_pools,
+            work,
+        )
 
     if settings.mode == "gateway":
         app.include_router(gateway)
