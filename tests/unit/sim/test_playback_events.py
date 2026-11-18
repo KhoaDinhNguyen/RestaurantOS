@@ -268,8 +268,10 @@ async def test_one_orders_events_go_out_strictly_one_after_another(tmp_path: Pat
 
 async def test_stop_while_an_event_waits_for_its_predecessor(tmp_path: Path) -> None:
     """A stop while a chained event sits behind its held predecessor:
-    the run ends stopped, the waiting task is cancelled by the drain and
-    still writes its line, and the log stays dense - every dispatched
+    the run ends stopped, and the waiting task - caught while it
+    waited, before it ever took a slot - is cancelled by the drain and
+    still writes its line (review round 3, item 13 proves that with the
+    line's own fields), and the log stays dense - every dispatched
     event has exactly one line."""
     hold = expected_event_id("1001", "accepted")
     transport = HoldingEvent(hold)
@@ -284,7 +286,17 @@ async def test_stop_while_an_event_waits_for_its_predecessor(tmp_path: Path) -> 
         transport=transport,
     )
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="chained-stop")
-    await settle()
+    # wait, with a bound, until accepted is held on the wire and
+    # preparing has been dispatched behind it: heap items three and
+    # four are the two orders' preparing events, so four dispatches
+    # mean 1001's preparing is out too
+    for _ in range(200):
+        on_wire = {event_id for _status, event_id in transport.wire}
+        if expected_event_id("1001", "accepted") in on_wire and pb.status()["events_sent"] >= 4:
+            break
+        await settle(2)
+    else:
+        pytest.fail("preparing was never dispatched behind the held accepted")
 
     before = time.monotonic()
     try:
@@ -1267,7 +1279,12 @@ async def test_a_normal_end_waits_for_every_send(tmp_path: Path) -> None:
     """Review round 2, item 3: when the dispatcher finishes normally,
     the run waits for its last in-flight sends instead of cutting them
     off at the drain timeout - a completed run must not lose its tail
-    as `cancelled`."""
+    as `cancelled`.
+
+    Review round 3, item 12: the hold outlasts the engine's real
+    drain timeout - if the end still drained, the held event would be
+    cancelled by now - and the waits are bounded timers, never
+    open-ended."""
     hold = expected_event_id("1001", "picked_up")
     transport = HoldingEvent(hold)
     orders = [make_order(14, 0, 0, 1, "1001")]
@@ -1288,8 +1305,16 @@ async def test_a_normal_end_waits_for_every_send(tmp_path: Path) -> None:
     assert pb.status()["events_sent"] == 4
     assert pb.status()["state"] == "running"
 
-    transport.release.set()
-    await pb.wait_done()
+    # hold it well past the drain timeout (a bounded timer, not an
+    # open-ended wait): the run is still waiting, nothing was drained
+    await asyncio.wait_for(asyncio.sleep(0.5), 5)
+    assert pb.status()["state"] == "running"
+
+    try:
+        transport.release.set()
+        await asyncio.wait_for(pb.wait_done(), 5)
+    finally:
+        transport.release.set()  # never leave the held task behind
     status = pb.status()
     assert status["state"] == "done"
     assert status["events_acked"] == 4

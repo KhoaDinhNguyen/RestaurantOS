@@ -222,10 +222,21 @@ async def test_the_shortening_warning_survives_a_broken_stderr(tmp_path: Path) -
 async def test_the_clock_stands_still_when_paused_or_ended(tmp_path: Path):
     """API review 4.5: while paused, and after a run has ended (done or
     stopped), the clock stands at its last moment; simulated time must
-    not keep moving behind GET /sim/clock."""
+    not keep moving behind GET /sim/clock.
+
+    Review round 3, item 14: the snapshot pairs around pause and stop
+    are read without any clock advance in between and must match
+    exactly, and after a normal end the clock stands at the final
+    simulated instant - the last dispatched item's deadline, rounded
+    down to the second."""
     clock = FakeWallClock()
     pb = make_playback(sample_orders(6), tmp_path, clock=clock, inflight=4)
     from restaurantos.sim.control import make_control_app
+
+    def moment(snapshot: dict) -> dict:
+        # the simulated moment, without the run's state, which is the
+        # one field a pause or a stop is allowed to change
+        return {key: value for key, value in snapshot.items() if key != "state"}
 
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
@@ -233,14 +244,26 @@ async def test_the_clock_stands_still_when_paused_or_ended(tmp_path: Path):
         await client.post("/sim/playback", json={"action": "start", "from_day": 14, "speed": 100.0})
         await drive(pb, clock, steps=4)  # 20 simulated seconds in
 
+        before_pause = (await client.get("/sim/clock")).json()
         await client.post("/sim/playback", json={"action": "pause"})
-        frozen = (await client.get("/sim/clock")).json()
-        assert frozen["state"] == "paused"
+        after_pause = (await client.get("/sim/clock")).json()
+        assert after_pause["state"] == "paused"
+        assert moment(after_pause) == moment(before_pause)  # the pause moves nothing
+        frozen = after_pause
         await drive(pb, clock, steps=10)  # wall time moves; the clock must not
         assert (await client.get("/sim/clock")).json() == frozen
 
         await client.post("/sim/playback", json={"action": "resume"})
-        await drive(pb, clock)  # to the end
+        # fine steps to the end (0.001 wall = 0.1 simulated seconds), so
+        # the clock never overshoots the last deadline by a whole
+        # coarse step
+        from conftest import FINAL_STATES, settle
+
+        for _ in range(400):
+            if pb.status()["state"] in FINAL_STATES:
+                break
+            await clock.advance(clock.now() + 0.001)
+            await settle()
         assert pb.status()["state"] == "done"
         ended = (await client.get("/sim/clock")).json()
         assert ended["state"] == "done"
@@ -259,9 +282,12 @@ async def test_the_clock_stands_still_when_paused_or_ended(tmp_path: Path):
             json={"action": "start", "from_day": 14, "speed": 100.0, "run_id": "second"},
         )
         await drive(pb, clock, steps=2)
+        before_stop = (await client.get("/sim/clock")).json()
         stopped = (await client.post("/sim/playback", json={"action": "stop"})).json()
         assert stopped["state"] == "stopped"
-        halted = (await client.get("/sim/clock")).json()
+        after_stop = (await client.get("/sim/clock")).json()
+        assert moment(after_stop) == moment(before_stop)  # the stop moves nothing
+        halted = after_stop
         await clock.advance(clock.now() + 1.0)
         assert (await client.get("/sim/clock")).json() == halted
 
