@@ -114,11 +114,39 @@ async def place_region_order(
     )
 
 
+async def get_order_items(
+    conn: psycopg.AsyncConnection,
+    order_day: int,
+    order_id: UUID,
+) -> list[dict[str, object]]:
+    """Read an order's lines in display order."""
+    cursor = await conn.execute(
+        load_query("gateway/get_order_items"),
+        {
+            "order_day": order_day,
+            "order_id": order_id,
+        },
+    )
+    rows = await cursor.fetchall()
+
+    return [
+        {
+            "line_no": row[0],
+            "product_id": row[1],
+            "name": row[2],
+            "quantity": row[3],
+            "price_units": row[4],
+        }
+        for row in rows
+    ]
+
+
 async def get_order_status(
     pool: AsyncConnectionPool,
     vendor_id: str,
     order_id: UUID,
     region_id: str,
+    day: int | None = None,
 ) -> dict[str, object]:
     """Read an order's current status from its owning region."""
 
@@ -128,6 +156,7 @@ async def get_order_status(
             {
                 "vendor_id": vendor_id,
                 "order_id": order_id,
+                "day": day,
             },
         )
         row = await cursor.fetchone()
@@ -135,15 +164,25 @@ async def get_order_status(
         if row is None:
             raise UnknownVendorError(f"unknown order {order_id}")
 
+        items = await get_order_items(
+            conn,
+            row[1],
+            row[0],
+        )
+
         return {
             "order_id": row[0],
             "order_day": row[1],
-            "vendor_id": row[2],
-            "status": row[3],
-            "status_changed_at": row[4],
-            "menu_version": row[5],
-            "received_at": row[6],
-            "committed_at": row[7],
+            "order_time": row[2],
+            "vendor_id": row[3],
+            "customer_id": row[4],
+            "channel": row[5],
+            "status": row[6],
+            "status_changed_at": row[7],
+            "menu_version": row[8],
+            "received_at": row[9],
+            "committed_at": row[10],
+            "items": items,
         }
 
     return await run_on(
@@ -157,7 +196,7 @@ async def get_vendor_orders(
     pool: AsyncConnectionPool,
     vendor_id: str,
     day: int,
-    status: str | None,
+    statuses: list[str] | None,
     region_id: str,
 ) -> list[dict[str, object]]:
     """Read one vendor's kitchen board from its owning region."""
@@ -168,25 +207,61 @@ async def get_vendor_orders(
             {
                 "vendor_id": vendor_id,
                 "day": day,
-                "status": status,
+                "statuses": statuses,
             },
         )
         rows = await cursor.fetchall()
 
-        return [
+        if not rows:
+            return []
+
+        order_ids = [row[0] for row in rows]
+
+        items_cursor = await conn.execute(
+            load_query("gateway/get_order_items_bulk"),
             {
-                "order_id": row[0],
-                "order_day": row[1],
-                "vendor_id": row[2],
-                "status": row[3],
-                "order_time": row[4],
-                "status_changed_at": row[5],
-                "menu_version": row[6],
-                "received_at": row[7],
-                "committed_at": row[8],
-            }
-            for row in rows
-        ]
+                "vendor_id": vendor_id,
+                "order_day": day,
+                "order_ids": order_ids,
+            },
+        )
+        item_rows = await items_cursor.fetchall()
+
+        items_by_order: dict[tuple[object, object], list[dict[str, object]]] = {}
+
+        for item in item_rows:
+            key = (item[0], item[1])
+            items_by_order.setdefault(key, []).append(
+                {
+                    "line_no": item[2],
+                    "product_id": item[3],
+                    "name": item[4],
+                    "quantity": item[5],
+                    "price_units": item[6],
+                }
+            )
+
+        result = []
+
+        for row in rows:
+            result.append(
+                {
+                    "order_id": row[0],
+                    "order_day": row[1],
+                    "order_time": row[2],
+                    "vendor_id": row[3],
+                    "customer_id": row[4],
+                    "channel": row[5],
+                    "status": row[6],
+                    "status_changed_at": row[7],
+                    "menu_version": row[8],
+                    "received_at": row[9],
+                    "committed_at": row[10],
+                    "items": items_by_order.get((row[1], row[0]), []),
+                }
+            )
+
+        return result
 
     return await run_on(
         pool,

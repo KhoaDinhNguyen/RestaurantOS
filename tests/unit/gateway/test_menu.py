@@ -11,8 +11,8 @@ async def test_get_vendor_menu(monkeypatch) -> None:
     cursor = AsyncMock()
 
     cursor.fetchall.return_value = [
-        ("v001", "p003", "Menu item 003", 2, 1, None, True),
-        ("v001", "p006", "Menu item 006", 11, 1, "manual", False),
+        ("v001", "p003", "Menu item 003", 2, 1, "d001", None, True),
+        ("v001", "p006", "Menu item 006", 11, 1, "d002", "manual", False),
     ]
     connection.execute.return_value = cursor
 
@@ -35,6 +35,7 @@ async def test_get_vendor_menu(monkeypatch) -> None:
             "name": "Menu item 003",
             "price_units": 2,
             "menu_version": 1,
+            "dish_id": "d001",
             "reason": None,
             "available": True,
         },
@@ -44,6 +45,7 @@ async def test_get_vendor_menu(monkeypatch) -> None:
             "name": "Menu item 006",
             "price_units": 11,
             "menu_version": 1,
+            "dish_id": "d002",
             "reason": "manual",
             "available": False,
         },

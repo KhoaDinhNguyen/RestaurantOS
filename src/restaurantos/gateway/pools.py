@@ -12,9 +12,16 @@ from restaurantos.common.db import make_pool, node_conninfo
 class RegionPools:
     """Lazily create and reuse one pool per region database node."""
 
-    def __init__(self, cluster: Cluster, settings: Settings) -> None:
+    def __init__(
+        self,
+        cluster: Cluster,
+        settings: Settings,
+        *,
+        direct: bool = False,
+    ) -> None:
         self.cluster = cluster
         self.settings = settings
+        self.direct = direct
         self._pools: dict[str, AsyncConnectionPool] = {}
 
     async def get(self, node: str) -> AsyncConnectionPool:
@@ -26,6 +33,7 @@ class RegionPools:
                 node_conninfo(
                     self.cluster,
                     node,
+                    direct=self.direct,
                     settings=self.settings,
                 ),
                 self.settings,
@@ -34,6 +42,25 @@ class RegionPools:
             self._pools[node] = pool
 
         return pool
+
+    async def drop(self, node: str) -> None:
+        """Close and forget the cached pool for one node."""
+        pool = self._pools.pop(node, None)
+
+        if pool is not None:
+            await pool.close()
+
+    async def drop_if_same(
+        self,
+        node: str,
+        pool: AsyncConnectionPool,
+    ) -> None:
+        """Drop a pool only if it is still the cached instance for this node."""
+        if self._pools.get(node) is not pool:
+            return
+
+        self._pools.pop(node)
+        await pool.close()
 
     async def close(self) -> None:
         """Close every pool created by this manager."""
