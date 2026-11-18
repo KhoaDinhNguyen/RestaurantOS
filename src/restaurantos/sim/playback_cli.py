@@ -31,7 +31,6 @@ from restaurantos.common.cluster import Cluster, load_cluster, service_port
 from restaurantos.common.config import get_settings
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.config import SimSettings, get_sim_settings
-from restaurantos.sim.loading import REFERENCE_COLUMNS
 from restaurantos.sim.playback import Playback, StateError, restock_days
 from restaurantos.sim.replaydata import (
     CacheMeta,
@@ -41,7 +40,7 @@ from restaurantos.sim.replaydata import (
     require_window,
     to_order_request,
 )
-from restaurantos.sim.shard import assign_shards, counts_by_cell
+from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_pairs
 
 
 def _orders_fn(cache_file: Path):
@@ -63,23 +62,12 @@ def restock_vendors(data_dir: Path) -> list[tuple[str, str]]:
     against its MANIFEST.csv entry and the header, then the rows
     parsed from those same bytes - the cell counts and the region map
     both build from what this returns, so nothing is derived from a
-    second, unchecked read. Rows are numbered with the header as
-    line 1: a blank or short row is a ValueError naming the line, an
-    empty vendor_id a ValueError of its own - never an IndexError out
-    of the CLI."""
-    rows = manifest_rows(data_dir, "vendors.csv")
-    columns = REFERENCE_COLUMNS["vendors.csv"]
-    geohash_column = columns.index("geohash")
-    pairs: list[tuple[str, str]] = []
-    # the rows begin at file line 2 (the header is line 1)
-    for number, row in enumerate(rows, start=2):
-        if len(row) != len(columns):
-            raise ValueError(
-                f"vendors.csv line {number}: expected {len(columns)} values, got {len(row)}"
-            )
-        if not row[0]:
-            raise ValueError(f"vendors.csv line {number}: empty vendor_id")
-        pairs.append((row[0], row[geohash_column]))
+    second, unchecked read. The row checks (value count first, then
+    the empty vendor_id, each with its own message and the line
+    number) are `shard.vendor_pairs`, shared with bootstrap's
+    `vendor_counts` (review round 4, item 7), so the two paths give
+    the same errors."""
+    pairs = vendor_pairs(manifest_rows(data_dir, "vendors.csv"))
     return sorted(pairs)
 
 
@@ -115,7 +103,18 @@ async def start_command(args: argparse.Namespace) -> int:
     # diagnostics of the running process.
     _stderr_handler = logging.StreamHandler(sys.stderr)
     _stderr_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
-    logging.getLogger("restaurantos.sim.playback").addHandler(_stderr_handler)
+    _logger = logging.getLogger("restaurantos.sim.playback")
+    _logger.addHandler(_stderr_handler)
+    # removed on every exit after the install, the early returns
+    # included (review round 4, item 5): two starts in one process
+    # must never stack handlers
+    try:
+        return await _run_start(args)
+    finally:
+        _logger.removeHandler(_stderr_handler)
+
+
+async def _run_start(args: argparse.Namespace) -> int:
     # The CLI override skips SimSettings validation, so it is checked
     # here, before anything is built: a NaN or a share outside [0, 1]
     # would otherwise silently drop or keep every event (review item 6).

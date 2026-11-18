@@ -1759,22 +1759,59 @@ async def test_a_status_flag_that_is_not_a_boolean_fails_the_event(tmp_path: Pat
         assert line["error"] == "malformed status answer"
 
 
-async def test_ids_in_kitchen_paths_are_encoded_per_segment(tmp_path: Path) -> None:
-    """Review round 3, item 10: the paths are built from data, so the
-    ids are encoded per segment - a vendor id containing "/" and a
-    space reaches the route as one path segment, not as extra path."""
+async def test_a_vendor_id_that_is_not_url_safe_is_refused_before_sending(tmp_path: Path) -> None:
+    """Review round 4, item 4, replacing round 3's encoding: FastAPI
+    (Starlette) decodes %2F before routing, so an encoded id still does
+    not reach the handler as one path segment - /vendors/a%2Fb/restock
+    is matched as /vendors/a/b/restock and answers 404. Encoding cannot
+    fix it, so an id with anything outside [A-Za-z0-9_-] is refused
+    before sending: the line says "id not url-safe", the call counts
+    failed, and nothing reaches any route."""
     transport = RegionAnswering("r1")  # records every URL it is asked for
     orders = [make_order(14, 0, 0, 5, "1001")]
-    orders[0] = orders[0].model_copy(update={"vendor_id": "v/1 x"})
+    orders[0] = orders[0].model_copy(update={"vendor_id": "a/b"})
     clock = FakeWallClock()
     pb = make_playback(orders, tmp_path, clock=clock, transport=transport, status_events=True)
-    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="encoded-ids")
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="url-unsafe")
     await drive(pb, clock)
-    status_urls = [url for url in transport.requests if url.endswith("/status")]
-    assert len(status_urls) == 4
-    for url in status_urls:
-        assert "/vendors/v%2F1%20x/" in url
-        assert "v/1 x" not in url
+    status = pb.status()
+    assert status["events_failed"] == 4
+    assert status["events_acked"] == 0
+    # only the order POST ever went out - no kitchen call, to any route
+    assert transport.requests == ["http://stub.test/api/v1/orders"]
+    lines = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
+    assert len(lines) == 4
+    for line in lines:
+        assert line["error"] == "id not url-safe"
+        assert "http_status" not in line
+        assert line["wall_sent_at"] is None
+
+
+async def test_a_normal_id_reaches_the_stub_route(tmp_path: Path) -> None:
+    """Review round 4, item 4's other half: a normal id passes the
+    URL-safety check and is answered by the stub's own route through
+    the real ASGI transport (201 for a status, 200 for a restock)."""
+    orders = [make_order(21, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        status_events=True,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001",),
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=100.0, run_id="url-safe")
+    await drive(pb, clock)
+    status = pb.status()
+    assert status["events_acked"] == 4
+    assert status["restocks_acked"] == 1
+    lines = run_log_lines(tmp_path, pb)
+    statuses = [line for line in lines if line["kind"] == "status_event"]
+    assert all(line["http_status"] == 201 for line in statuses)
+    restock = next(line for line in lines if line["kind"] == "restock")
+    assert restock["http_status"] == 200
 
 
 # --- an unknown region is not sent to the gateway (review round 3, item 2)
@@ -1859,6 +1896,35 @@ async def test_a_non_string_region_id_is_failed_the_same_way(tmp_path: Path) -> 
     await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="non-string-region")
     await drive(pb, clock)
     assert pb.status()["events_failed"] == 4
+    assert transport.requests == ["http://stub.test/api/v1/orders"]
+    lines = run_log_lines(tmp_path, pb)
+    assert not any(line["kind"] == "missing" for line in lines)
+    for line in lines:
+        if line["kind"] == "status_event":
+            assert line["error"] == "unknown region"
+
+
+async def test_an_explicitly_empty_kitchen_map_stays_edge_mode(tmp_path: Path) -> None:
+    """Review round 4, item 6: kitchen_urls={} is edge mode with no
+    known regions - every kitchen call fails as unknown region and
+    nothing reaches the gateway - and only an omitted map falls back
+    to the target."""
+    transport = RegionAnswering("r1")
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        transport=transport,
+        status_events=True,
+        kitchen_urls={},
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="empty-kitchen-map")
+    await drive(pb, clock)
+    status = pb.status()
+    assert status["events_failed"] == 4
+    assert status["events_acked"] == 0
     assert transport.requests == ["http://stub.test/api/v1/orders"]
     lines = run_log_lines(tmp_path, pb)
     assert not any(line["kind"] == "missing" for line in lines)

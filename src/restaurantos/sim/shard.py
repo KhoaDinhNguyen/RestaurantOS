@@ -28,13 +28,41 @@ def counts_by_cell(pairs: Iterable[tuple[str, str]]) -> dict[str, int]:
     return counts
 
 
-def vendor_counts(data_dir: Path, *, column: str = "geohash") -> dict[str, int]:
-    """Cell name -> number of vendors whose home cell it is:
-    bootstrap's own read of vendors.csv."""
+def vendor_pairs(rows: Iterable[list[str]]) -> list[tuple[str, str]]:
+    """(vendor_id, geohash) from vendors.csv rows, each row checked
+    (review round 4, item 7): a wrong value count first, then an empty
+    vendor_id, each a ValueError with its own message and the line
+    number (the header is line 1). Both playback's restock list and
+    bootstrap's vendor_counts go through here, so the two paths give
+    the same errors."""
     columns = REFERENCE_COLUMNS["vendors.csv"]
-    return counts_by_cell(
-        (row[0], row[columns.index(column)]) for row in read_rows(data_dir / "vendors.csv", columns)
-    )
+    geohash_column = columns.index("geohash")
+    pairs: list[tuple[str, str]] = []
+    for number, row in enumerate(rows, start=2):  # the header is line 1
+        if len(row) != len(columns):
+            raise ValueError(
+                f"vendors.csv line {number}: expected {len(columns)} values, got {len(row)}"
+            )
+        if not row[0]:
+            raise ValueError(f"vendors.csv line {number}: empty vendor_id")
+        pairs.append((row[0], row[geohash_column]))
+    return pairs
+
+
+def vendor_counts(data_dir: Path) -> dict[str, int]:
+    """Cell name -> number of vendors whose home cell it is:
+    bootstrap's own read of vendors.csv, through the same checked
+    `vendor_pairs` the playback side uses (review round 4, item 7).
+    A broken header is a ValueError naming the file, like every other
+    data error, not a RuntimeError escaping the CLI; any other
+    RuntimeError passes through unchanged."""
+    try:
+        rows = list(read_rows(data_dir / "vendors.csv", REFERENCE_COLUMNS["vendors.csv"]))
+    except RuntimeError as error:
+        if "header is" in str(error):
+            raise ValueError(str(error)) from None
+        raise
+    return counts_by_cell(vendor_pairs(rows))
 
 
 def assign_shards(counts: dict[str, int], regions: Sequence[str]) -> list[tuple[str, str]]:

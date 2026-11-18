@@ -68,7 +68,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import quote
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
@@ -93,6 +92,13 @@ WAIT_SLICE_S = 0.2
 # A run id names runs/<run_id>/; it comes from the CLI, the API, or a
 # default. One path component, no traversal.
 _RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+# The ids that may appear in a kitchen path (review round 4, item 4).
+# FastAPI decodes %2F before routing, so an encoded id still does not
+# reach the handler as one path segment - encoding cannot fix it, and
+# such an id is refused instead. Today's ids (hex vendor ids, UUIDs)
+# all pass.
+_URL_SAFE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 IDLE = "idle"
 RUNNING = "running"
@@ -359,7 +365,10 @@ class Playback:
         # calls fall back to the target - the single-URL mode the stub
         # and the unit tests run on.
         self._kitchen_url = kitchen_url.rstrip("/") if kitchen_url else None
-        self._kitchen_urls = dict(kitchen_urls) if kitchen_urls else None
+        # an explicitly empty map is edge mode with no known regions
+        # (every kitchen call fails as unknown region), not the
+        # single-URL fallback - only an omitted map falls back
+        self._kitchen_urls = dict(kitchen_urls) if kitchen_urls is not None else None
         self._vendor_regions = dict(vendor_regions) if vendor_regions else None
 
         self._state = IDLE
@@ -418,7 +427,7 @@ class Playback:
         before."""
         if self._kitchen_url is not None:
             return self._kitchen_url
-        if self._kitchen_urls:
+        if self._kitchen_urls is not None:
             if isinstance(region_id, str) and region_id in self._kitchen_urls:
                 return self._kitchen_urls[region_id]
             return None
@@ -1203,14 +1212,7 @@ class Playback:
     async def _send_event(
         self, seq: int, record: dict[str, Any], previous: asyncio.Task | None
     ) -> None:
-        # The ids are encoded per path segment (review round 3, item 10):
-        # today's ids never need it, but the paths are built from data,
-        # and this costs one call each. The base URL and the "/"
-        # separators stay as they are.
-        path = (
-            f"/vendors/{quote(record['vendor_id'], safe='')}"
-            f"/orders/{quote(str(record['order_id']), safe='')}/status"
-        )
+        path = f"/vendors/{record['vendor_id']}/orders/{record['order_id']}/status"
         await self._send_aux(
             seq,
             record,
@@ -1220,9 +1222,7 @@ class Playback:
         )
 
     async def _send_restock(self, seq: int, record: dict[str, Any]) -> None:
-        await self._send_aux(
-            seq, record, f"/vendors/{quote(record['vendor_id'], safe='')}/restock", None, None
-        )
+        await self._send_aux(seq, record, f"/vendors/{record['vendor_id']}/restock", None, None)
 
     async def _send_aux(
         self,
@@ -1318,6 +1318,17 @@ class Playback:
                             # to the gateway would quietly undo the
                             # region routing
                             record["error"] = "unknown region"
+                            break
+                        if not _URL_SAFE.fullmatch(str(record["vendor_id"])) or (
+                            "order_id" in record
+                            and not _URL_SAFE.fullmatch(str(record["order_id"]))
+                        ):
+                            # %2F is decoded before routing, so encoding
+                            # cannot make such an id reach the handler
+                            # (review round 4, item 4): refuse it here,
+                            # inside the counted path, like the
+                            # unknown-region check
+                            record["error"] = "id not url-safe"
                             break
                         record["wall_sent_at"] = round(self._wall.now(), 3)
                         response = await self._client.post(base + path, json=body)

@@ -224,9 +224,11 @@ def test_restock_vendors_are_sorted_and_header_checked(tmp_path):
         ("v9", "w21z7"),
     ]
 
-    # a fresh dir whose manifest matches: the header check is what fires
+    # a fresh dir whose manifest matches: the header check is what
+    # fires, and since round 4 it is a ValueError like every other data
+    # error, not a RuntimeError the CLI does not turn into a message
     bad = _vendors_csv_dir(tmp_path / "bad-header", "wrong,header\n")
-    with pytest.raises(RuntimeError, match="header"):
+    with pytest.raises(ValueError, match="header"):
         restock_vendors(bad)
 
 
@@ -633,3 +635,91 @@ def test_vendors_csv_is_read_once_for_the_whole_rest_of_the_run(tmp_path, monkey
     # and the map still equals bootstrap's own derivation
     cell_region = dict(assign_shards(vendor_counts(data), cluster.region_ids))
     assert regions == {vendor: cell_region[geohash] for vendor, geohash in pairs}
+
+
+def test_an_empty_vendors_csv_is_a_value_error_naming_the_file(tmp_path):
+    """Review round 4, item 7: next() with no default used to raise
+    StopIteration out of the CLI on an empty file; check_header now
+    reports the missing header, as a ValueError naming vendors.csv."""
+    from restaurantos.sim.playback_cli import restock_vendors
+
+    data = _vendors_csv_dir(tmp_path, "")
+    with pytest.raises(ValueError, match="vendors.csv: header is"):
+        restock_vendors(data)
+
+
+def test_vendor_counts_gives_the_same_row_errors_as_playback(tmp_path):
+    """Review round 4, item 7: bootstrap's vendor_counts goes through
+    the same checked vendor_pairs as playback, so a short row is the
+    same ValueError with its line number - and a broken header is a
+    ValueError naming the file, not a RuntimeError escaping the
+    CLI."""
+    from restaurantos.sim.shard import vendor_counts
+
+    (tmp_path / "vendors.csv").write_text(
+        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match=r"vendors.csv line 2: expected 4 values, got 3"):
+        vendor_counts(tmp_path)
+
+    (tmp_path / "vendors.csv").write_text("wrong,header\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="vendors.csv: header is"):
+        vendor_counts(tmp_path)
+
+
+def test_start_removes_its_log_handler_on_every_exit(tmp_path, monkeypatch, capsys, fresh_settings):
+    """Review round 4, item 5: start_command installs a stderr handler
+    on the playback logger and removes it on every exit - the early
+    return for a bad --event-sample-rate included - so two starts in
+    one process leave the logger exactly as they found it."""
+    import logging
+
+    orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
+    data = _make_data_with_vendors(
+        tmp_path,
+        orders,
+        [["1", "p1", 1]],
+        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n",
+    )
+    captured: dict = {}
+    _install_fake_start(monkeypatch, captured)
+    monkeypatch.setenv("ROS_DATA_DIR", str(data))
+    monkeypatch.chdir(tmp_path)
+    logger = logging.getLogger("restaurantos.sim.playback")
+    before = len(logger.handlers)
+
+    # the early return, after the handler was installed
+    rc_bad = app(
+        [
+            "playback",
+            "start",
+            "--from-day",
+            "14",
+            "--to-day",
+            "14",
+            "--kitchen-target",
+            "http://127.0.0.1:8900/api/v1",
+            "--event-sample-rate",
+            "2",
+            "--port",
+            "1",
+        ]
+    )
+    assert rc_bad == 1
+    # a full run to the end
+    rc_good = app(
+        [
+            "playback",
+            "start",
+            "--from-day",
+            "14",
+            "--to-day",
+            "14",
+            "--kitchen-target",
+            "http://127.0.0.1:8900/api/v1",
+            "--port",
+            "1",
+        ]
+    )
+    assert rc_good == 0
+    assert len(logger.handlers) == before

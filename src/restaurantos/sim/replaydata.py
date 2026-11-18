@@ -133,7 +133,11 @@ def manifest_rows(data_dir: Path, name: str) -> list[list[str]]:
     (review round 3, item 11).
 
     Blank rows are kept: the caller numbers them - the header is
-    line 1 - and rejects them."""
+    line 1 - and rejects them. An empty file is a data error too, not
+    a StopIteration escaping the CLI (review round 4, item 7):
+    `next(reader, [])` lets check_header report the missing header,
+    and the header error is a ValueError naming the file, like every
+    other data error."""
     expected = _manifest_sha256(data_dir).get(name)
     if expected is None:
         raise ValueError(f"{name} is not listed in MANIFEST.csv")
@@ -141,7 +145,10 @@ def manifest_rows(data_dir: Path, name: str) -> list[list[str]]:
     if hashlib.sha256(raw).hexdigest() != expected:
         raise ValueError(f"{name} does not match its MANIFEST.csv entry")
     reader = csv.reader(io.StringIO(raw.decode("utf-8"), newline=""))
-    check_header(name, next(reader), REFERENCE_COLUMNS[name])
+    try:
+        check_header(name, next(reader, []), REFERENCE_COLUMNS[name])
+    except RuntimeError as error:
+        raise ValueError(str(error)) from None
     return list(reader)
 
 
