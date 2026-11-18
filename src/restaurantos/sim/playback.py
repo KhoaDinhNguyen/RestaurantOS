@@ -624,8 +624,27 @@ class Playback:
         """Stop sending, wait for what is in flight, close the log."""
         self._require(LIVE_STATES, "stop")
         self._state = STOPPING
+        # The clock shows where the replay got to, not how long the
+        # cleanup took (review round 4, item 3): freeze it at the
+        # moment the stop is accepted, before the drain - on a slow
+        # target at 1000x, 30 s of draining would otherwise move the
+        # reported clock about 8 simulated hours past the last order
+        self._freeze_clock()
         self._wake.set()
         await self._done.wait()
+
+    def _freeze_clock(self) -> None:
+        """Freeze the reported clock where the replay stopped.
+
+        Called at a normal end (when the dispatcher dispatched its
+        last item), at a stop (the moment the stop is accepted) and at
+        a failure (when the dispatcher raised). Harmless when the
+        clock is already frozen - the cleanup's own pause is the
+        safety net. Pause keeps its own freeze, as before.
+        """
+        if self._simclock is not None:
+            with contextlib.suppress(Exception):
+                self._simclock.pause()
 
     async def wait_done(self) -> None:
         """Block until the run is over (done, stopped or failed)."""
@@ -805,10 +824,21 @@ class Playback:
                 # control requests must be able to run between the
                 # items that are all due at once.
                 await asyncio.sleep(0)
+            if not stopped:
+                # Normal end: the dispatcher dispatched its last item.
+                # Freeze the reported clock here, before the final wait
+                # for outstanding sends, so cleanup time never moves
+                # the moment the replay reached (review round 4,
+                # item 3). A stop already froze the clock when it was
+                # accepted; a failure freezes below.
+                self._freeze_clock()
         except Exception as error:  # noqa: BLE001 - the run must not die silently
             # logging.exception carries the traceback; a handler that
             # cannot write reports that itself and never raises here
             _LOGGER.exception(f"playback run {self._run_id} failed: {error}")
+            # freeze the clock where the replay was when it failed,
+            # before the cleanup moves wall time
+            self._freeze_clock()
             failed = True
         finally:
             cleanup_cancelled = False
@@ -858,8 +888,9 @@ class Playback:
                 raise
             finally:
                 if clock is not None:
-                    # freeze the reported clock: a finished run must not
-                    # keep advancing simulated time
+                    # the safety net: the clock is already frozen at the
+                    # stop, the failure or the last dispatch, and pausing
+                    # a paused clock changes nothing
                     with contextlib.suppress(Exception):
                         clock.pause()
                 # set only here, at the very end: earlier, and a start

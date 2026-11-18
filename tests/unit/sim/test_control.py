@@ -3,11 +3,12 @@ answers, and the 409/422 errors the architecture's contract implies."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import httpx
 import pytest
-from conftest import FakeWallClock, drive, make_playback, sample_orders
+from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle
 
 
 @pytest.fixture
@@ -228,7 +229,13 @@ async def test_the_clock_stands_still_when_paused_or_ended(tmp_path: Path):
     are read without any clock advance in between and must match
     exactly, and after a normal end the clock stands at the final
     simulated instant - the last dispatched item's deadline, rounded
-    down to the second."""
+    down to the second.
+
+    Review round 4, item 3 says which contract that instant is: the
+    clock shows where the replay stopped, so a normal end freezes it
+    when the dispatcher dispatches its last item, and a stop freezes
+    it at the moment the stop is accepted - never after the cleanup
+    waits (the final wait for outstanding sends, the drain)."""
     clock = FakeWallClock()
     pb = make_playback(sample_orders(6), tmp_path, clock=clock, inflight=4)
     from restaurantos.sim.control import make_control_app
@@ -290,6 +297,117 @@ async def test_the_clock_stands_still_when_paused_or_ended(tmp_path: Path):
         halted = after_stop
         await clock.advance(clock.now() + 1.0)
         assert (await client.get("/sim/clock")).json() == halted
+
+
+async def test_the_clock_stays_at_the_stop_request_while_the_drain_runs(tmp_path: Path):
+    """Review round 4, item 3: the clock shows how far the replay got,
+    not how long the cleanup took. stop() freezes it at the moment the
+    stop is accepted, so while the drain still waits for a held order -
+    and with the wall clock running on - /sim/clock keeps showing that
+    moment."""
+    from test_playback_events import HoldingOrders
+
+    clock = FakeWallClock()
+    transport = HoldingOrders()
+    orders = [make_order(14, 0, 0, 5, "1001"), make_order(14, 0, 0, 50, "1002")]
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        inflight=8,
+        drain_timeout_s=2.0,  # the drain waits on the held order, not on its own timeout
+        transport=transport,
+    )
+    from restaurantos.sim.control import make_control_app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        await client.post("/sim/playback", json={"action": "start", "from_day": 14, "speed": 100.0})
+        await drive(pb, clock, steps=2)  # 10 simulated seconds in: order 1001 is out, held
+        before_stop = (await client.get("/sim/clock")).json()
+        stop_task = asyncio.create_task(pb.stop())
+        await settle()  # the stop is accepted: the clock freezes here
+        at_stop = (await client.get("/sim/clock")).json()
+        assert at_stop["sim_day"] == before_stop["sim_day"]
+        assert at_stop["sim_time"] == before_stop["sim_time"]
+        # the drain is waiting for the held order; the wall clock moves
+        # on, and the reported clock does not
+        await clock.advance(clock.now() + 5.0)
+        await settle()
+        held_reading = (await client.get("/sim/clock")).json()
+        assert held_reading == at_stop
+        try:
+            transport.release.set()
+            await asyncio.wait_for(stop_task, 5)
+        finally:
+            transport.release.set()
+    assert pb.status()["state"] == "stopped"
+    final = pb.clock()
+    assert final["sim_day"] == at_stop["sim_day"]
+    assert final["sim_time"] == at_stop["sim_time"]
+
+
+async def test_the_clock_stays_at_the_last_dispatch_through_the_final_wait(tmp_path: Path):
+    """Review round 4, item 3: a normal end freezes the clock when the
+    dispatcher dispatched its last item - the final wait for a held
+    send, and the wall clock moving during it, never move the reported
+    moment."""
+    from conftest import settle
+    from test_playback_events import HoldingEvent, expected_event_id
+
+    hold = expected_event_id("1001", "picked_up")
+    transport = HoldingEvent(hold)
+    orders = [make_order(14, 0, 0, 1, "1001")]
+    clock = FakeWallClock()
+    # no jitter, so the last deadline is exactly +25 minutes; fine
+    # steps so the fake clock lands on it without a coarse overshoot
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        status_events=True,
+        event_jitter_s=0.0,
+        transport=transport,
+    )
+    from restaurantos.sim.control import make_control_app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        await client.post("/sim/playback", json={"action": "start", "from_day": 14, "speed": 100.0})
+        # speed 100 with 0.005 steps: the wake overshoot stays under a
+        # simulated second, so the frozen reading is exactly the
+        # deadline's own second
+        for _ in range(3500):
+            if pb.status()["events_sent"] == 4:
+                break
+            await clock.advance(clock.now() + 0.005)
+            await settle()
+        await settle(10)
+        assert pb.status()["events_sent"] == 4
+        assert pb.status()["state"] == "running"  # waiting for the held event
+        at_end = (await client.get("/sim/clock")).json()
+        # the last dispatched item is picked_up, at +25 simulated
+        # minutes; the slice-wise wake may cross the deadline's second
+        # by a step, so the frozen reading is the deadline's own second
+        # or one past it - and never past that
+        assert at_end["sim_day"] == 14
+        assert at_end["sim_time"] in {"00:25:00", "00:25:01"}
+        # the final wait runs with the wall clock moving on: the
+        # reported clock does not
+        await clock.advance(clock.now() + 5.0)
+        await settle()
+        assert (await client.get("/sim/clock")).json() == at_end
+        try:
+            transport.release.set()
+            await asyncio.wait_for(pb.wait_done(), 5)
+        finally:
+            transport.release.set()
+        assert pb.status()["state"] == "done"
+    final = pb.clock()
+    assert final["sim_day"] == at_end["sim_day"]
+    assert final["sim_time"] == at_end["sim_time"]
 
 
 async def test_speed_change_before_to_day_zero(client, pb):
