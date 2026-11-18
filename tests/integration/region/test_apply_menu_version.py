@@ -10,6 +10,7 @@ recipe amounts and multipliers are above 1, as the brief asks.
 
 from __future__ import annotations
 
+import asyncio
 import os
 from collections.abc import AsyncIterator, Awaitable, Callable
 from decimal import Decimal
@@ -365,6 +366,38 @@ async def test_the_next_restock_switches_an_added_product_on(region):
     assert (await counters(conn))["chili"] == (6, 6)
 
 
+async def waits_on_a_lock(watch: psycopg.AsyncConnection, pid: int, task: asyncio.Task) -> bool:
+    """True once backend `pid` waits on a lock; False if `task` ends first or 5 s pass."""
+    for _ in range(250):
+        if task.done():
+            return False
+        cur = await watch.execute(
+            "SELECT wait_event_type FROM pg_stat_activity WHERE pid = %s", (pid,)
+        )
+        if await cur.fetchone() == ("Lock",):
+            return True
+        await asyncio.sleep(0.02)
+    return False
+
+
+async def test_a_restock_waits_for_a_menu_apply_in_flight(region):
+    applying, restocking, watch = await region(), await region(), await region()
+
+    # apply's own transaction() is a savepoint inside this one, so its
+    # node_state lock is held until this block commits. p_pie's counter is new.
+    async with applying.transaction():
+        await apply(applying, P_RICE, P_CAKE, row("p_pie", "d_pie", 1))
+        task = asyncio.create_task(restock(restocking, "v1", 1))
+        waited = await waits_on_a_lock(watch, restocking.info.backend_pid, task)
+    await task
+
+    assert waited
+    # The restock ran after the apply committed: it filled the new counter
+    # before clearing the new product's mark.
+    assert (await counters(watch))["d_pie"] == (5, 5)
+    assert "p_pie" not in await marks(watch)
+
+
 # --- what is never applied ----------------------------------------------------------
 
 
@@ -403,12 +436,11 @@ async def test_a_failure_part_way_applies_nothing(region):
     conn = await region()
     state = await everything(conn)
 
-    # The last row names a vendor this node does not have: the products
-    # foreign key fails after the other rows were written.
+    # The last row names a dish that does not exist. The products upsert
+    # succeeds for every row, then the product_dish foreign key fails in the
+    # next statement, so the products rows are only undone by the rollback.
     with pytest.raises(psycopg.errors.ForeignKeyViolation):
-        await apply(
-            conn, P_RICE, row("p_laksa", "d_laksa", 2), row("p_x", "d_cake", 1, vendor="vX")
-        )
+        await apply(conn, P_RICE, row("p_laksa", "d_laksa", 2), row("p_x", "d_missing", 1))
 
     assert await everything(conn) == state
 

@@ -37,7 +37,7 @@ One transaction, in this order:
    - `none`: nothing.
 5. Lock the needed `stock` rows with `SELECT ... FOR UPDATE`, always in the same order (`item_kind`, `item_id`), so two orders cannot deadlock.
 6. If any row has too little (`out_of_stock`): **refuse the whole order**. A missing `stock` row counts as zero.
-7. Otherwise decrement stock, and add a `product_availability` row (`reason = 'stock'`) for products that can no longer be made because a stock row just reached zero. Insert with `ON CONFLICT DO NOTHING`, so a `manual` row is never overwritten.
+7. Otherwise decrement stock, and add a `product_availability` row (`reason = 'stock'`) for products that can no longer make one unit because a counter the order just took from is now below what one unit needs (the `can_make_one` rule, checked only on those counters). Insert with `ON CONFLICT DO NOTHING`, so a `manual` row is never overwritten.
 8. Insert `orders` (status `received`, with `menu_version`, the caller's `epoch` and `received_at`) and `order_items`.
 9. Insert one `outbox` row (`order.created`). Commit.
 
@@ -92,5 +92,5 @@ What each line needs is marked in front of it (the marks are explained in `READM
 
 - The epoch fence is cooperative. `assert_epoch` protects the transactions that call it, and nothing in the schema stops a write that skips it. So every function here calls it first, inside its transaction, and this package is the only code that writes a region's operational tables. If the gateway or the relay needs a new kind of write, it becomes a function here.
 - Never call `now()` for business time. `order_day` and `order_time` come from the request. Use `clock_timestamp()` only for `committed_at`.
-- Keep the availability update cheap: only look at stock rows that just crossed zero, not the whole menu.
+- Keep the availability update cheap: only look at the counters the order just took from, not the whole menu.
 - Hot path: the item lookup runs for every order. Check it uses the primary keys.

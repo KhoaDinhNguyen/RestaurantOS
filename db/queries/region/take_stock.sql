@@ -1,5 +1,5 @@
--- Takes the stock and returns what is left, so the caller knows
--- which counters just reached zero.
+-- place_order step 7. Takes the stock from counters this transaction already
+-- holds FOR UPDATE (step 5); step 6 has checked that each one has enough.
 UPDATE stock AS s
 SET
     on_hand = s.on_hand - n.need,
@@ -10,5 +10,4 @@ FROM
 WHERE
     s.vendor_id = %(vendor_id)s
     AND s.item_kind = n.item_kind
-    AND s.item_id = n.item_id
-RETURNING s.item_kind, s.item_id, s.on_hand;
+    AND s.item_id = n.item_id;

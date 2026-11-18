@@ -82,10 +82,12 @@ async def place_order(
             # 6. One short counter refuses the whole order. No row means zero.
             if any(on_hand.get(key, 0) < need for key, need in needs.items()):
                 return await _refuse(cur, req, RefusalReason.OUT_OF_STOCK)
-            # 7. Take the stock; mark products whose counter just reached zero.
+            # 7. Take the stock; mark products that can no longer make one unit.
             await _take_stock(cur, req.vendor_id, needs)
 
-        # 8. The order and its lines; each line keeps today's price.
+        # 8. The order and its lines; each line keeps today's price, and the
+        #    order the menu version those prices were read from.
+        menu_version = products[req.items[0].product_id]["menu_version"]
         lines = [
             OrderItemRow(
                 line_no=line_no,
@@ -95,7 +97,7 @@ async def place_order(
             )
             for line_no, item in enumerate(req.items, start=1)
         ]
-        order = await _insert_order(cur, req, order_id, epoch, received_at, lines)
+        order = await _insert_order(cur, req, order_id, epoch, menu_version, received_at, lines)
 
         # 9. The event for HQ, committed together with the order.
         status = OrderStatus(order["status"])
@@ -285,6 +287,12 @@ async def _lock_stock(
 
 
 async def _take_stock(cur: Cursor, vendor_id: str, needs: dict[StockKey, int]) -> None:
+    """Take the stock, then mark the products that can no longer make one unit.
+
+    Only the counters this order took from are checked: they are the ones that
+    went down, and step 5 already holds them, so the marking takes no new locks.
+    Every one of them has a row, because step 6 refused an order with a missing one.
+    """
     keys = sorted(needs)
     await cur.execute(
         load_query("region/take_stock"),
@@ -295,18 +303,14 @@ async def _take_stock(cur: Cursor, vendor_id: str, needs: dict[StockKey, int]) -
             "needs": [needs[key] for key in keys],
         },
     )
-    emptied = [
-        (row["item_kind"], row["item_id"]) for row in await cur.fetchall() if row["on_hand"] == 0
-    ]
-    if emptied:
-        await cur.execute(
-            load_query("region/mark_out_of_stock"),
-            {
-                "vendor_id": vendor_id,
-                "empty_dishes": [item_id for kind, item_id in emptied if kind == "dish"],
-                "empty_ingredients": [item_id for kind, item_id in emptied if kind == "ingredient"],
-            },
-        )
+    await cur.execute(
+        load_query("region/mark_out_of_stock"),
+        {
+            "vendor_id": vendor_id,
+            "touched_dishes": [item_id for kind, item_id in keys if kind == "dish"],
+            "touched_ingredients": [item_id for kind, item_id in keys if kind == "ingredient"],
+        },
+    )
 
 
 # --- step 8: the order -----------------------------------------------------
@@ -317,6 +321,7 @@ async def _insert_order(
     req: OrderRequest,
     order_id: UUID,
     epoch: int,
+    menu_version: int,
     received_at: datetime | None,
     lines: list[OrderItemRow],
 ) -> Row:
@@ -331,6 +336,7 @@ async def _insert_order(
             "customer_id": req.customer_id,
             "customer_geohash": req.customer_geohash,
             "order_time": req.order_time,
+            "menu_version": menu_version,
             "epoch": epoch,
             "received_at": received_at,
         },

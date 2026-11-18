@@ -253,7 +253,9 @@ async def test_two_orders_racing_for_the_last_stock_exactly_one_wins(region):
     outcomes = sorted(r.outcome for r in results)
     assert outcomes == [OrderOutcome.ACCEPTED, OrderOutcome.REFUSED]
     refused = next(r for r in results if r.outcome == OrderOutcome.REFUSED)
-    assert refused.refusal_reason == RefusalReason.OUT_OF_STOCK
+    # The loser waits on the stock lock (out_of_stock) if it read the products
+    # before the winner committed, or finds p_rice marked (unavailable) if after.
+    assert refused.refusal_reason in {RefusalReason.OUT_OF_STOCK, RefusalReason.UNAVAILABLE}
     assert await on_hand(a, "ingredient", "rice") == 0
     assert await count(a, "orders") == 1
 
@@ -333,6 +335,34 @@ async def test_counter_reaching_zero_marks_every_product_using_it(region):
 
     await place_order(conn, make_order(("p_rice", 3)), 1)  # rice 1500 -> 0
 
+    assert await marks(conn) == {"p_rice": "stock", "p_rice_small": "stock"}
+
+
+async def test_counter_below_one_unit_marks_the_product(region):
+    conn = await region()
+
+    await place_order(conn, make_order(("p_cake", 2)), 1)  # d_cake 7 -> 1; a box needs 3
+
+    assert await marks(conn) == {"p_cake": "stock"}
+
+    result = await place_order(conn, make_order(("p_cake", 1), ext="o2"), 1)
+
+    assert result.refusal_reason == RefusalReason.UNAVAILABLE
+    assert await on_hand(conn, "dish", "d_cake") == 1
+
+
+async def test_only_products_that_cannot_make_one_are_marked(region):
+    conn = await region()
+
+    # rice 1500 -> 250, beef 100 -> 90. p_rice needs 500 rice, p_rice_small 250.
+    await place_order(conn, make_order(("p_rice_small", 5)), 1)
+
+    assert await marks(conn) == {"p_rice": "stock"}
+
+    result = await place_order(conn, make_order(("p_rice_small", 1), ext="o2"), 1)
+
+    assert result.outcome == OrderOutcome.ACCEPTED
+    assert await on_hand(conn, "ingredient", "rice") == 0
     assert await marks(conn) == {"p_rice": "stock", "p_rice_small": "stock"}
 
 

@@ -449,8 +449,8 @@ The edge API (`edge-r{n}`) serves the same `/vendors/...` routes, and `/regions/
 ```
 
 - The switch only touches the **manual** mark. Off writes a `manual` mark. On removes it and then checks whether one unit of the product can be made right now; if not, a `stock` mark takes its place and the answer says `available: false, reason: "stock"`. That is not an error.
-- The `stock` mark looks after itself: an order that empties a counter sets it, and a restock clears it. Nobody switches it by hand.
-- The mark is set only when a counter reaches zero. A product that needs 6 of a counter holding 3 still shows as available; its orders are refused as `out_of_stock` all the same, because the stock check at order time is the real gate.
+- The `stock` mark looks after itself: an order that leaves a counter below what one unit needs sets it, and a restock clears it. Nobody switches it by hand.
+- The mark is about one unit. A product that needs 6 of a counter an order has just left at 3 is marked. An order for several units can still be refused as `out_of_stock` while one unit shows as available, because the stock check at order time is the real gate.
 
 What availability does to orders:
 

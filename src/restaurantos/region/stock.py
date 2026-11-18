@@ -59,7 +59,10 @@ async def restock(
 
         params = {"vendor_id": vendor_id}
 
-        # 2. Lock the vendor's counters in the same order place_order does.
+        # 2. Lock node_state, then the counters: the order apply_menu_version
+        #    takes them in, so a menu apply in flight finishes first. Counters
+        #    are locked in the same order place_order uses.
+        await cur.execute(load_query("region/lock_node_state_shared"))
         await cur.execute(load_query("region/lock_vendor_stock"), params)
 
         # 3. Up to par, never down.
