@@ -638,7 +638,9 @@ class Playback:
 
         - `events_acked`: the region applied the change;
         - `events_duplicate`: a replayed event id the region already
-          knew (2xx with `duplicate`);
+          knew (2xx with `duplicate`), on any attempt - so
+          `events_acked + events_duplicate` is the number of events
+          the region holds;
         - `events_conflicted`: a real state-machine rejection (409, or
           2xx with `conflict`);
         - `events_failed`: everything else, including a 2xx whose body
@@ -1219,8 +1221,8 @@ class Playback:
         attempt sends the same body - for an event, the same event_id,
         which the region's processed_events answers duplicate, and a
         restock has no body, and a top-up twice is safe - so one
-        retry too many is a no-op duplicate counted as acked, while
-        giving up after one attempt would send the order's next event
+        retry too many is a no-op duplicate, while giving up after
+        one attempt would send the order's next event
         into an impossible move: a conflict and an HQ exception
         caused by playback, not by a real race. A 2xx, 404, 409 or
         422 is never retried: the region answered. The chained next
@@ -1352,13 +1354,13 @@ class Playback:
           carries the transport error) is a failure;
         - on a 2xx, an answer whose body did not parse (the record
           carries `error` from _response_fields) is a failure;
-        - `duplicate` on the first attempt is a replayed event the
-          region already knew;
-        - `duplicate` on a retry means our own earlier attempt landed
-          (every attempt sends the same event_id, and the region's
-          processed_events makes a repeat a no-op): the change is
-          applied, so it counts as acked, and the line says
-          `landed_earlier`;
+        - `duplicate` is a replayed event id the region already knew,
+          on every attempt alike: a duplicate on a retry does not
+          prove that this send's earlier attempt landed (the same id
+          may have landed in an earlier run while the first attempt
+          never reached the region), so the line records the fact
+          with `duplicate_after_retry` and the event counts as a
+          duplicate, never as a guess about what landed;
         - `conflict` on a 2xx is a real conflict too;
         - `applied` is the only other ack;
         - anything else is a failure, below.
@@ -1383,13 +1385,12 @@ class Playback:
                 return
         if record.get("duplicate"):
             if attempt > 1:
-                # the same event_id went out on an earlier attempt of
-                # this same send: it landed, the region just never
-                # answered - so the change is applied
-                record["landed_earlier"] = True
-                self._events_acked += 1
-            else:
-                self._events_duplicate += 1
+                # a fact about the answer, not a guess about what the
+                # earlier attempt did: the same event_id may have
+                # landed in an earlier run while this send's first
+                # attempt never reached the region
+                record["duplicate_after_retry"] = True
+            self._events_duplicate += 1
         elif record.get("conflict"):
             self._events_conflicted += 1
         elif record.get("applied"):

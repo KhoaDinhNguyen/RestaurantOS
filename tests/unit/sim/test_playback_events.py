@@ -1517,28 +1517,33 @@ class FakeEdge(httpx.AsyncBaseTransport):
         )
 
 
-async def test_a_retry_after_a_landed_attempt_counts_as_acked(tmp_path: Path) -> None:
-    """Review round 3, item 1: the edge commits the change and then the
-    answer is lost (a timeout). The retry sends the same event_id, the
-    region answers duplicate, and the event counts as acked with
-    landed_earlier on the line - no exception at the region, and the
-    order's next event applies on its first attempt."""
+async def test_a_retry_that_answers_duplicate_counts_as_a_duplicate(tmp_path: Path) -> None:
+    """Review round 3, item 1 and round 4, item 2: the edge commits the
+    change and then the answer is lost (a timeout). The retry sends the
+    same event_id, the region answers duplicate - and a duplicate
+    counts as a duplicate on every attempt, because it cannot prove
+    which attempt landed: the line says duplicate_after_retry, the
+    counter says duplicate, no exception is logged at the region, and
+    the order's next event applies on its first attempt."""
     fake = FakeEdge()
     fake.status_script[stub_order_id("1001")] = ["apply-then-timeout"]
     orders = [make_order(14, 0, 0, 5, "1001")]
     clock = FakeWallClock()
     pb = make_playback(orders, tmp_path, clock=clock, transport=fake, status_events=True)
-    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="retry-landed")
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="retry-duplicate")
     await drive(pb, clock)
     status = pb.status()
     assert status["state"] == "done"
-    assert status["events_acked"] == 4
-    assert status["events_duplicate"] == 0
+    assert status["events_acked"] == 3  # the three events that applied cleanly
+    assert status["events_duplicate"] == 1  # the retried one
+    assert status["events_failed"] == 0
     assert fake.exception_log == []
     lines = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
     accepted = next(line for line in lines if line["to_status"] == "accepted")
     assert accepted["attempts"] == 2
-    assert accepted["landed_earlier"] is True
+    assert accepted["duplicate_after_retry"] is True
+    assert "landed_earlier" not in accepted
+    assert accepted.get("duplicate") is True
     assert fake.status_calls[accepted["event_id"]] == 2
     preparing = next(line for line in lines if line["to_status"] == "preparing")
     assert preparing["attempts"] == 1
