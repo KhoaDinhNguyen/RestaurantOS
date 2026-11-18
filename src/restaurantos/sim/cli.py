@@ -205,12 +205,14 @@ def app(argv: Sequence[str] | None = None) -> int:
         from restaurantos.sim.config import get_sim_settings
 
         try:
-            counts = sync(load_cluster(args.config), get_sim_settings())
+            counts, warning = sync(load_cluster(args.config), get_sim_settings())
         except BaselineSyncError as error:
             # playback still live, a region down, a sick control
             # endpoint: the message says what to do about it.
             print(f"rosctl baseline sync: {error}", file=sys.stderr)
             return 1
+        if warning is not None:
+            print(warning, file=sys.stderr)
         print(format_report(counts))
         return 0
     print(f"rosctl {args.command}: not built yet ({NOT_BUILT[args.command]})", file=sys.stderr)

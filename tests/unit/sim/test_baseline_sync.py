@@ -10,6 +10,7 @@ from __future__ import annotations
 import socket
 
 import httpx
+import psycopg
 import pytest
 from conftest import FakeWallClock, make_playback, sample_orders
 
@@ -19,6 +20,7 @@ from restaurantos.sim.baseline_sync import (
     SYNC_TABLES,
     BaselineSyncError,
     _control_client,
+    failed_sends_warning,
     format_report,
     gate_recheck,
     playback_refusal,
@@ -294,6 +296,28 @@ def test_recheck_aborts_when_the_second_read_is_not_quiet():
     assert "left as it was" in message
 
 
+def test_no_warning_for_a_clean_or_absent_body():
+    assert failed_sends_warning(None) is None
+    assert failed_sends_warning(_status()) is None
+
+
+def test_warning_names_every_failed_and_parked_count():
+    body = _status(orders_failed=2, restocks_failed=1, orders_parked=5)
+    message = failed_sends_warning(body)
+    assert message is not None
+    assert "orders_failed 2" in message
+    assert "restocks_failed 1" in message
+    assert "orders_parked 5" in message
+    assert "healed" in message
+
+
+def test_warning_ignores_zero_missing_and_non_int_counts():
+    assert failed_sends_warning(_status(orders_failed=0)) is None
+    assert failed_sends_warning(_status(orders_parked=0)) is None
+    assert failed_sends_warning(_status(restocks_failed="many")) is None
+    assert failed_sends_warning({"state": "idle"}) is None
+
+
 # --- sync, end to end against fake databases ------------------------------------
 
 
@@ -331,17 +355,23 @@ class _FakeCursor:
 
 
 class _FakeConnection:
-    def __init__(self, label: str):
+    def __init__(self, label: str, commit_error: Exception | None = None):
         self.label = label
         self.committed = False
         self.rolled_back = False
         self.closed = False
+        self.commit_error = commit_error
 
     def execute(self, *args, **kwargs):
         return _FakeCursor()
 
     def cursor(self):
         return _FakeCursor()
+
+    def commit(self):
+        if self.commit_error is not None:
+            raise self.commit_error
+        self.committed = True
 
     def close(self):
         self.closed = True
@@ -359,12 +389,17 @@ class _FakeConnection:
         return False
 
 
-def _fake_databases(monkeypatch, cluster: Cluster) -> list[_FakeConnection]:
+def _fake_databases(
+    monkeypatch, cluster: Cluster, baseline_commit_error: Exception | None = None
+) -> list[_FakeConnection]:
     connections: list[_FakeConnection] = []
     baseline_port = f"port={host_port(cluster, BASELINE)}"
 
     def connect(dsn, **kwargs):
-        connection = _FakeConnection("baseline" if baseline_port in dsn else "region")
+        if baseline_port in dsn:
+            connection = _FakeConnection("baseline", commit_error=baseline_commit_error)
+        else:
+            connection = _FakeConnection("region")
         connections.append(connection)
         return connection
 
@@ -393,7 +428,7 @@ def _cluster() -> Cluster:
 def test_sync_with_an_unchanged_gate_commits(monkeypatch):
     cluster = _cluster()
     connections = _fake_databases(monkeypatch, cluster)
-    counts = sync(
+    counts, warning = sync(
         cluster,
         SimSettings(_env_file=None),
         transport=_two_reads(_status(), _status()),
@@ -402,6 +437,46 @@ def test_sync_with_an_unchanged_gate_commits(monkeypatch):
     assert baseline.committed and not baseline.rolled_back
     assert all(c.closed for c in connections), "every connection must be closed"
     assert counts == {"r1": {table: 3 for table in SYNC_TABLES}}
+    assert warning is None
+
+
+def test_sync_returns_the_failed_sends_warning(monkeypatch):
+    """Failed and parked counters do not refuse the sync; the warning is
+    returned for the CLI to print."""
+    cluster = _cluster()
+    _fake_databases(monkeypatch, cluster)
+    body = _status(orders_failed=2, orders_parked=1)
+    counts, warning = sync(
+        cluster,
+        SimSettings(_env_file=None),
+        transport=_two_reads(body, body),
+    )
+    assert counts == {"r1": {table: 3 for table in SYNC_TABLES}}
+    assert warning is not None
+    assert "orders_failed 2" in warning
+    assert "orders_parked 1" in warning
+
+
+def test_a_commit_failure_reports_an_unknown_outcome(monkeypatch):
+    """An error from the commit itself cannot claim a rollback: the
+    baseline holds either its old rows or the new copy. The message
+    says unknown, and the region connections are still closed."""
+    cluster = _cluster()
+    connections = _fake_databases(
+        monkeypatch, cluster, baseline_commit_error=psycopg.OperationalError("connection lost")
+    )
+    with pytest.raises(BaselineSyncError) as caught:
+        sync(
+            cluster,
+            SimSettings(_env_file=None),
+            transport=_two_reads(_status(), _status()),
+        )
+    message = str(caught.value)
+    assert "unknown" in message
+    assert "rolled back" not in message
+    assert "safe to repeat" in message
+    regions = [c for c in connections if c.label == "region"]
+    assert regions and all(c.closed for c in regions)
 
 
 def test_sync_aborts_and_rolls_back_when_playback_advanced_during_the_copy(monkeypatch):
@@ -508,9 +583,28 @@ def test_sync_refusal_is_printed_as_a_message(capsys, monkeypatch):
 def test_sync_prints_the_report_and_exits_zero(capsys, monkeypatch):
     monkeypatch.setattr(
         "restaurantos.sim.baseline_sync.sync",
-        lambda cluster, settings, **kwargs: {"r1": {"orders": 3, "order_items": 4, "stock": 5}},
+        lambda cluster, settings, **kwargs: (
+            {"r1": {"orders": 3, "order_items": 4, "stock": 5}},
+            None,
+        ),
     )
     assert app(["baseline", "sync"]) == 0
     out = capsys.readouterr().out
     assert "r1: orders 3, order_items 4, stock 5, product_availability 0" in out
     assert "total: orders 3, order_items 4, stock 5, product_availability 0" in out
+
+
+def test_sync_prints_the_failed_sends_warning_to_stderr(capsys, monkeypatch):
+    monkeypatch.setattr(
+        "restaurantos.sim.baseline_sync.sync",
+        lambda cluster, settings, **kwargs: (
+            {"r1": {table: 3 for table in SYNC_TABLES}},
+            "warning: the last playback run counted sends that may not be settled "
+            "(orders_failed 2); sync once faults are healed",
+        ),
+    )
+    assert app(["baseline", "sync"]) == 0
+    captured = capsys.readouterr()
+    assert "orders_failed 2" in captured.err
+    assert "warning" not in captured.out
+    assert "total:" in captured.out

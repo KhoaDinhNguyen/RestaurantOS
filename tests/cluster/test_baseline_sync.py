@@ -124,7 +124,8 @@ def _settings() -> SimSettings:
 
 def test_sync_copies_the_regions_counts_to_the_baseline(cluster, seeded):
     region, baseline = seeded
-    counts = sync(cluster, _settings())
+    counts, warning = sync(cluster, _settings())
+    assert warning is None
     assert set(counts) == {"r1"}
     for table in SYNC_TABLES:
         # what the command copied is what the region holds...
@@ -142,9 +143,9 @@ def test_sync_copies_the_regions_counts_to_the_baseline(cluster, seeded):
 
 def test_a_second_sync_is_idempotent(cluster, seeded):
     region, baseline = seeded
-    first = sync(cluster, _settings())
+    first, _ = sync(cluster, _settings())
     before = {table: _count(baseline, table) for table in SYNC_TABLES}
-    second = sync(cluster, _settings())
+    second, _ = sync(cluster, _settings())
     assert second == first
     # the baseline holds the same rows after the second sync, not just
     # the same reported counts
@@ -164,7 +165,6 @@ def test_a_region_that_cannot_be_reached_is_an_error_that_leaves_the_baseline_al
     region, baseline = seeded
     sync(cluster, _settings())  # a good sync first, so there is something to lose
     before = {table: _count(baseline, table) for table in SYNC_TABLES}
-
     missing_rid = f"r{cluster.regions + 1}"
     missing = dataclasses.replace(cluster, regions=cluster.regions + 1)
     with pytest.raises(BaselineSyncError) as caught:

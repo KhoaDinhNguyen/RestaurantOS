@@ -49,7 +49,13 @@ detection, not prevention: it catches anything playback sent during the
 copy and rolls back, but a `resume` racing the copy still wastes the
 work. Residual, accepted: writers other than the configured playback
 process are invisible to the gate; a real exclusion (a marker playback
-honours) belongs with the WP6b control process.
+honours) belongs with the WP6b control process. Also accepted: a send
+playback counted as failed may still have committed on its region - a
+call that misses its deadline is abandoned, not cancelled, and its
+rollback is best effort (common/deadline.py) - and orders parked at HQ
+reach the regions later through a writer the gate cannot see at all.
+Sync after faults are healed and parked orders have been delivered; the
+warning (failed_sends_warning) states this, it does not refuse.
 
 Batch job, not a request path: plain sync psycopg connections from the
 host (common.cluster.host_conninfo), no Toxiproxy, no statement timeout,
@@ -258,6 +264,44 @@ def gate_recheck(before: dict | None, after: dict | None) -> str | None:
     return None
 
 
+def _positive_int(body: dict, name: str) -> int | None:
+    value = body.get(name)
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
+def failed_sends_warning(body: dict | None) -> str | None:
+    """One line for the report when the last playback run counted sends
+    that may not be settled: any *_failed counter above zero, or
+    orders parked at HQ. A send counted as failed may still have
+    committed on its region (a call that misses its deadline is
+    abandoned, not cancelled, and its rollback is best effort -
+    common/deadline.py), and parked orders reach the regions later
+    through a writer the gate cannot see. The sync still runs; the
+    warning states the precondition, it does not refuse."""
+    if body is None:
+        return None
+    named: list[str] = []
+    for name in sorted(body):
+        if name.endswith("_failed"):
+            count = _positive_int(body, name)
+            if count is not None:
+                named.append(f"{name} {count}")
+    parked = _positive_int(body, "orders_parked")
+    if parked is not None:
+        named.append(f"orders_parked {parked}")
+    if not named:
+        return None
+    return (
+        "warning: the last playback run counted sends that may not be "
+        f"settled ({', '.join(named)}); a send counted as failed may still "
+        "have committed on its region, and parked orders are delivered "
+        "later by a writer the gate cannot see - sync once faults are "
+        "healed and parked orders have been delivered"
+    )
+
+
 def _connection_refused(error: BaseException, depth: int = 8) -> bool:
     """True when the failure is ECONNREFUSED, not a timeout or a reset.
 
@@ -281,22 +325,27 @@ def sync(
     settings: SimSettings,
     *,
     transport: httpx.BaseTransport | None = None,
-) -> dict[str, dict[str, int]]:
+) -> tuple[dict[str, dict[str, int]], str | None]:
     """Copy the regions' four tables into the baseline; return the rows
-    copied per region per table: {region_id: {table: count}}.
+    copied per region per table ({region_id: {table: count}}) and, when
+    the last playback run counted failed or parked sends, the warning
+    line for the CLI to print (failed_sends_warning; None when clean).
 
     Raises BaselineSyncError when the system is not quiet, playback
     changed during the copy, or a database cannot be reached; in every
-    failure case the baseline is left untouched (the one transaction
-    rolls back). Genuine bugs (non-psycopg exceptions) keep their
-    traceback."""
+    failure case before the commit the baseline is left untouched (the
+    one transaction rolls back). A failure during the commit itself is
+    reported as an unknown outcome instead. Genuine bugs (non-psycopg
+    exceptions) keep their traceback."""
     # First gate read: quiet now, or refuse before anything is touched.
     with _control_client(settings, transport) as client:
         before = read_playback_status(client)
+    warning: str | None = None
     if before is not None:
         refusal = live_refusal(before)
         if refusal is not None:
             raise BaselineSyncError(f"refusing to sync the baseline: {refusal}")
+        warning = failed_sends_warning(before)
 
     # Every region must be reachable, and its snapshot taken, before
     # the baseline is touched. One read-only REPEATABLE READ transaction
@@ -351,12 +400,26 @@ def sync(
                 abort = gate_recheck(before, after)
                 if abort is not None:
                     raise BaselineSyncError(abort)
+                # The commit is explicit and its own step: a psycopg
+                # error anywhere above rolled the transaction back (the
+                # with-block exit aborted it), so those messages may
+                # say "left untouched". An error from the commit itself
+                # does NOT have that guarantee - the baseline holds
+                # either its old rows or the new copy, never a mix -
+                # which is why it is caught and worded separately.
+                try:
+                    baseline.commit()
+                except psycopg.Error as error:
+                    raise BaselineSyncError(
+                        f"committing the baseline copy failed: {error}; the "
+                        "outcome is unknown - the baseline now holds either "
+                        "its old rows or the new copy, never a mix; rerun "
+                        "`rosctl baseline sync` (it is safe to repeat)"
+                    ) from error
         except psycopg.Error as error:
-            # Covers everything up to the COMMIT: connect, DELETE, COPY,
-            # the wrapped failures above. A failure during the COMMIT
-            # itself (the connection lost mid-commit) has an unknown
-            # outcome - the message below would then overstate what is
-            # known, but that window is a fraction of a second.
+            # Everything up to the explicit commit() above: connect,
+            # DELETE, COPY, the wrapped failures. All of it rolled the
+            # transaction back, so the message below can say so.
             raise BaselineSyncError(
                 f"the baseline node failed during the sync: {error}; it was "
                 "left untouched (the transaction rolled back)"
@@ -364,7 +427,7 @@ def sync(
     finally:
         for connection in regions.values():
             connection.close()
-    return counts
+    return counts, warning
 
 
 def _copy_table(source: psycopg.Connection, baseline: psycopg.Connection, table: str) -> int:
