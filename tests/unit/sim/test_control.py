@@ -124,12 +124,18 @@ async def test_api_start_past_the_data_is_shortened(tmp_path: Path, caplog) -> N
     """Review round 2, item 4: an API start with a to_day past the last
     cached day still succeeds - the answer shows the effective day, the
     process's logger says so (review round 3, item 9 moved the warning
-    from a bare print to logging), and meta.json records both ends."""
+    from a bare print to logging), and meta.json records both ends.
+
+    Review round 4, item 8: caplog's level is set on the exact logger,
+    so the capture is what the test claims, not an accident of the
+    root logger's level."""
     import json
+    import logging
 
     from restaurantos.sim.control import make_control_app
     from restaurantos.sim.replaydata import CacheMeta, require_window
 
+    caplog.set_level(logging.WARNING, logger="restaurantos.sim.playback")
     meta = CacheMeta(
         orders_sha256="x",
         order_items_sha256="y",
@@ -163,30 +169,41 @@ async def test_api_start_past_the_data_is_shortened(tmp_path: Path, caplog) -> N
     await drive(pb, clock)
 
 
-async def test_the_shortening_warning_survives_a_broken_stderr(tmp_path: Path) -> None:
+async def test_the_shortening_warning_survives_a_broken_stderr(tmp_path: Path, caplog) -> None:
     """Review round 3, item 9: the warning goes through logging, and a
     handler that cannot write - a closed stderr pipe - is reported by
     logging itself instead of raising into the route: the start that
-    already succeeded still answers 200 with the shortened to_day."""
+    already succeeded still answers 200 with the shortened to_day.
+
+    Review round 4, item 8: WARNING is enabled on the exact logger and
+    the broken stream counts its write attempts, so the test proves the
+    handler really was asked to write."""
     import logging
 
     from restaurantos.sim.control import make_control_app
     from restaurantos.sim.replaydata import CacheMeta, require_window
 
     class BrokenStderr:
-        """A stderr that is a closed pipe: every write raises."""
+        """A stderr that is a closed pipe: every write raises, and
+        every attempt is counted."""
+
+        def __init__(self) -> None:
+            self.writes = 0
 
         def write(self, *args):
+            self.writes += 1
             raise BrokenPipeError("stderr is a closed pipe")
 
         def flush(self):
             raise BrokenPipeError("stderr is a closed pipe")
 
+    caplog.set_level(logging.WARNING, logger="restaurantos.sim.playback")
+    broken = BrokenStderr()
     logger = logging.getLogger("restaurantos.sim.playback")
     # a real StreamHandler over the broken stream: its emit catches the
     # write error and reports it through handleError, which swallows
     # the OSError it meets while reporting - the route never sees it
-    handler = logging.StreamHandler(BrokenStderr())
+    handler = logging.StreamHandler(broken)
     logger.addHandler(handler)
     try:
         meta = CacheMeta(
@@ -215,6 +232,9 @@ async def test_the_shortening_warning_survives_a_broken_stderr(tmp_path: Path) -
             )
         assert response.status_code == 200, response.text
         assert response.json()["to_day"] == meta.last_day
+        # the handler really was asked to write, and the route never
+        # saw the failure
+        assert broken.writes >= 1
         await drive(pb, clock)
     finally:
         logger.removeHandler(handler)

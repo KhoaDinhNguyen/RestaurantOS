@@ -286,20 +286,22 @@ async def test_stop_while_an_event_waits_for_its_predecessor(tmp_path: Path) -> 
         transport=transport,
     )
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="chained-stop")
-    # wait, with a bound, until accepted is held on the wire and
-    # preparing has been dispatched behind it: heap items three and
-    # four are the two orders' preparing events, so four dispatches
-    # mean 1001's preparing is out too
-    for _ in range(200):
-        on_wire = {event_id for _status, event_id in transport.wire}
-        if expected_event_id("1001", "accepted") in on_wire and pb.status()["events_sent"] >= 4:
-            break
-        await settle(2)
-    else:
-        pytest.fail("preparing was never dispatched behind the held accepted")
-
     before = time.monotonic()
     try:
+        # wait, with a bound, until accepted is held on the wire and
+        # preparing has been dispatched behind it: heap items three and
+        # four are the two orders' preparing events, so four dispatches
+        # mean 1001's preparing is out too (review round 4, item 9: the
+        # readiness polling sits inside the release, so a failed poll
+        # never leaves the held task behind either)
+        for _ in range(200):
+            on_wire = {event_id for _status, event_id in transport.wire}
+            if expected_event_id("1001", "accepted") in on_wire and pb.status()["events_sent"] >= 4:
+                break
+            await settle(2)
+        else:
+            pytest.fail("preparing was never dispatched behind the held accepted")
+
         # a stalled stop must fail the test, not hang the suite
         await asyncio.wait_for(pb.stop(), 5)
     finally:
@@ -1299,18 +1301,23 @@ async def test_a_normal_end_waits_for_every_send(tmp_path: Path) -> None:
         transport=transport,
     )
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="normal-end")
-    await drive(pb, clock, steps=5)
-    # everything is dispatched; the last event is held, and the run has
-    # not ended - it is waiting for it
-    assert pb.status()["events_sent"] == 4
-    assert pb.status()["state"] == "running"
-
-    # hold it well past the drain timeout (a bounded timer, not an
-    # open-ended wait): the run is still waiting, nothing was drained
-    await asyncio.wait_for(asyncio.sleep(0.5), 5)
-    assert pb.status()["state"] == "running"
-
+    # review round 4, item 9: the release covers everything after the
+    # start, the drive and the dispatch assertions included, so a
+    # failed assertion never leaves the held task behind either
     try:
+        await drive(pb, clock, steps=5)
+        # everything is dispatched; the last event is held, and the run
+        # has not ended - it is waiting for it
+        assert pb.status()["events_sent"] == 4
+        assert pb.status()["state"] == "running"
+
+        # hold it well past the drain timeout (a bounded timer, not an
+        # open-ended wait): the run is still waiting, nothing was
+        # drained - and only now, after that check, is picked_up
+        # released
+        await asyncio.wait_for(asyncio.sleep(0.5), 5)
+        assert pb.status()["state"] == "running"
+
         transport.release.set()
         await asyncio.wait_for(pb.wait_done(), 5)
     finally:
@@ -1490,8 +1497,11 @@ class FakeEdge(httpx.AsyncBaseTransport):
             if outcome == "409":
                 return httpx.Response(409, json={"detail": "state machine"})
             if outcome == "string-flags":
-                # a flag that is not a real boolean (item 4)
-                return httpx.Response(201, json={"applied": "true"})
+                # only `applied` is malformed (review round 4, item 10):
+                # the other flags are real booleans
+                return httpx.Response(
+                    201, json={"applied": "false", "duplicate": False, "conflict": False}
+                )
             if event_id in self.seen:
                 return self._status_result(order_id, event_id, to_status, False, duplicate=True)
             current = self._statuses(self.status_of.get(order_id, "received"))
@@ -1870,11 +1880,12 @@ async def test_an_unknown_region_is_failed_not_sent_to_the_gateway(tmp_path: Pat
     assert transport.requests == ["http://stub.test/api/v1/orders"]
     lines = run_log_lines(tmp_path, pb)
     assert not any(line["kind"] == "missing" for line in lines)
-    for line in lines:
-        if line["kind"] == "status_event":
-            assert line["error"] == "unknown region"
-            assert "http_status" not in line
-            assert line["wall_sent_at"] is None
+    events = [line for line in lines if line["kind"] == "status_event"]
+    assert len(events) == 4  # every scheduled event has its line (round 4, item 10)
+    for line in events:
+        assert line["error"] == "unknown region"
+        assert "http_status" not in line
+        assert line["wall_sent_at"] is None
 
 
 async def test_a_non_string_region_id_is_failed_the_same_way(tmp_path: Path) -> None:
@@ -1899,9 +1910,10 @@ async def test_a_non_string_region_id_is_failed_the_same_way(tmp_path: Path) -> 
     assert transport.requests == ["http://stub.test/api/v1/orders"]
     lines = run_log_lines(tmp_path, pb)
     assert not any(line["kind"] == "missing" for line in lines)
-    for line in lines:
-        if line["kind"] == "status_event":
-            assert line["error"] == "unknown region"
+    events = [line for line in lines if line["kind"] == "status_event"]
+    assert len(events) == 4  # every scheduled event has its line (round 4, item 10)
+    for line in events:
+        assert line["error"] == "unknown region"
 
 
 async def test_an_explicitly_empty_kitchen_map_stays_edge_mode(tmp_path: Path) -> None:
@@ -1928,6 +1940,7 @@ async def test_an_explicitly_empty_kitchen_map_stays_edge_mode(tmp_path: Path) -
     assert transport.requests == ["http://stub.test/api/v1/orders"]
     lines = run_log_lines(tmp_path, pb)
     assert not any(line["kind"] == "missing" for line in lines)
-    for line in lines:
-        if line["kind"] == "status_event":
-            assert line["error"] == "unknown region"
+    events = [line for line in lines if line["kind"] == "status_event"]
+    assert len(events) == 4  # every scheduled event has its line (round 4, item 10)
+    for line in events:
+        assert line["error"] == "unknown region"
