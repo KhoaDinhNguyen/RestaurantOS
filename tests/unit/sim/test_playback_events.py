@@ -938,6 +938,71 @@ async def test_stop_ends_the_wait_for_an_unanswered_order(tmp_path: Path) -> Non
     assert all(line["error"] == "cancelled" for line in lines)
 
 
+async def test_a_normal_end_waits_for_every_send(tmp_path: Path) -> None:
+    """Review round 2, item 3: when the dispatcher finishes normally,
+    the run waits for its last in-flight sends instead of cutting them
+    off at the drain timeout - a completed run must not lose its tail
+    as `cancelled`."""
+    hold = expected_event_id("1001", "picked_up")
+    transport = HoldingEvent(hold)
+    orders = [make_order(14, 0, 0, 1, "1001")]
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=8,
+        speed=1e9,
+        status_events=True,
+        drain_timeout_s=0.2,  # far shorter than the hold
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="normal-end")
+    await settle(40)
+    # everything is dispatched; the last event is held, and the run has
+    # not ended - it is waiting for it
+    assert pb.status()["events_sent"] == 4
+    assert pb.status()["state"] == "running"
+
+    transport.release.set()
+    await pb.wait_done()
+    status = pb.status()
+    assert status["state"] == "done"
+    assert status["events_acked"] == 4
+    events = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
+    assert all("error" not in line for line in events)
+
+
+async def test_stop_during_the_final_wait_ends_stopped(tmp_path: Path) -> None:
+    """A stop accepted while the run waits for its last held send ends
+    the run as `stopped` (not `done`), inside the drain timeout; the
+    held send is cancelled and its line says so, and the log stays
+    dense."""
+    hold = expected_event_id("1001", "picked_up")
+    transport = HoldingEvent(hold)  # never released
+    orders = [make_order(14, 0, 0, 1, "1001")]
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=8,
+        speed=1e9,
+        status_events=True,
+        drain_timeout_s=0.2,
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="final-wait")
+    await settle(40)
+    assert pb.status()["events_sent"] == 4
+    assert pb.status()["state"] == "running"
+
+    before = time.monotonic()
+    await asyncio.wait_for(pb.stop(), 5)
+    assert pb.status()["state"] == "stopped"
+    assert time.monotonic() - before < 5.0
+    lines = run_log_lines(tmp_path, pb)
+    assert [line["seq"] for line in lines] == list(range(len(lines)))
+    held = next(line for line in lines if line["kind"] == "status_event" and line.get("error"))
+    assert held["error"] == "cancelled"
+
+
 async def test_stop_leaves_a_dense_log_with_events(tmp_path: Path) -> None:
     """A stop mid-run with events scheduled: whatever was dispatched is
     logged densely, nothing half-written, and the run ends stopped."""

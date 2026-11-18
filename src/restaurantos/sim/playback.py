@@ -738,6 +738,21 @@ class Playback:
             try:
                 # Each step is guarded: a cleanup error must not skip
                 # the final state or _done.set().
+                if not stopped and not failed:
+                    # A run that ended normally waits for every send it
+                    # started (review round 2, item 3): on a slow target
+                    # the bounded drain below would otherwise cut the
+                    # tail off a *completed* run and count it cancelled.
+                    # Each send is still bounded by the HTTP timeout once
+                    # it holds a slot; only a stop (or a failure) falls
+                    # through to the drain.
+                    while True:
+                        outstanding = {task for task in self._send_tasks if not task.done()}
+                        if not outstanding:
+                            break
+                        if not await self._await_or_stop(asyncio.wait(outstanding)):
+                            stopped = True
+                            break
                 try:
                     await self._drain()
                 except Exception:  # noqa: BLE001
@@ -771,9 +786,14 @@ class Playback:
                     with contextlib.suppress(Exception):
                         clock.pause()
                 # set only here, at the very end: earlier, and a start
-                # could slip in while this run is still cleaning up
+                # could slip in while this run is still cleaning up.
+                # FAILED always wins; a stop that arrived during the
+                # final wait (or during the drain) still reads as
+                # STOPPED, never as done.
                 self._state = (
-                    FAILED if failed or cleanup_cancelled else (STOPPED if stopped else DONE)
+                    FAILED
+                    if failed or cleanup_cancelled
+                    else (STOPPED if stopped or self._state == STOPPING else DONE)
                 )
                 self._done.set()
 
