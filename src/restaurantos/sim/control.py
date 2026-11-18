@@ -15,6 +15,7 @@ port. WP6b will resolve it; the port is a setting either way.
 
 from __future__ import annotations
 
+import sys
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
@@ -83,6 +84,20 @@ def make_control_app(playback: Playback) -> FastAPI:
                     speed=command.speed or playback.default_speed,
                     run_id=command.run_id,
                 )
+                status = playback.status()
+                if (
+                    command.to_day is not None
+                    and status["to_day"] is not None
+                    and command.to_day > status["to_day"]
+                ):
+                    # the window check shortened to_day to the last day
+                    # the data holds; the answer already shows the
+                    # effective day, so say so on the process's stderr
+                    print(
+                        f"playback start: data only goes to day {status['to_day']}; "
+                        f"running to day {status['to_day']} instead of {command.to_day}",
+                        file=sys.stderr,
+                    )
             elif command.action == "pause":
                 await playback.pause()
             elif command.action == "resume":

@@ -398,6 +398,10 @@ class Playback:
         """Begin a run from `from_day` to `to_day` (None: to the end)."""
         if to_day is not None and to_day < from_day:
             raise ValueError(f"to_day {to_day} is before from_day {from_day}")
+        # what the caller asked for, recorded next to the effective days
+        # so the run log can be read against the request (a window check
+        # may shorten to_day to the last day the data holds)
+        requested_to_day = to_day
         # a finished run frees the slot: the control plane may start
         # another run on the same engine without restarting anything
         self._require(FINAL_STATES, "start a run")
@@ -450,6 +454,7 @@ class Playback:
             "seed": seed,
             "from_day": from_day,
             "to_day": to_day,
+            "to_day_requested": requested_to_day,
             "speed": speed,
             "inflight": self._inflight,
             "target_url": self._orders_url,

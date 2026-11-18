@@ -77,10 +77,17 @@ async def start_command(args: argparse.Namespace) -> int:
     )
     to_day = args.to_day
     try:
-        require_window(meta, from_day, to_day)
+        window = require_window(meta, from_day, to_day)
     except ValueError as error:
         print(f"rosctl playback start: {error}", file=sys.stderr)
         return 1
+    if window.shortened_from is not None:
+        # before the banner: the run that follows is not the one asked for
+        print(
+            f"rosctl playback start: data only goes to day {meta.last_day}; "
+            f"running to day {meta.last_day} instead of {window.shortened_from}",
+            file=sys.stderr,
+        )
 
     speed = args.speed or sim.playback_speed
     inflight = args.inflight or sim.playback_inflight
@@ -92,9 +99,10 @@ async def start_command(args: argparse.Namespace) -> int:
         else sim.playback_event_sample_rate
     )
     restock_every = args.restock_days if args.restock_days is not None else sim.stock_restock_days
-    last_day = to_day if to_day is not None else meta.last_day
     try:
-        banner_days = restock_days(meta.warm_up_days, restock_every, from_day, last_day)
+        # the banner's days come from the effective window, so a
+        # shortened to_day never announces restocks outside the data
+        banner_days = restock_days(meta.warm_up_days, restock_every, window.from_day, window.to_day)
         vendors = restock_vendors(data_dir)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"rosctl playback start: {error}", file=sys.stderr)
@@ -146,6 +154,9 @@ async def start_command(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        # the original to_day goes to the engine: it records it as
+        # to_day_requested in meta.json and its window check does the
+        # same shortening this command already reported
         await playback.start(
             seed=args.seed,
             from_day=from_day,
@@ -166,7 +177,7 @@ async def start_command(args: argparse.Namespace) -> int:
             events_note += f" (sample rate {event_rate})"
         print(
             f"run {playback.status()['run_id']} started: {from_day} -> "
-            f"{to_day if to_day is not None else meta.last_day}, speed {speed}x, "
+            f"{window.to_day}, speed {speed}x, "
             f"{inflight} in flight, events {events_note}, restock on "
             f"{len(banner_days)} day(s) x {len(vendors)} vendors, control on {sim.control_host}:"
             f"{args.port or sim.control_port}",

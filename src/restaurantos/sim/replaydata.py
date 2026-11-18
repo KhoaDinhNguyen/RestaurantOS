@@ -61,6 +61,27 @@ IMPORT_BATCH = 100_000
 
 
 @dataclass(frozen=True)
+class ReplayWindow:
+    """The replay window a run will actually use, after validation.
+
+    `to_day` is the effective end: the caller's to_day, the cache's
+    last day when the caller left it open, or the cache's last day
+    again when the caller asked for more than the data holds - the
+    last case is reported in `shortened_from` so the caller can say
+    so; this module never prints.
+    """
+
+    from_day: int
+    to_day: int
+    shortened_from: int | None = None
+
+    def __iter__(self) -> Iterator[int]:
+        # unpacking stays legal for the callers that only want the days
+        yield self.from_day
+        yield self.to_day
+
+
+@dataclass(frozen=True)
 class CacheMeta:
     """What the cache was built from; enough to decide it is stale."""
 
@@ -379,7 +400,7 @@ def to_order_request(order: dict) -> OrderRequest:
     )
 
 
-def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> tuple[int, int]:
+def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> ReplayWindow:
     """Validate the replay window against the cache, or raise ValueError.
 
     from_day below the warm-up window is refused, not clamped: those
@@ -387,6 +408,11 @@ def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> tuple[
     its usage), so replaying them would count every ingredient twice
     and no oracle could ever match. The two settings stay decoupled;
     this only rejects the combination that cannot mean anything.
+
+    A to_day past the last cached day is shortened to it and reported
+    in `shortened_from`, not refused: the caller prints the warning,
+    never this module. Days with no orders inside the window stay
+    empty, but the window itself never runs past the data.
     """
     if from_day < max(meta.warm_up_days, meta.first_day):
         raise ValueError(
@@ -401,4 +427,12 @@ def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> tuple[
         )
     if to_day is not None and to_day < from_day:
         raise ValueError(f"to_day {to_day} is before from_day {from_day}")
-    return from_day, to_day if to_day is not None else meta.last_day
+    shortened_from = None
+    if to_day is not None and to_day > meta.last_day:
+        shortened_from = to_day
+        to_day = meta.last_day
+    return ReplayWindow(
+        from_day=from_day,
+        to_day=to_day if to_day is not None else meta.last_day,
+        shortened_from=shortened_from,
+    )

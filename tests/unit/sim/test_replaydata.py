@@ -185,8 +185,41 @@ def test_require_window_refuses_the_warm_up(tmp_path: Path) -> None:
     # past the last cached day the run would replay nothing (review B1)
     with pytest.raises(ValueError, match="last cached day"):
         require_window(meta, from_day=91, to_day=95)
-    assert require_window(meta, from_day=14, to_day=20) == (14, 20)
-    assert require_window(meta, from_day=14, to_day=None) == (14, meta.last_day)
+    window = require_window(meta, from_day=14, to_day=meta.last_day)
+    assert (window.from_day, window.to_day) == (14, meta.last_day)
+    assert window.shortened_from is None
+    # past the last cached day: shortened to it and reported (round 2, 4)
+    window = require_window(meta, from_day=14, to_day=meta.last_day + 6)
+    assert (window.from_day, window.to_day) == (14, meta.last_day)
+    assert window.shortened_from == meta.last_day + 6
+    # an open end still resolves to the last cached day
+    assert tuple(require_window(meta, from_day=14, to_day=None)) == (14, meta.last_day)
+
+
+def test_a_to_day_past_the_data_is_shortened_not_refused(tmp_path: Path) -> None:
+    """Review round 2, item 4: an explicit to_day past the last day
+    that has orders is shortened to that day and reported, so restocks
+    are never scheduled on days with no orders and the run never waits
+    in simulated time past the data. The day itself is read from meta,
+    never written into the test."""
+    orders = [
+        ["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"],
+        ["2", "c1", "v1", "w21z7", "3", 15, "12:00:00"],
+    ]
+    data = make_data_dir(tmp_path, orders, [["1", "p1", 1], ["2", "p1", 1]])
+    meta = build_cache(data, warm_up_days=14)
+
+    window = require_window(meta, from_day=14, to_day=meta.last_day + 5)
+    assert window.to_day == meta.last_day
+    assert window.shortened_from == meta.last_day + 5
+    # at the boundary it is not a shortening
+    window = require_window(meta, from_day=14, to_day=meta.last_day)
+    assert window.to_day == meta.last_day
+    assert window.shortened_from is None
+    # and an open end still resolves to the last cached day
+    window = require_window(meta, from_day=14, to_day=None)
+    assert window.to_day == meta.last_day
+    assert window.shortened_from is None
 
 
 def test_ensure_cache_rebuilds_when_the_cache_file_is_gone(tmp_path: Path) -> None:

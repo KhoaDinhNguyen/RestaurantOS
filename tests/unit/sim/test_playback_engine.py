@@ -223,11 +223,14 @@ async def test_log_is_in_send_order_despite_reordered_acks(tmp_path: Path) -> No
 
 
 async def test_drain_timeout_records_every_dispatched_order(tmp_path: Path) -> None:
-    """A burst faster than the consumer: the drain timeout cancels
-    tasks still queued for a slot, and every dispatched order must
-    still get its log line - found by the real-data throughput probe,
-    which lost 460 lines before the record moved before the
-    semaphore."""
+    """A burst faster than the consumer. Before review round 2, item 3,
+    a run that ended normally had its still-queued sends cancelled at
+    the drain timeout (0.05 s here, against a 0.2 s stub) and lost them
+    as failures; now a normal end waits for every send it started, so
+    the burst is answered, not cancelled - while the one-line-per-
+    dispatched-order invariant (the throughput probe's lesson: 460
+    lines were lost before the record moved before the semaphore)
+    holds either way."""
     transport = CountingTransport(httpx.ASGITransport(app=make_stub_app(delay_seconds=0.2)))
     orders = sample_orders(6)
     pb = Playback(
@@ -235,7 +238,7 @@ async def test_drain_timeout_records_every_dispatched_order(tmp_path: Path) -> N
         target_url="http://stub.test/api/v1",
         inflight=1,
         http_timeout_s=5.0,
-        drain_timeout_s=0.05,  # nothing can finish in time
+        drain_timeout_s=0.05,  # nothing can finish within it
         runs_dir=tmp_path,
         transport=transport,
     )  # real wall clock: the stub's 0.2 s delay must actually elapse
@@ -246,8 +249,10 @@ async def test_drain_timeout_records_every_dispatched_order(tmp_path: Path) -> N
     lines = run_log_lines(tmp_path, pb)
     assert len(lines) == len(orders)  # one line per dispatched order
     assert [line["seq"] for line in lines] == list(range(len(orders)))
-    assert all(line["error"] == "cancelled" for line in lines)
-    assert pb.status()["orders_failed"] == len(orders)
+    # the run waited past its drain timeout for its own sends
+    assert all(line["http_status"] == 201 for line in lines)
+    assert pb.status()["orders_acked"] == len(orders)
+    assert pb.status()["orders_failed"] == 0
 
 
 async def test_stop_drains_in_flight_requests(tmp_path: Path) -> None:

@@ -119,6 +119,48 @@ async def test_full_cycle_through_the_routes(client, pb, tmp_path):
         assert response.json()["state"] == "stopped"
 
 
+async def test_api_start_past_the_data_is_shortened(tmp_path: Path, capsys) -> None:
+    """Review round 2, item 4: an API start with a to_day past the last
+    cached day still succeeds - the answer shows the effective day, the
+    process's stderr says so, and meta.json records both ends."""
+    import json
+
+    from restaurantos.sim.control import make_control_app
+    from restaurantos.sim.replaydata import CacheMeta, require_window
+
+    meta = CacheMeta(
+        orders_sha256="x",
+        order_items_sha256="y",
+        warm_up_days=14,
+        first_day=14,
+        last_day=14,
+        orders=1,
+        itemless_orders=0,
+    )
+    clock = FakeWallClock()
+    pb = make_playback(
+        sample_orders(2),
+        tmp_path,
+        clock=clock,
+        window_check=lambda f, t: require_window(meta, f, t),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        response = await client.post(
+            "/sim/playback",
+            json={"action": "start", "from_day": 14, "to_day": 200, "speed": 100.0},
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["to_day"] == meta.last_day
+    assert f"data only goes to day {meta.last_day}" in capsys.readouterr().err
+    run_meta = json.loads((tmp_path / body["run_id"] / "meta.json").read_text())
+    assert run_meta["to_day"] == meta.last_day
+    assert run_meta["to_day_requested"] == 200
+    await drive(pb, clock)
+
+
 async def test_the_clock_stands_still_when_paused_or_ended(tmp_path: Path):
     """API review 4.5: while paused, and after a run has ended (done or
     stopped), the clock stands at its last moment; simulated time must

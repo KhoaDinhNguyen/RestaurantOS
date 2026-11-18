@@ -241,3 +241,108 @@ def test_start_refuses_a_window_inside_the_warmup(tmp_path, monkeypatch, capsys,
     rc = app(["playback", "start", "--from-day", "13", "--port", "1"])
     assert rc == 1
     assert "warm-up" in capsys.readouterr().err
+
+
+def test_start_shortens_a_to_day_past_the_data(tmp_path, monkeypatch, capsys, fresh_settings):
+    """Review round 2, item 4: a to_day past the last cached day is
+    shortened, with a warning before the banner, and the banner's
+    restock-day count comes from the shortened window. The engine
+    boundary is faked: the CLI's own reporting is what is under test."""
+    import asyncio
+
+    import uvicorn
+    from test_replaydata import make_data_dir
+
+    import restaurantos.sim.playback_cli as playback_cli
+    from restaurantos.sim.replaydata import build_cache, load_meta
+
+    orders = [
+        ["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"],
+        ["2", "c1", "v1", "w21z7", "3", 15, "12:00:00"],
+    ]
+    data = make_data_dir(tmp_path, orders, [["1", "p1", 1], ["2", "p1", 1]])
+    build_cache(data, warm_up_days=14, quiet=True)
+    meta = load_meta(data)
+    assert meta is not None
+
+    class FakeServer:
+        started = True
+
+        def __init__(self, config):
+            self.should_exit = False
+
+        async def serve(self):
+            while not self.should_exit:
+                await asyncio.sleep(0.01)
+
+    class FakePlayback:
+        default_speed = 1000.0
+
+        def __init__(self, *args, **kwargs):
+            self._state = "idle"
+
+        async def start(self, **kwargs):
+            self._state = "done"
+
+        async def pause(self):
+            pass
+
+        async def resume(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def set_speed(self, speed):
+            pass
+
+        async def wait_done(self):
+            pass
+
+        @property
+        def state(self):
+            return self._state
+
+        def status(self):
+            return {
+                "run_id": "fake",
+                "state": self._state,
+                "orders_sent": 0,
+                "orders_acked": 0,
+                "orders_parked": 0,
+                "orders_refused": 0,
+                "orders_failed": 0,
+            }
+
+        def clock(self):
+            return {}
+
+    monkeypatch.setenv("ROS_DATA_DIR", str(data))
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(playback_cli, "Playback", FakePlayback)
+
+    rc = app(
+        [
+            "playback",
+            "start",
+            "--from-day",
+            "14",
+            "--to-day",
+            "40",
+            "--restock-days",
+            "1",
+            "--port",
+            "1",
+        ]
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert (
+        f"data only goes to day {meta.last_day}; "
+        f"running to day {meta.last_day} instead of 40" in err
+    )
+    # the banner's restock count comes from the shortened window: day
+    # 15 alone (the first restock is W+R), not 15 through 40
+    assert "restock on 1 day(s)" in err
+    # and the banner names the effective end, not the requested one
+    assert f"started: 14 -> {meta.last_day}," in err

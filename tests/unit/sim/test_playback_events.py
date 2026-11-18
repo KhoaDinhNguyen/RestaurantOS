@@ -715,18 +715,21 @@ async def test_restocks_wait_for_the_sends_from_before_midnight(tmp_path: Path) 
     answer, so the end-of-cycle stock never depends on timing."""
     orders = [make_order(20, 23, 59, 58, "1001"), make_order(21, 0, 0, 5, "1002")]
     transport = HoldingOrders()
+    clock = FakeWallClock()
     pb = make_playback(
         orders,
         tmp_path,
+        clock=clock,
         inflight=8,
-        speed=1e9,
         restock_every=7,
         warm_up_days=14,
         restock_vendors=("v001", "v002"),
         transport=transport,
     )
     await pb.start(seed=0, from_day=20, to_day=21, speed=1e9, run_id="pre-midnight")
-    await settle(20)
+    # fake time makes the dispatches deterministic; the run cannot end
+    # while the order's answer is held
+    await drive(pb, clock, steps=5)
     # the order from before midnight is dispatched and held; the restocks
     # have not gone out
     assert pb.status()["orders_sent"] == 1
@@ -756,11 +759,12 @@ async def test_stop_during_the_pre_restock_wait_ends_stopped(tmp_path: Path) -> 
     behind the wait was never dispatched, so it has no line."""
     orders = [make_order(20, 23, 59, 58, "1001")]
     transport = HoldingOrders()  # never released
+    clock = FakeWallClock()
     pb = make_playback(
         orders,
         tmp_path,
+        clock=clock,
         inflight=8,
-        speed=1e9,
         drain_timeout_s=0.3,
         restock_every=7,
         warm_up_days=14,
@@ -768,7 +772,7 @@ async def test_stop_during_the_pre_restock_wait_ends_stopped(tmp_path: Path) -> 
         transport=transport,
     )
     await pb.start(seed=0, from_day=20, to_day=21, speed=1e9, run_id="held-pre-restock")
-    await settle(20)
+    await drive(pb, clock, steps=5)
     assert pb.status()["restocks_sent"] == 0
 
     before = time.monotonic()
@@ -779,6 +783,48 @@ async def test_stop_during_the_pre_restock_wait_ends_stopped(tmp_path: Path) -> 
     assert [line["seq"] for line in lines] == list(range(len(lines)))
     assert [line["kind"] for line in lines] == ["order"]
     assert lines[0]["error"] == "cancelled"
+
+
+async def test_a_to_day_past_the_data_is_shortened_per_run(tmp_path: Path) -> None:
+    """The engine's own window check shortens an explicit to_day to the
+    last cached day (review round 2, item 4): no restock lands beyond
+    the data, the run ends done without waiting for days with no
+    orders, and meta.json records both the requested and the effective
+    end."""
+    from restaurantos.sim.replaydata import CacheMeta, require_window
+
+    meta = CacheMeta(
+        orders_sha256="x",
+        order_items_sha256="y",
+        warm_up_days=7,
+        first_day=14,
+        last_day=15,
+        orders=2,
+        itemless_orders=0,
+    )
+    orders = [make_order(14, 0, 0, 5, "1001"), make_order(15, 0, 0, 5, "1002")]
+    pb = make_playback(
+        orders,
+        tmp_path,
+        restock_every=7,
+        warm_up_days=7,
+        restock_vendors=("v001",),
+        window_check=lambda f, t: require_window(meta, f, t),
+    )
+    # W=7 and R=7: without the shortening the restock days would run
+    # 21, 28, 35 - all past the data
+    await pb.start(seed=0, from_day=14, to_day=40, speed=1e9, run_id="short")
+    await pb.wait_done()
+    status = pb.status()
+    assert status["state"] == "done"
+    assert status["to_day"] == 15
+    assert status["restocks_sent"] == 1  # day 14 alone
+    meta_json = json.loads((tmp_path / "short" / "meta.json").read_text())
+    assert meta_json["to_day"] == 15
+    assert meta_json["to_day_requested"] == 40
+    assert meta_json["restock"]["days"] == [14]
+    lines = run_log_lines(tmp_path, pb)
+    assert all(line["restock_day"] <= 15 for line in lines if line["kind"] == "restock")
 
 
 async def test_restock_on_the_first_day_goes_out_first(tmp_path: Path) -> None:
@@ -946,17 +992,18 @@ async def test_a_normal_end_waits_for_every_send(tmp_path: Path) -> None:
     hold = expected_event_id("1001", "picked_up")
     transport = HoldingEvent(hold)
     orders = [make_order(14, 0, 0, 1, "1001")]
+    clock = FakeWallClock()
     pb = make_playback(
         orders,
         tmp_path,
+        clock=clock,
         inflight=8,
-        speed=1e9,
         status_events=True,
         drain_timeout_s=0.2,  # far shorter than the hold
         transport=transport,
     )
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="normal-end")
-    await settle(40)
+    await drive(pb, clock, steps=5)
     # everything is dispatched; the last event is held, and the run has
     # not ended - it is waiting for it
     assert pb.status()["events_sent"] == 4
@@ -979,17 +1026,18 @@ async def test_stop_during_the_final_wait_ends_stopped(tmp_path: Path) -> None:
     hold = expected_event_id("1001", "picked_up")
     transport = HoldingEvent(hold)  # never released
     orders = [make_order(14, 0, 0, 1, "1001")]
+    clock = FakeWallClock()
     pb = make_playback(
         orders,
         tmp_path,
+        clock=clock,
         inflight=8,
-        speed=1e9,
         status_events=True,
         drain_timeout_s=0.2,
         transport=transport,
     )
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="final-wait")
-    await settle(40)
+    await drive(pb, clock, steps=5)
     assert pb.status()["events_sent"] == 4
     assert pb.status()["state"] == "running"
 
