@@ -691,6 +691,96 @@ async def test_stop_during_the_restock_barrier_ends_stopped(tmp_path: Path) -> N
     assert all(line["error"] == "cancelled" for line in lines)
 
 
+class HoldingOrders(httpx.AsyncBaseTransport):
+    """Holds every order answer until released, so the wait before a
+    restock batch is observable: the restocks must not go out while an
+    order from before midnight is still in flight."""
+
+    def __init__(self) -> None:
+        self.inner = httpx.ASGITransport(app=make_stub_app())
+        self.release = asyncio.Event()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/orders"):
+            await self.release.wait()
+        return await self.inner.handle_async_request(request)
+
+
+async def test_restocks_wait_for_the_sends_from_before_midnight(tmp_path: Path) -> None:
+    """Review round 2, item 2: the round-1 barrier protects the orders
+    after a restock, not the orders before it. An order sent at 23:59:58
+    and still in flight at 00:00:00 races the restock at the region:
+    "order, then restock" ends the cycle at par, "restock, then order"
+    at par minus the order. The restock now waits for that order's
+    answer, so the end-of-cycle stock never depends on timing."""
+    orders = [make_order(20, 23, 59, 58, "1001"), make_order(21, 0, 0, 5, "1002")]
+    transport = HoldingOrders()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=8,
+        speed=1e9,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=20, to_day=21, speed=1e9, run_id="pre-midnight")
+    await settle(20)
+    # the order from before midnight is dispatched and held; the restocks
+    # have not gone out
+    assert pb.status()["orders_sent"] == 1
+    assert pb.status()["restocks_sent"] == 0
+
+    transport.release.set()
+    await pb.wait_done()
+    assert pb.status()["state"] == "done"
+    lines = run_log_lines(tmp_path, pb)
+    order_line = next(
+        line for line in lines if line["kind"] == "order" and line["external_order_id"] == "1001"
+    )
+    restocks = [line for line in lines if line["kind"] == "restock"]
+    # every restock went out after the earlier order was answered
+    assert all(line["wall_sent_at"] >= order_line["wall_acked_at"] for line in restocks)
+    # and the day's own orders still follow the round-1 barrier
+    day_order = next(
+        line for line in lines if line["kind"] == "order" and line["external_order_id"] == "1002"
+    )
+    assert all(day_order["wall_sent_at"] >= line["wall_acked_at"] for line in restocks)
+
+
+async def test_stop_during_the_pre_restock_wait_ends_stopped(tmp_path: Path) -> None:
+    """A stop while the dispatcher waits for an in-flight order before
+    the restock batch ends the run as stopped, with a dense log: the
+    held order is cancelled by the drain (one line), and the restock
+    behind the wait was never dispatched, so it has no line."""
+    orders = [make_order(20, 23, 59, 58, "1001")]
+    transport = HoldingOrders()  # never released
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=8,
+        speed=1e9,
+        drain_timeout_s=0.3,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=20, to_day=21, speed=1e9, run_id="held-pre-restock")
+    await settle(20)
+    assert pb.status()["restocks_sent"] == 0
+
+    before = time.monotonic()
+    await asyncio.wait_for(pb.stop(), 5)
+    assert pb.status()["state"] == "stopped"
+    assert time.monotonic() - before < 5.0, "stop sat behind the held order"
+    lines = run_log_lines(tmp_path, pb)
+    assert [line["seq"] for line in lines] == list(range(len(lines)))
+    assert [line["kind"] for line in lines] == ["order"]
+    assert lines[0]["error"] == "cancelled"
+
+
 async def test_restock_on_the_first_day_goes_out_first(tmp_path: Path) -> None:
     """A restock day at the very start of the window fires at simulated
     zero, before the first order of the run (W=7 and R=7: day 14 is

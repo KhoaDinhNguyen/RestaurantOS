@@ -620,6 +620,7 @@ class Playback:
         sim_start = self._from_day * SECONDS_PER_DAY
         stopped = False
         failed = False
+        last_restock_deadline: float | None = None
         try:
             # One dispatcher, one total order: the next stream order
             # against the earliest scheduled event or restock, both
@@ -689,6 +690,40 @@ class Playback:
                             break
                         self._dispatch_event(deadline - sim_start, handle, to_status, jitter)
                     else:
+                        if deadline != last_restock_deadline:
+                            # The first restock of an instant waits for
+                            # every in-flight non-restock send first
+                            # (review round 2, item 2): an order sent at
+                            # 23:59:58 could still be in flight at
+                            # 00:00:00, and "order, then restock" ends
+                            # the cycle at par while "restock, then
+                            # order" ends it at par minus the order -
+                            # the oracle applies the order first, so
+                            # the wire must too. Waiting for events too
+                            # is fine: they never touch stock, and it
+                            # makes the restock instant a clean sync
+                            # point, at most one in-flight window per
+                            # restock day. The later restocks of the
+                            # same instant find nothing outstanding:
+                            # the dispatcher is sequential, and no
+                            # non-restock send started meanwhile.
+                            while True:
+                                outstanding = {
+                                    task
+                                    for task in self._send_tasks - self._restock_tasks
+                                    if not task.done()
+                                }
+                                if not outstanding:
+                                    break
+                                if not await self._await_or_stop(asyncio.wait(outstanding)):
+                                    stopped = True
+                                    break
+                            if stopped:
+                                break
+                            if not await self._after_gate():
+                                stopped = True
+                                break
+                            last_restock_deadline = deadline
                         self._dispatch_restock(deadline - sim_start, tie_a, tie_b)
                 # One loop turn per dispatch, even in a burst: sends and
                 # control requests must be able to run between the
