@@ -1225,9 +1225,16 @@ class Playback:
         caused by playback, not by a real race. A 2xx, 404, 409 or
         422 is never retried: the region answered. The chained next
         event of the order waits for this task, so it waits for the
-        final answer, retries included. A stop during a backoff
-        cancels the task, and its line says cancelled, as any
-        cancelled send does; a restock that still fails after its
+        final answer, retries included.
+
+        Each attempt's answer describes that attempt alone (review
+        round 4, item 1): the line's `http_status` and flags come
+        from the final attempt, and the reasons of the failed attempts
+        that a retry followed are kept in `earlier_failures`. A stop
+        ends the retries: after a backoff or a slot, a task that sees
+        STOPPING sends nothing new - the line says cancelled, the
+        call counts failed, and only the requests already on the
+        wire drain. A restock that still fails after its
         last attempt is counted failed and the run goes on - in a
         fault harness, a call that could not get through is a result
         to report, not a crash.
@@ -1249,7 +1256,22 @@ class Playback:
                 await asyncio.wait({previous})
             attempt = 1
             while True:
+                # each attempt's answer describes that attempt alone
+                # (review round 4, item 1): a status or a response left
+                # over from an earlier attempt must not mix into the
+                # line - the history of the failed attempts goes to
+                # `earlier_failures` instead
+                response = None
+                record.pop("http_status", None)
                 async with self._slots:
+                    if attempt > 1 and self._state == STOPPING:
+                        # a stop lets only what is already on the wire
+                        # finish: no new attempt after it, whether the
+                        # task woke from its backoff or just took the
+                        # slot. The line says cancelled, and the call
+                        # counts failed the way any cancelled call does
+                        record["error"] = "cancelled"
+                        break
                     try:
                         # The base is resolved here, inside the counted
                         # path, so a bad region_id (or any error in the
@@ -1285,13 +1307,18 @@ class Playback:
                     if attempt >= self._kitchen_attempts:
                         record["error"] = failure
                         break
+                    # this attempt failed and another one follows: keep
+                    # the reason in the history, out of the final answer
+                    record.setdefault("earlier_failures", []).append(failure)
                 # back off in wall time, without the slot, before the
-                # next attempt; a stop cancels the task here and its
-                # line says cancelled
+                # next attempt; a stop here also ends the retries
                 await self._wall.sleep(
                     _KITCHEN_BACKOFF_S[min(attempt - 1, len(_KITCHEN_BACKOFF_S) - 1)]
                 )
                 attempt += 1
+                if self._state == STOPPING:
+                    record["error"] = "cancelled"
+                    break
             if is_event:
                 if response is not None:
                     record.update(_response_fields(response, EVENT_RESPONSE_FIELDS))

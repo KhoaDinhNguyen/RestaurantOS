@@ -1483,6 +1483,8 @@ class FakeEdge(httpx.AsyncBaseTransport):
                 # the change commits, the answer never arrives
                 self._apply(order_id, event_id, to_status)
                 raise httpx.ReadTimeout("answer lost", request=request)
+            if outcome == "read-timeout":
+                raise httpx.ReadTimeout("timed out", request=request)
             if outcome == "503":
                 return httpx.Response(503, json={"detail": "failover"})
             if outcome == "409":
@@ -1653,10 +1655,48 @@ async def test_restocks_retry_a_503_and_a_still_failing_restock_is_not_fatal(
     assert fake.restock_calls["v002"] == 3
 
 
+async def test_each_attempts_answer_describes_only_that_attempt(tmp_path: Path) -> None:
+    """Review round 4, item 1: attempt 1 answers 503, attempt 2 times
+    out - the line carries no http_status from the attempt that did not
+    produce the final answer, its error is the final attempt's, and the
+    failed attempt's reason lives in earlier_failures."""
+    fake = FakeEdge()
+    fake.status_script[stub_order_id("1001")] = ["503", "read-timeout"]
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        transport=fake,
+        status_events=True,
+        kitchen_attempts=2,
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="mixed-attempts")
+    await drive(pb, clock)
+    status = pb.status()
+    # the accepted event failed; the later events conflict at the fake's
+    # state machine (the order never reached accepted), which is the
+    # region's business, not playback's
+    assert status["events_failed"] == 1
+    assert status["events_conflicted"] == 3
+    accepted = next(
+        line
+        for line in run_log_lines(tmp_path, pb)
+        if line["kind"] == "status_event" and line["to_status"] == "accepted"
+    )
+    assert "http_status" not in accepted  # attempt 1's 503 is not on the line
+    assert accepted["error"] == "ReadTimeout"
+    assert accepted["earlier_failures"] == ["http 503"]
+    assert accepted["attempts"] == 2
+
+
 async def test_a_stop_during_a_backoff_cancels_the_retry(tmp_path: Path) -> None:
-    """Review round 3, item 1: a stop while a retry sits in its backoff
-    cancels the task - the line says cancelled with the attempts that
-    were made, the log stays dense, and the run ends stopped."""
+    """Review round 4, item 1: a stop while a retry sits in its backoff
+    ends the retries - the task that wakes from the backoff sends
+    nothing new (no second POST reaches the transport), the line says
+    cancelled with the failed attempt in earlier_failures, the log
+    stays dense, and the run ends stopped."""
     fake = FakeEdge()
     fake.restock_script["v001"] = ["503", "503", "503"]
     orders = [make_order(21, 0, 0, 5, "1001")]
@@ -1667,7 +1707,7 @@ async def test_a_stop_during_a_backoff_cancels_the_retry(tmp_path: Path) -> None
         clock=clock,
         transport=fake,
         status_events=True,
-        drain_timeout_s=0.3,
+        drain_timeout_s=2.0,  # long enough that the backoff, not the drain, ends the task
         restock_every=7,
         warm_up_days=14,
         restock_vendors=("v001",),
@@ -1676,14 +1716,22 @@ async def test_a_stop_during_a_backoff_cancels_the_retry(tmp_path: Path) -> None
     await drive(pb, clock, steps=3)  # attempt 1 has its 503; the task backs off
     await settle()
     assert fake.restock_calls["v001"] == 1
-    await asyncio.wait_for(pb.stop(), 5)
+    stop_task = asyncio.create_task(pb.stop())
+    await settle()  # the stop is accepted; the drain is waiting on the backoff
+    # the backoff runs out while the run is stopping...
+    await clock.advance(clock.now() + 1.0)
+    await settle()
+    await asyncio.wait_for(stop_task, 5)
     assert pb.status()["state"] == "stopped"
+    # ...and no second POST ever reached the transport
+    assert fake.restock_calls["v001"] == 1
     lines = run_log_lines(tmp_path, pb)
     assert [line["seq"] for line in lines] == list(range(len(lines)))
     restock_line = lines[0]
     assert restock_line["kind"] == "restock"
     assert restock_line["error"] == "cancelled"
     assert restock_line["attempts"] == 1
+    assert restock_line["earlier_failures"] == ["http 503"]
 
 
 async def test_a_status_flag_that_is_not_a_boolean_fails_the_event(tmp_path: Path) -> None:
