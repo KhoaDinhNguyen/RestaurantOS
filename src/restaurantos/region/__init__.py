@@ -6,5 +6,6 @@ caller's epoch first.
 """
 
 from restaurantos.region.orders import place_order
+from restaurantos.region.status import change_status
 
-__all__ = ["place_order"]
+__all__ = ["change_status", "place_order"]
