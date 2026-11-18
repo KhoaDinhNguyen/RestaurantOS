@@ -245,11 +245,13 @@ def test_restock_vendors_reject_a_blank_line_with_its_number(tmp_path):
 
 
 def test_restock_vendors_reject_an_empty_vendor_id(tmp_path):
+    """Review round 3, item 5: a four-column row with an empty
+    vendor_id reaches the id check (the value count is checked first,
+    with its own message) and is refused there."""
     from restaurantos.sim.playback_cli import restock_vendors
 
-    # three values and no vendor id: both halves of the check fail
-    data = _vendors_csv_dir(tmp_path, "vendor_id,chain_id,geohash,primary_cuisine\n,w21z7,x\n")
-    with pytest.raises(ValueError, match=r"vendors.csv line 2: expected 4 values, got 3"):
+    data = _vendors_csv_dir(tmp_path, "vendor_id,chain_id,geohash,primary_cuisine\n,,w21z7,x\n")
+    with pytest.raises(ValueError, match=r"vendors.csv line 2: empty vendor_id"):
         restock_vendors(data)
 
 
@@ -279,7 +281,7 @@ def test_vendor_regions_match_bootstraps_shards():
     from restaurantos.sim.loading import REFERENCE_COLUMNS, read_rows
     from restaurantos.sim.mini import mini_dir
     from restaurantos.sim.playback_cli import vendor_region_map
-    from restaurantos.sim.shard import assign_shards, vendor_counts
+    from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_counts
 
     data = mini_dir()
     cluster = Cluster(regions=3)
@@ -295,7 +297,7 @@ def test_vendor_regions_match_bootstraps_shards():
     pairs = sorted(
         (row[0], row[geohash_column]) for row in read_rows(data / "vendors.csv", columns)
     )
-    regions = vendor_region_map(pairs, data, cluster)
+    regions = vendor_region_map(pairs, counts_by_cell(pairs), cluster)
     assert regions == expected
     assert set(regions) == set(expected)  # every vendor is covered
 
@@ -347,119 +349,64 @@ def test_start_shortens_a_to_day_past_the_data(tmp_path, monkeypatch, capsys, fr
     """Review round 2, item 4: a to_day past the last cached day is
     shortened, with a warning before the banner, and the banner's
     restock-day count comes from the shortened window. The engine
-    boundary is faked: the CLI's own reporting is what is under test."""
-    import asyncio
+    boundary is faked: the CLI's own reporting is what is under test.
 
-    import uvicorn
-    from test_replaydata import make_data_dir
+    Review round 3, item 8: the settings this test's numbers ride on
+    are pinned - ROS_SIM_STOCK_WARM_UP_DAYS=14 with the
+    get_sim_settings cache cleared around the test, so no stray
+    variable or .env on a dev machine moves the numbers - and the run
+    passes --kitchen-target, so it needs no cluster file."""
+    from restaurantos.sim.config import get_sim_settings
+    from restaurantos.sim.replaydata import load_meta
 
-    import restaurantos.sim.playback_cli as playback_cli
-    from restaurantos.sim.replaydata import build_cache, load_meta
-
-    orders = [
-        ["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"],
-        ["2", "c1", "v1", "w21z7", "3", 15, "12:00:00"],
-    ]
-    data = make_data_dir(tmp_path, orders, [["1", "p1", 1], ["2", "p1", 1]])
-    # one vendor row, so the kitchen routing's vendor -> region map has
-    # something to shard (the manifest entry follows the file)
-    import hashlib
-
-    vendors = "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n"
-    (data / "vendors.csv").write_text(vendors, encoding="utf-8")
-    raw = (data / "vendors.csv").read_bytes()
-    manifest = [
-        line
-        for line in (data / "MANIFEST.csv").read_text().splitlines()
-        if not line.startswith("vendors.csv,")
-    ]
-    manifest.append(f"vendors.csv,1,{hashlib.sha256(raw).hexdigest()}")
-    (data / "MANIFEST.csv").write_text("\n".join(manifest) + "\n", encoding="utf-8")
-    build_cache(data, warm_up_days=14, quiet=True)
-    meta = load_meta(data)
-    assert meta is not None
-
-    class FakeServer:
-        started = True
-
-        def __init__(self, config):
-            self.should_exit = False
-
-        async def serve(self):
-            while not self.should_exit:
-                await asyncio.sleep(0.01)
-
-    class FakePlayback:
-        default_speed = 1000.0
-
-        def __init__(self, *args, **kwargs):
-            self._state = "idle"
-
-        async def start(self, **kwargs):
-            self._state = "done"
-
-        async def pause(self):
-            pass
-
-        async def resume(self):
-            pass
-
-        async def stop(self):
-            pass
-
-        async def set_speed(self, speed):
-            pass
-
-        async def wait_done(self):
-            pass
-
-        @property
-        def state(self):
-            return self._state
-
-        def status(self):
-            return {
-                "run_id": "fake",
-                "state": self._state,
-                "orders_sent": 0,
-                "orders_acked": 0,
-                "orders_parked": 0,
-                "orders_refused": 0,
-                "orders_failed": 0,
-            }
-
-        def clock(self):
-            return {}
-
-    monkeypatch.setenv("ROS_DATA_DIR", str(data))
-    monkeypatch.setattr(uvicorn, "Server", FakeServer)
-    monkeypatch.setattr(playback_cli, "Playback", FakePlayback)
-
-    rc = app(
-        [
-            "playback",
-            "start",
-            "--from-day",
-            "14",
-            "--to-day",
-            "40",
-            "--restock-days",
-            "1",
-            "--port",
-            "1",
+    get_sim_settings.cache_clear()
+    monkeypatch.setenv("ROS_SIM_STOCK_WARM_UP_DAYS", "14")
+    try:
+        orders = [
+            ["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"],
+            ["2", "c1", "v1", "w21z7", "3", 15, "12:00:00"],
         ]
-    )
-    assert rc == 0
-    err = capsys.readouterr().err
-    assert (
-        f"data only goes to day {meta.last_day}; "
-        f"running to day {meta.last_day} instead of 40" in err
-    )
-    # the banner's restock count comes from the shortened window: day
-    # 15 alone (the first restock is W+R), not 15 through 40
-    assert "restock on 1 day(s)" in err
-    # and the banner names the effective end, not the requested one
-    assert f"started: 14 -> {meta.last_day}," in err
+        data = _make_data_with_vendors(
+            tmp_path,
+            orders,
+            [["1", "p1", 1], ["2", "p1", 1]],
+            "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n",
+        )
+        meta = load_meta(data)
+        assert meta is not None
+
+        captured: dict = {}
+        _install_fake_start(monkeypatch, captured)
+        monkeypatch.setenv("ROS_DATA_DIR", str(data))
+        rc = app(
+            [
+                "playback",
+                "start",
+                "--from-day",
+                "14",
+                "--to-day",
+                "40",
+                "--restock-days",
+                "1",
+                "--kitchen-target",
+                "http://127.0.0.1:8900/api/v1",
+                "--port",
+                "1",
+            ]
+        )
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert (
+            f"data only goes to day {meta.last_day}; "
+            f"running to day {meta.last_day} instead of 40" in err
+        )
+        # the banner's restock count comes from the shortened window: day
+        # 15 alone (the first restock is W+R), not 15 through 40
+        assert "restock on 1 day(s)" in err
+        # and the banner names the effective end, not the requested one
+        assert f"started: 14 -> {meta.last_day}," in err
+    finally:
+        get_sim_settings.cache_clear()
 
 
 def _install_fake_start(monkeypatch, captured: dict) -> None:
@@ -600,6 +547,13 @@ def test_a_kitchen_target_run_needs_no_cluster_file(tmp_path, monkeypatch, capsy
     assert captured["vendor_regions"] == {}
     # no cluster file was used, so none is recorded
     assert "cluster" not in captured["start_kwargs"]["meta_extra"]
+    # the end-of-run summary carries the kitchen results too (review
+    # round 3, item 6)
+    out = capsys.readouterr().out
+    assert (
+        "events: 0 sent, 0 acked, 0 duplicate, 0 conflicted, 0 failed, 0 skipped; "
+        "restocks: 0 sent, 0 acked, 0 failed" in out
+    )
 
 
 def test_config_decides_the_region_routing(tmp_path, monkeypatch, capsys, fresh_settings):
@@ -644,3 +598,38 @@ def test_config_decides_the_region_routing(tmp_path, monkeypatch, capsys, fresh_
     assert captured["vendor_regions"] == expected
     assert set(captured["kitchen_urls"]) == {"r1", "r2"}
     assert captured["start_kwargs"]["meta_extra"]["cluster"]["config"] == str(cluster_file)
+
+
+def test_vendors_csv_is_read_once_for_the_whole_rest_of_the_run(tmp_path, monkeypatch):
+    """Review round 3, item 11: the vendor list, the cell counts and
+    the region map all come from one checked read of vendors.csv - the
+    file is opened exactly once, and the map still equals bootstrap's
+    own derivation."""
+    orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
+    data = _make_data_with_vendors(
+        tmp_path,
+        orders,
+        [["1", "p1", 1]],
+        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\nv2,,w21z7,x\nv3,,w21z6,y\n",
+    )
+    from restaurantos.common.cluster import Cluster
+    from restaurantos.sim.playback_cli import restock_vendors, vendor_region_map
+    from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_counts
+
+    opens: list[str] = []
+    real_open = Path.open
+
+    def counting_open(self, *args, **kwargs):
+        if self.name == "vendors.csv":
+            opens.append(str(self))
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    pairs = restock_vendors(data)  # the one checked read
+    counts = counts_by_cell(pairs)
+    cluster = Cluster(regions=2)
+    regions = vendor_region_map(pairs, counts, cluster)
+    assert len(opens) == 1
+    # and the map still equals bootstrap's own derivation
+    cell_region = dict(assign_shards(vendor_counts(data), cluster.region_ids))
+    assert regions == {vendor: cell_region[geohash] for vendor, geohash in pairs}

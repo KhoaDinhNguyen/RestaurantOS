@@ -59,8 +59,8 @@ import asyncio
 import contextlib
 import heapq
 import json
+import logging
 import re
-import sys
 import time
 import traceback
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
@@ -68,6 +68,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import quote
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
@@ -75,7 +76,15 @@ import httpx
 from restaurantos.common.models import OrderRequest, OrderStatus
 from restaurantos.common.simclock import SECONDS_PER_DAY, SimClock, from_sim_seconds, to_sim_seconds
 from restaurantos.sim.determinism import stable_float
+from restaurantos.sim.replaydata import ReplayWindow
 from restaurantos.sim.timeline import EVENT_SCHEDULE, MIN_EVENT_GAP_S
+
+# The run's own diagnostics go through this logger (review round 3,
+# item 9): the CLI installs a stderr handler, and logging reports a
+# handler that cannot write instead of raising into the caller - a
+# closed stderr pipe can no longer turn a run that already succeeded
+# into a failure.
+_LOGGER = logging.getLogger("restaurantos.sim.playback")
 
 # Re-check the clock at most this often during a long wait, so a speed
 # change is picked up within a slice instead of at the far deadline.
@@ -288,7 +297,7 @@ class Playback:
         default_speed: float = 1000.0,
         wall: WallClock | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
-        window_check: Callable[[int, int | None], tuple[int, int | None]] | None = None,
+        window_check: Callable[[int, int | None], ReplayWindow] | None = None,
         status_events: bool = False,
         event_sample_rate: float = 1.0,
         event_jitter_s: float = 60.0,
@@ -795,8 +804,9 @@ class Playback:
                 # items that are all due at once.
                 await asyncio.sleep(0)
         except Exception as error:  # noqa: BLE001 - the run must not die silently
-            traceback.print_exc()
-            print(f"playback run {self._run_id} failed: {error}", file=sys.stderr)
+            # logging.exception carries the traceback; a handler that
+            # cannot write reports that itself and never raises here
+            _LOGGER.exception(f"playback run {self._run_id} failed: {error}")
             failed = True
         finally:
             cleanup_cancelled = False
@@ -1160,7 +1170,14 @@ class Playback:
     async def _send_event(
         self, seq: int, record: dict[str, Any], previous: asyncio.Task | None
     ) -> None:
-        path = f"/vendors/{record['vendor_id']}/orders/{record['order_id']}/status"
+        # The ids are encoded per path segment (review round 3, item 10):
+        # today's ids never need it, but the paths are built from data,
+        # and this costs one call each. The base URL and the "/"
+        # separators stay as they are.
+        path = (
+            f"/vendors/{quote(record['vendor_id'], safe='')}"
+            f"/orders/{quote(str(record['order_id']), safe='')}/status"
+        )
         await self._send_aux(
             seq,
             record,
@@ -1170,7 +1187,9 @@ class Playback:
         )
 
     async def _send_restock(self, seq: int, record: dict[str, Any]) -> None:
-        await self._send_aux(seq, record, f"/vendors/{record['vendor_id']}/restock", None, None)
+        await self._send_aux(
+            seq, record, f"/vendors/{quote(record['vendor_id'], safe='')}/restock", None, None
+        )
 
     async def _send_aux(
         self,
@@ -1326,6 +1345,15 @@ class Playback:
         if response is None or response.status_code not in (200, 201):
             self._events_failed += 1
             return
+        for flag in ("applied", "duplicate", "conflict"):
+            if flag in record and not isinstance(record[flag], bool):
+                # {"applied": "false"} is a non-empty string, which
+                # Python treats as true: a flag that is not a real
+                # boolean would count a garbage answer as an ack
+                # (review round 3, item 4)
+                record["error"] = "malformed status answer"
+                self._events_failed += 1
+                return
         if record.get("duplicate"):
             if attempt > 1:
                 # the same event_id went out on an earlier attempt of

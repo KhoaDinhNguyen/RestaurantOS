@@ -11,18 +11,30 @@ a real boundary.
 
 from __future__ import annotations
 
-import csv
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
+
+from restaurantos.sim.loading import REFERENCE_COLUMNS, read_rows
+
+
+def counts_by_cell(pairs: Iterable[tuple[str, str]]) -> dict[str, int]:
+    """Cell name -> number of vendors whose home cell it is, from
+    (vendor_id, geohash) pairs. Both bootstrap (through vendor_counts)
+    and playback count through this one function, so the two cannot
+    drift apart (review round 3, item 11)."""
+    counts: dict[str, int] = {}
+    for _vendor, cell in pairs:
+        counts[cell] = counts.get(cell, 0) + 1
+    return counts
 
 
 def vendor_counts(data_dir: Path, *, column: str = "geohash") -> dict[str, int]:
-    """Cell name → number of vendors whose home cell it is."""
-    counts: dict[str, int] = {}
-    with (data_dir / "vendors.csv").open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            counts[row[column]] = counts.get(row[column], 0) + 1
-    return counts
+    """Cell name -> number of vendors whose home cell it is:
+    bootstrap's own read of vendors.csv."""
+    columns = REFERENCE_COLUMNS["vendors.csv"]
+    return counts_by_cell(
+        (row[0], row[columns.index(column)]) for row in read_rows(data_dir / "vendors.csv", columns)
+    )
 
 
 def assign_shards(counts: dict[str, int], regions: Sequence[str]) -> list[tuple[str, str]]:

@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import signal
 import sys
@@ -30,17 +31,17 @@ from restaurantos.common.cluster import Cluster, load_cluster, service_port
 from restaurantos.common.config import get_settings
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.config import SimSettings, get_sim_settings
-from restaurantos.sim.loading import REFERENCE_COLUMNS, read_rows
+from restaurantos.sim.loading import REFERENCE_COLUMNS
 from restaurantos.sim.playback import Playback, StateError, restock_days
 from restaurantos.sim.replaydata import (
     CacheMeta,
     ensure_cache,
     iter_orders,
-    require_manifest_file,
+    manifest_rows,
     require_window,
     to_order_request,
 )
-from restaurantos.sim.shard import assign_shards, vendor_counts
+from restaurantos.sim.shard import assign_shards, counts_by_cell
 
 
 def _orders_fn(cache_file: Path):
@@ -58,35 +59,40 @@ def restock_vendors(data_dir: Path) -> list[tuple[str, str]]:
     not depend on the CSV's row order, and the geohash routes each
     restock to its vendor's region.
 
-    The file is checked against MANIFEST.csv first - `ensure_cache`
-    binds only the two order files, so without this a cache hit could
-    restock a different vendor set than the one bootstrap loaded. Rows
-    are numbered with the header as line 1: a blank or short row, or an
-    empty vendor_id, is a ValueError naming the line, not an
-    IndexError."""
-    require_manifest_file(data_dir, "vendors.csv")
+    One read, checked (review round 3, item 11): the file's sha256
+    against its MANIFEST.csv entry and the header, then the rows
+    parsed from those same bytes - the cell counts and the region map
+    both build from what this returns, so nothing is derived from a
+    second, unchecked read. Rows are numbered with the header as
+    line 1: a blank or short row is a ValueError naming the line, an
+    empty vendor_id a ValueError of its own - never an IndexError out
+    of the CLI."""
+    rows = manifest_rows(data_dir, "vendors.csv")
     columns = REFERENCE_COLUMNS["vendors.csv"]
     geohash_column = columns.index("geohash")
     pairs: list[tuple[str, str]] = []
-    # read_rows checks the header; the numbering starts at 2 because
-    # the header is line 1
-    for number, row in enumerate(read_rows(data_dir / "vendors.csv", columns), start=2):
-        if len(row) != len(columns) or not row[0]:
+    # the rows begin at file line 2 (the header is line 1)
+    for number, row in enumerate(rows, start=2):
+        if len(row) != len(columns):
             raise ValueError(
                 f"vendors.csv line {number}: expected {len(columns)} values, got {len(row)}"
             )
+        if not row[0]:
+            raise ValueError(f"vendors.csv line {number}: empty vendor_id")
         pairs.append((row[0], row[geohash_column]))
     return sorted(pairs)
 
 
 def vendor_region_map(
-    pairs: list[tuple[str, str]], data_dir: Path, cluster: Cluster
+    pairs: list[tuple[str, str]], counts: dict[str, int], cluster: Cluster
 ) -> dict[str, str]:
     """vendor -> its region, built exactly the way bootstrap shards it:
-    the same `vendor_counts` + `assign_shards` walk over
-    `cluster.region_ids`, then each vendor's geohash looked up in the
-    result. Deterministic, and no HQ call at run start."""
-    cell_region = dict(assign_shards(vendor_counts(data_dir), cluster.region_ids))
+    the same `assign_shards` walk over `cluster.region_ids`, then each
+    vendor's geohash looked up in the result. `counts` is the
+    vendors-per-cell count of these same pairs (`shard.counts_by_cell`),
+    so the map cannot drift from bootstrap's sharding. Deterministic,
+    and no HQ call at run start."""
+    cell_region = dict(assign_shards(counts, cluster.region_ids))
     return {vendor: cell_region[geohash] for vendor, geohash in pairs}
 
 
@@ -101,6 +107,15 @@ def kitchen_urls(cluster: Cluster, edge_host: str) -> dict[str, str]:
 
 
 async def start_command(args: argparse.Namespace) -> int:
+    # The run's diagnostics (the shortening warning, a failed run) go
+    # through the restaurantos.sim.playback logger; give it a plain
+    # stderr handler here so the operator sees the same text as before
+    # (review round 3, item 9). The `rosctl ...` lines this command
+    # prints itself stay print: they are the command's own output, not
+    # diagnostics of the running process.
+    _stderr_handler = logging.StreamHandler(sys.stderr)
+    _stderr_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    logging.getLogger("restaurantos.sim.playback").addHandler(_stderr_handler)
     # The CLI override skips SimSettings validation, so it is checked
     # here, before anything is built: a NaN or a share outside [0, 1]
     # would otherwise silently drop or keep every event (review item 6).
@@ -148,6 +163,8 @@ async def start_command(args: argparse.Namespace) -> int:
         banner_days = restock_days(meta.warm_up_days, restock_every, window.from_day, window.to_day)
         pairs = restock_vendors(data_dir)
         vendors = [vendor for vendor, _geohash in pairs]
+        # the region map shards these same rows, not a second read
+        cell_counts = counts_by_cell(pairs)
         # kitchen routing: resolve the override first - a stub run
         # sends every kitchen call to the one URL and never reads a
         # cluster file, so it does not need one. Only a run routing
@@ -162,7 +179,7 @@ async def start_command(args: argparse.Namespace) -> int:
         else:
             cluster_path = args.config
             cluster = load_cluster(cluster_path)
-            vendor_regions = vendor_region_map(pairs, data_dir, cluster)
+            vendor_regions = vendor_region_map(pairs, cell_counts, cluster)
             edges = kitchen_urls(cluster, sim.playback_edge_host)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"rosctl playback start: {error}", file=sys.stderr)
@@ -175,7 +192,9 @@ async def start_command(args: argparse.Namespace) -> int:
         drain_timeout_s=sim.playback_drain_timeout_s,
         runs_dir=Path("runs"),
         default_speed=sim.playback_speed,
-        # the window is refused, never clamped, for API starts as well
+        # the window is shortened, never refused, for API starts as
+        # well (a to_day past the data runs to the last cached day,
+        # and the engine records both days in meta.json)
         window_check=lambda f, t: require_window(meta, f, t),
         status_events=events_on,
         event_sample_rate=event_rate,
@@ -280,6 +299,16 @@ async def start_command(args: argparse.Namespace) -> int:
         "run {run_id} {state}: {orders_sent} sent, {orders_acked} acked, "
         "{orders_parked} parked, {orders_refused} refused, {orders_failed} failed; "
         "log: runs/{run_id}/orders.jsonl".format(**status)
+    )
+    # the kitchen results too (review round 3, item 6): the operator
+    # should not have to open the log to see how events and restocks
+    # ended
+    print(
+        "events: {events_sent} sent, {events_acked} acked, {events_duplicate} duplicate, "
+        "{events_conflicted} conflicted, {events_failed} failed, {events_skipped} skipped; "
+        "restocks: {restocks_sent} sent, {restocks_acked} acked, {restocks_failed} failed".format(
+            **status
+        )
     )
     return 0 if status["state"] in ("done", "stopped") else 1
 

@@ -119,10 +119,11 @@ async def test_full_cycle_through_the_routes(client, pb, tmp_path):
         assert response.json()["state"] == "stopped"
 
 
-async def test_api_start_past_the_data_is_shortened(tmp_path: Path, capsys) -> None:
+async def test_api_start_past_the_data_is_shortened(tmp_path: Path, caplog) -> None:
     """Review round 2, item 4: an API start with a to_day past the last
     cached day still succeeds - the answer shows the effective day, the
-    process's stderr says so, and meta.json records both ends."""
+    process's logger says so (review round 3, item 9 moved the warning
+    from a bare print to logging), and meta.json records both ends."""
     import json
 
     from restaurantos.sim.control import make_control_app
@@ -154,11 +155,68 @@ async def test_api_start_past_the_data_is_shortened(tmp_path: Path, capsys) -> N
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["to_day"] == meta.last_day
-    assert f"data only goes to day {meta.last_day}" in capsys.readouterr().err
+    assert f"data only goes to day {meta.last_day}" in caplog.text
     run_meta = json.loads((tmp_path / body["run_id"] / "meta.json").read_text())
     assert run_meta["to_day"] == meta.last_day
     assert run_meta["to_day_requested"] == 200
     await drive(pb, clock)
+
+
+async def test_the_shortening_warning_survives_a_broken_stderr(tmp_path: Path) -> None:
+    """Review round 3, item 9: the warning goes through logging, and a
+    handler that cannot write - a closed stderr pipe - is reported by
+    logging itself instead of raising into the route: the start that
+    already succeeded still answers 200 with the shortened to_day."""
+    import logging
+
+    from restaurantos.sim.control import make_control_app
+    from restaurantos.sim.replaydata import CacheMeta, require_window
+
+    class BrokenStderr:
+        """A stderr that is a closed pipe: every write raises."""
+
+        def write(self, *args):
+            raise BrokenPipeError("stderr is a closed pipe")
+
+        def flush(self):
+            raise BrokenPipeError("stderr is a closed pipe")
+
+    logger = logging.getLogger("restaurantos.sim.playback")
+    # a real StreamHandler over the broken stream: its emit catches the
+    # write error and reports it through handleError, which swallows
+    # the OSError it meets while reporting - the route never sees it
+    handler = logging.StreamHandler(BrokenStderr())
+    logger.addHandler(handler)
+    try:
+        meta = CacheMeta(
+            orders_sha256="x",
+            order_items_sha256="y",
+            warm_up_days=14,
+            first_day=14,
+            last_day=14,
+            orders=1,
+            itemless_orders=0,
+        )
+        clock = FakeWallClock()
+        pb = make_playback(
+            sample_orders(2),
+            tmp_path,
+            clock=clock,
+            window_check=lambda f, t: require_window(meta, f, t),
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=make_control_app(pb)),
+            base_url="http://control.test",
+        ) as client:
+            response = await client.post(
+                "/sim/playback",
+                json={"action": "start", "from_day": 14, "to_day": 200, "speed": 100.0},
+            )
+        assert response.status_code == 200, response.text
+        assert response.json()["to_day"] == meta.last_day
+        await drive(pb, clock)
+    finally:
+        logger.removeHandler(handler)
 
 
 async def test_the_clock_stands_still_when_paused_or_ended(tmp_path: Path):
@@ -186,10 +244,16 @@ async def test_the_clock_stands_still_when_paused_or_ended(tmp_path: Path):
         assert pb.status()["state"] == "done"
         ended = (await client.get("/sim/clock")).json()
         assert ended["state"] == "done"
+        # the clock stands at the final simulated instant: sample_orders(6)
+        # ends 30 seconds after midnight, and the last dispatched item's
+        # deadline is exactly that, rounded down to the second
+        assert ended["sim_day"] == 14
+        assert ended["sim_time"] == "00:00:30"
         await clock.advance(clock.now() + 1.0)
         assert (await client.get("/sim/clock")).json() == ended
 
-        # a stopped run freezes the same way
+        # a stopped run freezes the same way, and the stop itself moves
+        # nothing either
         await client.post(
             "/sim/playback",
             json={"action": "start", "from_day": 14, "speed": 100.0, "run_id": "second"},

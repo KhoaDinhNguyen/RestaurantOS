@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -38,7 +39,7 @@ from pathlib import Path
 
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.datacheck import check_manifest
-from restaurantos.sim.loading import read_rows
+from restaurantos.sim.loading import REFERENCE_COLUMNS, check_header, read_rows
 
 CACHE_DIR_NAME = "cached"
 CACHE_FILE = "orders-sorted.jsonl"
@@ -123,22 +124,25 @@ def _manifest_sha256(data_dir: Path) -> dict[str, str]:
         return entries
 
 
-def require_manifest_file(data_dir: Path, name: str) -> None:
-    """The file's sha256 matches its MANIFEST.csv entry, or ValueError
-    naming the file.
+def manifest_rows(data_dir: Path, name: str) -> list[list[str]]:
+    """One read of one data file, checked before anything is parsed
+    from it: the sha256 matches its MANIFEST.csv entry, the header
+    matches `REFERENCE_COLUMNS`, and the rows come back so every
+    derived thing (vendor list, cell counts, region map) is built from
+    these same checked bytes - never from a second, unchecked read
+    (review round 3, item 11).
 
-    For a file a run reads directly (vendors.csv, read for restocks):
-    `ensure_cache` binds only orders.csv and order_items.csv to the
-    manifest, so without this check a cache hit could restock a
-    different vendor set than the one bootstrap loaded. The file is
-    small; hashing it is instant.
-    """
+    Blank rows are kept: the caller numbers them - the header is
+    line 1 - and rejects them."""
     expected = _manifest_sha256(data_dir).get(name)
     if expected is None:
         raise ValueError(f"{name} is not listed in MANIFEST.csv")
-    digest = hashlib.sha256((data_dir / name).read_bytes()).hexdigest()
-    if digest != expected:
+    raw = (data_dir / name).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected:
         raise ValueError(f"{name} does not match its MANIFEST.csv entry")
+    reader = csv.reader(io.StringIO(raw.decode("utf-8"), newline=""))
+    check_header(name, next(reader), REFERENCE_COLUMNS[name])
+    return list(reader)
 
 
 def load_meta(data_dir: Path) -> CacheMeta | None:

@@ -15,7 +15,7 @@ port. WP6b will resolve it; the port is a setting either way.
 
 from __future__ import annotations
 
-import sys
+import logging
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
@@ -23,6 +23,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from restaurantos.sim.playback import Playback, StateError
+
+# The control process's diagnostics go through logging, not a bare
+# print to stderr (review round 3, item 9): the CLI process installs
+# the stderr handler, and a handler that cannot write - a closed pipe
+# - reports the problem itself instead of raising into a route that
+# has already succeeded.
+_LOGGER = logging.getLogger("restaurantos.sim.playback")
 
 
 class PlaybackCommand(BaseModel):
@@ -92,11 +99,11 @@ def make_control_app(playback: Playback) -> FastAPI:
                 ):
                     # the window check shortened to_day to the last day
                     # the data holds; the answer already shows the
-                    # effective day, so say so on the process's stderr
-                    print(
+                    # effective day, so say so through the logger (the
+                    # CLI process prints it to stderr)
+                    _LOGGER.warning(
                         f"playback start: data only goes to day {status['to_day']}; "
-                        f"running to day {status['to_day']} instead of {command.to_day}",
-                        file=sys.stderr,
+                        f"running to day {status['to_day']} instead of {command.to_day}"
                     )
             elif command.action == "pause":
                 await playback.pause()

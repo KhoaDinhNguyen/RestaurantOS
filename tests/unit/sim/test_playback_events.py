@@ -303,6 +303,14 @@ async def test_stop_while_an_event_waits_for_its_predecessor(tmp_path: Path) -> 
     assert all(
         line.get("error") == "cancelled" or line.get("http_status") == 201 for line in event_lines
     )
+    # and the successor was cancelled *while waiting*: it never sent
+    preparing = next(
+        line
+        for line in event_lines
+        if line["external_order_id"] == "1001" and line["to_status"] == "preparing"
+    )
+    assert preparing["error"] == "cancelled"
+    assert preparing["wall_sent_at"] is None
 
 
 async def test_refused_parked_and_failed_orders_skip_their_events(tmp_path: Path) -> None:
@@ -1270,7 +1278,7 @@ async def test_a_normal_end_waits_for_every_send(tmp_path: Path) -> None:
         clock=clock,
         inflight=8,
         status_events=True,
-        drain_timeout_s=0.2,  # far shorter than the hold
+        drain_timeout_s=0.2,
         transport=transport,
     )
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="normal-end")
@@ -1287,6 +1295,8 @@ async def test_a_normal_end_waits_for_every_send(tmp_path: Path) -> None:
     assert status["events_acked"] == 4
     events = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
     assert all("error" not in line for line in events)
+    picked_up = next(line for line in events if line["to_status"] == "picked_up")
+    assert picked_up["wall_sent_at"] is not None  # acked, not cancelled
 
 
 async def test_stop_during_the_final_wait_ends_stopped(tmp_path: Path) -> None:
@@ -1452,6 +1462,9 @@ class FakeEdge(httpx.AsyncBaseTransport):
                 return httpx.Response(503, json={"detail": "failover"})
             if outcome == "409":
                 return httpx.Response(409, json={"detail": "state machine"})
+            if outcome == "string-flags":
+                # a flag that is not a real boolean (item 4)
+                return httpx.Response(201, json={"applied": "true"})
             if event_id in self.seen:
                 return self._status_result(order_id, event_id, to_status, False, duplicate=True)
             current = self._statuses(self.status_of.get(order_id, "received"))
@@ -1646,6 +1659,44 @@ async def test_a_stop_during_a_backoff_cancels_the_retry(tmp_path: Path) -> None
     assert restock_line["kind"] == "restock"
     assert restock_line["error"] == "cancelled"
     assert restock_line["attempts"] == 1
+
+
+async def test_a_status_flag_that_is_not_a_boolean_fails_the_event(tmp_path: Path) -> None:
+    """Review round 3, item 4: {"applied": "false"} is a non-empty
+    string, which Python treats as true - a flag that is not a real
+    boolean makes the answer malformed, and the event fails instead of
+    counting as acked."""
+    fake = FakeEdge()
+    fake.status_script[stub_order_id("1001")] = ["string-flags"] * 4
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, transport=fake, status_events=True)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="string-flags")
+    await drive(pb, clock)
+    assert pb.status()["events_failed"] == 4
+    assert pb.status()["events_acked"] == 0
+    lines = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
+    assert len(lines) == 4
+    for line in lines:
+        assert line["error"] == "malformed status answer"
+
+
+async def test_ids_in_kitchen_paths_are_encoded_per_segment(tmp_path: Path) -> None:
+    """Review round 3, item 10: the paths are built from data, so the
+    ids are encoded per segment - a vendor id containing "/" and a
+    space reaches the route as one path segment, not as extra path."""
+    transport = RegionAnswering("r1")  # records every URL it is asked for
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    orders[0] = orders[0].model_copy(update={"vendor_id": "v/1 x"})
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, transport=transport, status_events=True)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="encoded-ids")
+    await drive(pb, clock)
+    status_urls = [url for url in transport.requests if url.endswith("/status")]
+    assert len(status_urls) == 4
+    for url in status_urls:
+        assert "/vendors/v%2F1%20x/" in url
+        assert "v/1 x" not in url
 
 
 # --- an unknown region is not sent to the gateway (review round 3, item 2)
