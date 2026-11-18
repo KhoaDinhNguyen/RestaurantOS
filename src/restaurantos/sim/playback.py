@@ -641,10 +641,16 @@ class Playback:
                         stopped = True
                         break
                     # the day's restocks are acknowledged before the
-                    # first order goes out (review item 2)
-                    if self._restock_tasks and not await self._restock_barrier():
-                        stopped = True
-                        break
+                    # first order goes out (review item 2), and a
+                    # pause or stop that arrived during that wait is
+                    # honored before the order leaves
+                    if self._restock_tasks:
+                        if not await self._restock_barrier():
+                            stopped = True
+                            break
+                        if not await self._after_gate():
+                            stopped = True
+                            break
                     self._dispatch_order(order_target - sim_start, request)
                     pending = next(stream_items, None)
                 else:
@@ -656,9 +662,13 @@ class Playback:
                     if kind == "event":
                         # not a restock: the restocks go first all the
                         # way to their acks (review item 2)
-                        if self._restock_tasks and not await self._restock_barrier():
-                            stopped = True
-                            break
+                        if self._restock_tasks:
+                            if not await self._restock_barrier():
+                                stopped = True
+                                break
+                            if not await self._after_gate():
+                                stopped = True
+                                break
                         handle, to_status, jitter = payload
                         # The event goes out only once the order's
                         # outcome is known (it needs the order id, and
@@ -671,12 +681,10 @@ class Playback:
                         if not await self._await_or_stop(handle.future):
                             stopped = True
                             break
-                        if self._state == PAUSED:
-                            # the outcome arrived while the run was
-                            # paused; the event waits for the resume
-                            # with the rest of the schedule
-                            await self._wake_or_end()
-                        if self._state == STOPPING:
+                        # a pause or stop that arrived during the
+                        # outcome wait is honored before the event
+                        # goes out
+                        if not await self._after_gate():
                             stopped = True
                             break
                         self._dispatch_event(deadline - sim_start, handle, to_status, jitter)
@@ -812,6 +820,19 @@ class Playback:
             if task is not waiter:
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
+
+    async def _after_gate(self) -> bool:
+        """Honor a pause or stop that arrived while a gate was waiting.
+
+        Every stop-aware gate (the restock barrier, an outcome wait,
+        the wait before a restock batch) ends without looking at the
+        state a control operation may have changed in the meantime, so
+        the dispatcher calls this before the next send goes out: a
+        pause parks it, a stop ends it. Returns False when the run is
+        stopping."""
+        if self._state == PAUSED:
+            await self._wake_or_end()
+        return self._state != STOPPING
 
     def _dispatch_order(self, sim_offset: float, request: OrderRequest) -> None:
         seq = self._next_seq()

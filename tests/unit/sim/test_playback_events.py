@@ -619,6 +619,46 @@ async def test_restocks_are_acknowledged_before_the_days_first_order(tmp_path: P
     assert all(line["wall_sent_at"] >= last_restock_ack for line in day_orders)
 
 
+async def test_pause_during_the_restock_barrier_parks_the_days_first_order(tmp_path: Path) -> None:
+    """Review round 2, item 1: a pause that arrives while the dispatcher
+    sits in the restock barrier is honored before the next order goes
+    out, not swallowed by the gate. After the resume the order is sent
+    and the log stays dense."""
+    orders = [make_order(21, 0, 0, 5, "1001")]
+    transport = HoldingRestocks()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        inflight=8,
+        speed=1e9,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=1e9, run_id="pause-gate")
+    await settle()
+    # the dispatcher sits in the barrier, both restocks held
+    assert pb.status()["restocks_sent"] == 2
+    assert pb.status()["orders_sent"] == 0
+
+    await pb.pause()
+    transport.release.set()
+    await settle(10)
+    # the restocks are answered now, but the order stays parked
+    assert pb.status()["state"] == "paused"
+    assert pb.status()["orders_sent"] == 0
+
+    await pb.resume()
+    await pb.wait_done()
+    status = pb.status()
+    assert status["state"] == "done"
+    assert status["orders_sent"] == 1
+    lines = run_log_lines(tmp_path, pb)
+    assert [line["seq"] for line in lines] == list(range(len(lines)))
+    assert [line["kind"] for line in lines] == ["restock", "restock", "order"]
+
+
 async def test_stop_during_the_restock_barrier_ends_stopped(tmp_path: Path) -> None:
     """A stop while the barrier waits for held restocks ends the run
     promptly: the barrier gives way to the stop, the held restocks are
