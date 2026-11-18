@@ -11,16 +11,19 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from restaurantos.common.db import run_on
-from restaurantos.common.errors import UnknownVendorError
+from restaurantos.common.errors import RegionUnreachableError, UnknownVendorError
 from restaurantos.common.models import (
     OrderOutcome,
     OrderRequest,
     OrderResponse,
     OrderResult,
+    StatusChangeRequest,
+    StatusResult,
 )
 from restaurantos.common.sqlfiles import load_query
 
 PlaceOrder = Callable[..., Awaitable[OrderResult]]
+ChangeStatus = Callable[..., Awaitable[StatusResult]]
 
 
 def order_response(
@@ -105,6 +108,59 @@ async def place_region_order(
             request,
             epoch,
             received_at=received_at,
+        )
+
+    return await run_on(
+        pool,
+        work,
+        region_id=region_id,
+    )
+
+
+async def read_region_epoch(
+    pool: AsyncConnectionPool,
+    region_id: str,
+) -> int:
+    """Read the epoch advertised by a regional node."""
+
+    async def work(conn: psycopg.AsyncConnection) -> int:
+        cursor = await conn.execute(load_query("gateway/read_epoch"))
+        row = await cursor.fetchone()
+
+        if row is None:
+            raise RegionUnreachableError(
+                "no local epoch",
+                region_id=region_id,
+            )
+
+        return row[0]
+
+    return await run_on(
+        pool,
+        work,
+        region_id=region_id,
+    )
+
+
+async def change_region_order_status(
+    pool: AsyncConnectionPool,
+    vendor_id: str,
+    order_id: UUID,
+    request: StatusChangeRequest,
+    region_id: str,
+    epoch: int,
+    change_status: ChangeStatus,
+) -> StatusResult:
+    """Run WP1's status-change transaction on the owning region."""
+
+    async def work(conn: psycopg.AsyncConnection) -> StatusResult:
+        return await change_status(
+            conn,
+            vendor_id,
+            order_id,
+            request.event_id,
+            request.to_status,
+            epoch,
         )
 
     return await run_on(

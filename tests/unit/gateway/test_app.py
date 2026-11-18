@@ -188,12 +188,7 @@ def test_create_order_accepted(monkeypatch) -> None:
         received_at,
         place_order,
     ):
-        return await place_order(
-            None,
-            order,
-            epoch,
-            received_at=received_at,
-        )
+        return await place_order_accepted()
 
     monkeypatch.setattr(
         "restaurantos.gateway.app.place_region_order",
@@ -217,7 +212,6 @@ def test_create_order_accepted(monkeypatch) -> None:
     region_pools = AsyncMock()
     region_pools.get.return_value = object()
     app.state.region_pools = region_pools
-    app.state.place_order = place_order_accepted
 
     client = TestClient(app)
 
@@ -300,7 +294,6 @@ def test_create_order_parks_when_region_unreachable(monkeypatch) -> None:
 
     app.state.region_pools = region_pools
     app.state.hq_pool = object()
-    app.state.place_order = AsyncMock()
 
     client = TestClient(app)
 
@@ -404,7 +397,6 @@ def test_create_order_refreshes_after_stale_epoch(monkeypatch) -> None:
 
     app.state.region_pools = region_pools
     app.state.hq_pool = object()
-    app.state.place_order = AsyncMock()
 
     client = TestClient(app)
 
@@ -566,7 +558,6 @@ def test_create_order_parks_when_retry_after_stale_epoch_is_unreachable(
 
     app.state.region_pools = region_pools
     app.state.hq_pool = object()
-    app.state.place_order = AsyncMock()
 
     client = TestClient(app)
 
@@ -1675,3 +1666,743 @@ def test_publish_menu_products_dish_link_fixed_returns_409(
     assert response.json() == {
         "error": "dish_link_fixed",
     }
+
+
+def test_change_order_status(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from restaurantos.common.models import OrderStatus, StatusResult
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    order_id = uuid4()
+    event_id = uuid4()
+
+    async def fake_change(
+        pool,
+        vendor_id,
+        requested_order_id,
+        body,
+        region_id,
+        epoch,
+        change_status,
+    ):
+        assert vendor_id == "v001"
+        assert requested_order_id == order_id
+        assert body.event_id == event_id
+        assert body.to_status == OrderStatus.ACCEPTED
+        assert region_id == "r1"
+        assert epoch == 2
+
+        return StatusResult(
+            order_id=order_id,
+            status=OrderStatus.ACCEPTED,
+            applied=True,
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.change_region_order_status",
+        fake_change,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=2,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/vendors/v001/orders/{order_id}/status",
+        json={
+            "event_id": str(event_id),
+            "to_status": "accepted",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "order_id": str(order_id),
+        "status": "accepted",
+        "applied": True,
+        "duplicate": False,
+        "conflict": False,
+    }
+
+
+def test_change_order_status_conflict_returns_409(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from restaurantos.common.models import OrderStatus, StatusResult
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    order_id = uuid4()
+
+    async def fake_change(*args, **kwargs):
+        return StatusResult(
+            order_id=order_id,
+            status=OrderStatus.ACCEPTED,
+            applied=False,
+            conflict=True,
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.change_region_order_status",
+        fake_change,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/vendors/v001/orders/{order_id}/status",
+        json={
+            "event_id": str(uuid4()),
+            "to_status": "preparing",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["conflict"] is True
+    assert response.json()["applied"] is False
+
+
+def test_change_order_status_refreshes_after_stale_epoch(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from restaurantos.common.errors import StaleEpochError
+    from restaurantos.common.models import OrderStatus, StatusResult
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+
+    order_id = uuid4()
+    calls = 0
+
+    async def fake_change(
+        pool,
+        vendor_id,
+        requested_order_id,
+        body,
+        region_id,
+        epoch,
+        change_status,
+    ):
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            assert epoch == 1
+            raise StaleEpochError()
+
+        assert epoch == 2
+        assert region_id == "r1"
+
+        return StatusResult(
+            order_id=order_id,
+            status=OrderStatus.ACCEPTED,
+            applied=True,
+        )
+
+    async def fake_refresh(pool):
+        app.state.directory.cell_routes["w21z7"] = RegionRoute(
+            region_id="r1",
+            epoch=2,
+            primary_node="r1-standby",
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.change_region_order_status",
+        fake_change,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+    app.state.directory.refresh = fake_refresh
+    app.state.hq_pool = object()
+
+    region_pools = AsyncMock()
+    region_pools.get.side_effect = [object(), object()]
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/vendors/v001/orders/{order_id}/status",
+        json={
+            "event_id": str(uuid4()),
+            "to_status": "accepted",
+        },
+    )
+
+    assert response.status_code == 200
+    assert calls == 2
+
+    assert region_pools.get.await_args_list[0].args == ("r1-primary",)
+    assert region_pools.get.await_args_list[1].args == ("r1-standby",)
+
+
+def test_edge_change_order_status_uses_local_primary(monkeypatch) -> None:
+    from uuid import uuid4
+
+    from restaurantos.common.config import Settings
+    from restaurantos.common.models import OrderStatus, StatusResult
+    from restaurantos.gateway import app as gateway_app
+
+    order_id = uuid4()
+    event_id = uuid4()
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_read_epoch(pool, region_id):
+        assert pool == "edge-pool"
+        assert region_id == "r1"
+        return 4
+
+    async def fake_change(
+        pool,
+        vendor_id,
+        requested_order_id,
+        body,
+        region_id,
+        epoch,
+        change_status,
+    ):
+        assert pool == "edge-pool"
+        assert vendor_id == "v001"
+        assert requested_order_id == order_id
+        assert body.event_id == event_id
+        assert body.to_status == OrderStatus.ACCEPTED
+        assert region_id == "r1"
+        assert epoch == 4
+
+        return StatusResult(
+            order_id=order_id,
+            status=OrderStatus.ACCEPTED,
+            applied=True,
+        )
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+    monkeypatch.setattr(gateway_app, "read_region_epoch", fake_read_epoch)
+    monkeypatch.setattr(
+        gateway_app,
+        "change_region_order_status",
+        fake_change,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.post(
+        f"/api/v1/vendors/v001/orders/{order_id}/status",
+        json={
+            "event_id": str(event_id),
+            "to_status": "accepted",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "accepted"
+    assert response.json()["applied"] is True
+
+    region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_set_product_availability(monkeypatch) -> None:
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+    from restaurantos.region import ProductState
+
+    async def fake_set(
+        pool,
+        vendor_id,
+        product_id,
+        available,
+        region_id,
+        epoch,
+        set_availability,
+    ):
+        assert vendor_id == "v001"
+        assert product_id == "p001"
+        assert available is False
+        assert region_id == "r1"
+        assert epoch == 2
+
+        return ProductState(
+            available=False,
+            reason="manual",
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.set_region_availability",
+        fake_set,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=2,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/v1/vendors/v001/products/p001/availability",
+        json={"available": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "vendor_id": "v001",
+        "product_id": "p001",
+        "available": False,
+        "reason": "manual",
+    }
+
+    region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_set_product_available_can_remain_off_for_stock(monkeypatch) -> None:
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+    from restaurantos.region import ProductState
+
+    async def fake_set(*args, **kwargs):
+        return ProductState(
+            available=False,
+            reason="stock",
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.set_region_availability",
+        fake_set,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/v1/vendors/v001/products/p001/availability",
+        json={"available": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["available"] is False
+    assert response.json()["reason"] == "stock"
+
+
+def test_edge_set_product_availability_uses_local_primary(
+    monkeypatch,
+) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+    from restaurantos.region import ProductState
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_read_epoch(pool, region_id):
+        assert pool == "edge-pool"
+        assert region_id == "r1"
+        return 4
+
+    async def fake_set(
+        pool,
+        vendor_id,
+        product_id,
+        available,
+        region_id,
+        epoch,
+        set_availability,
+    ):
+        assert pool == "edge-pool"
+        assert vendor_id == "v001"
+        assert product_id == "p001"
+        assert available is False
+        assert region_id == "r1"
+        assert epoch == 4
+
+        return ProductState(
+            available=False,
+            reason="manual",
+        )
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+    monkeypatch.setattr(gateway_app, "read_region_epoch", fake_read_epoch)
+    monkeypatch.setattr(
+        gateway_app,
+        "set_region_availability",
+        fake_set,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/v1/vendors/v001/products/p001/availability",
+        json={"available": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["available"] is False
+    assert response.json()["reason"] == "manual"
+
+    region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_set_product_availability_refreshes_after_stale_epoch(
+    monkeypatch,
+) -> None:
+    from restaurantos.common.errors import StaleEpochError
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+    from restaurantos.region import ProductState
+
+    calls = 0
+
+    async def fake_set(
+        pool,
+        vendor_id,
+        product_id,
+        available,
+        region_id,
+        epoch,
+        set_availability,
+    ):
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            assert epoch == 1
+            raise StaleEpochError()
+
+        assert epoch == 2
+        assert region_id == "r1"
+
+        return ProductState(
+            available=False,
+            reason="manual",
+        )
+
+    async def fake_refresh(pool):
+        app.state.directory.cell_routes["w21z7"] = RegionRoute(
+            region_id="r1",
+            epoch=2,
+            primary_node="r1-standby",
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.set_region_availability",
+        fake_set,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+    app.state.directory.refresh = fake_refresh
+    app.state.hq_pool = object()
+
+    region_pools = AsyncMock()
+    region_pools.get.side_effect = [object(), object()]
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.put(
+        "/api/v1/vendors/v001/products/p001/availability",
+        json={"available": False},
+    )
+
+    assert response.status_code == 200
+    assert calls == 2
+
+    assert region_pools.get.await_args_list[0].args == ("r1-primary",)
+    assert region_pools.get.await_args_list[1].args == ("r1-standby",)
+
+
+def test_restock_vendor(monkeypatch) -> None:
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+    from restaurantos.region import RestockResult
+
+    async def fake_restock(
+        pool,
+        vendor_id,
+        region_id,
+        epoch,
+        restock,
+    ):
+        assert vendor_id == "v001"
+        assert region_id == "r1"
+        assert epoch == 2
+
+        return RestockResult(
+            counters_restocked=14,
+            products_back_on=3,
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.restock_region_vendor",
+        fake_restock,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=2,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = object()
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.post("/api/v1/vendors/v001/restock")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "vendor_id": "v001",
+        "region_id": "r1",
+        "counters_restocked": 14,
+        "products_back_on": 3,
+    }
+
+    region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_edge_restock_vendor_uses_local_primary(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+    from restaurantos.region import RestockResult
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_read_epoch(pool, region_id):
+        assert pool == "edge-pool"
+        assert region_id == "r1"
+        return 4
+
+    async def fake_restock(
+        pool,
+        vendor_id,
+        region_id,
+        epoch,
+        restock,
+    ):
+        assert pool == "edge-pool"
+        assert vendor_id == "v001"
+        assert region_id == "r1"
+        assert epoch == 4
+
+        return RestockResult(
+            counters_restocked=14,
+            products_back_on=3,
+        )
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+    monkeypatch.setattr(gateway_app, "read_region_epoch", fake_read_epoch)
+    monkeypatch.setattr(
+        gateway_app,
+        "restock_region_vendor",
+        fake_restock,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.post("/api/v1/vendors/v001/restock")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "vendor_id": "v001",
+        "region_id": "r1",
+        "counters_restocked": 14,
+        "products_back_on": 3,
+    }
+
+    region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_restock_vendor_refreshes_after_stale_epoch(monkeypatch) -> None:
+    from restaurantos.common.errors import StaleEpochError
+    from restaurantos.gateway.directory import DirectoryCache, RegionRoute
+    from restaurantos.region import RestockResult
+
+    calls = 0
+
+    async def fake_restock(
+        pool,
+        vendor_id,
+        region_id,
+        epoch,
+        restock,
+    ):
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            assert epoch == 1
+            raise StaleEpochError()
+
+        assert epoch == 2
+        assert region_id == "r1"
+
+        return RestockResult(
+            counters_restocked=14,
+            products_back_on=3,
+        )
+
+    async def fake_refresh(pool):
+        app.state.directory.cell_routes["w21z7"] = RegionRoute(
+            region_id="r1",
+            epoch=2,
+            primary_node="r1-standby",
+        )
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.restock_region_vendor",
+        fake_restock,
+    )
+
+    app = create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={"v001": "w21z7"},
+        cell_routes={
+            "w21z7": RegionRoute(
+                region_id="r1",
+                epoch=1,
+                primary_node="r1-primary",
+            )
+        },
+        region_routes={},
+    )
+    app.state.directory.refresh = fake_refresh
+    app.state.hq_pool = object()
+
+    region_pools = AsyncMock()
+    region_pools.get.side_effect = [object(), object()]
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+    response = client.post("/api/v1/vendors/v001/restock")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "vendor_id": "v001",
+        "region_id": "r1",
+        "counters_restocked": 14,
+        "products_back_on": 3,
+    }
+
+    assert calls == 2
+    assert region_pools.get.await_args_list[0].args == ("r1-primary",)
+    assert region_pools.get.await_args_list[1].args == ("r1-standby",)
