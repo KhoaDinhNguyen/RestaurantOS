@@ -122,6 +122,12 @@ class AvailabilityRequest(BaseModel):
     available: bool
 
 
+class RestockRequest(BaseModel):
+    """Optional vendor restock request."""
+
+    items: list[dict[str, object]] | None = None
+
+
 def create_app() -> FastAPI:
     """Create the gateway or edge FastAPI application."""
     settings = get_settings()
@@ -476,7 +482,13 @@ def create_app() -> FastAPI:
     async def restock_vendor(
         vendor_id: str,
         request: Request,
+        body: RestockRequest | None = None,
     ) -> dict[str, object]:
+        if body is not None and body.items is not None:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "not_implemented"},
+            )
         route = request.app.state.directory.route_vendor(vendor_id)
         pool = await request.app.state.region_pools.get(route.primary_node)
 
@@ -513,7 +525,13 @@ def create_app() -> FastAPI:
     async def edge_restock_vendor(
         vendor_id: str,
         request: Request,
+        body: RestockRequest | None = None,
     ) -> dict[str, object]:
+        if body is not None and body.items is not None:
+            return JSONResponse(
+                status_code=501,
+                content={"error": "not_implemented"},
+            )
         region_id = settings.region_id
         if region_id is None:
             raise RuntimeError("ROS_REGION_ID is required in edge mode")
