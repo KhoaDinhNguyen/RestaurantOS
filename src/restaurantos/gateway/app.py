@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
 from uuid import UUID
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from restaurantos.common.cluster import HQ_PRIMARY, load_cluster
@@ -334,14 +334,8 @@ def create_app() -> FastAPI:
     async def dish_search(
         q: str,
         request: Request,
-        limit: int = 20,
+        limit: int = Query(default=20, ge=1, le=100),
     ) -> list[dict[str, object]]:
-        if limit < 1 or limit > 100:
-            raise HTTPException(
-                status_code=422,
-                detail="limit must be between 1 and 100",
-            )
-
         async def work():
             return await search_dishes(
                 request.app.state.hq_pool,
@@ -376,13 +370,8 @@ def create_app() -> FastAPI:
     async def edge_dish_search(
         q: str,
         request: Request,
-        limit: int = 20,
+        limit: int = Query(default=20, ge=1, le=100),
     ) -> list[dict[str, object]]:
-        if limit < 1 or limit > 100:
-            raise HTTPException(
-                status_code=422,
-                detail="limit must be between 1 and 100",
-            )
 
         region_id = settings.region_id
         if region_id is None:
@@ -776,6 +765,33 @@ def create_app() -> FastAPI:
         "/menu/products",
         response_model=MenuPublishResponse,
         status_code=202,
+        responses={
+            404: {
+                "description": "Vendor, product, or dish not found.",
+                "content": {
+                    "application/json": {
+                        "example": {"error": "not_found"},
+                    }
+                },
+            },
+            409: {
+                "description": "Product already exists or its dish link cannot change.",
+                "content": {
+                    "application/json": {
+                        "examples": {
+                            "product_exists": {
+                                "value": {
+                                    "error": "product_exists",
+                                    "vendor_id": "v001",
+                                    "product_id": "p001",
+                                }
+                            },
+                            "dish_link_fixed": {"value": {"error": "dish_link_fixed"}},
+                        }
+                    }
+                },
+            },
+        },
     )
     async def publish_menu_products(
         body: MenuPublishRequest,

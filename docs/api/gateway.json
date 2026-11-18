@@ -172,6 +172,8 @@
                         "required": false,
                         "schema": {
                             "type": "integer",
+                            "maximum": 100,
+                            "minimum": 1,
                             "default": 20,
                             "title": "Limit"
                         }
@@ -606,6 +608,37 @@
                             "application/json": {
                                 "schema": {
                                     "$ref": "#/components/schemas/MenuPublishResponse"
+                                }
+                            }
+                        }
+                    },
+                    "404": {
+                        "description": "Vendor, product, or dish not found.",
+                        "content": {
+                            "application/json": {
+                                "example": {
+                                    "error": "not_found"
+                                }
+                            }
+                        }
+                    },
+                    "409": {
+                        "description": "Product already exists or its dish link cannot change.",
+                        "content": {
+                            "application/json": {
+                                "examples": {
+                                    "product_exists": {
+                                        "value": {
+                                            "error": "product_exists",
+                                            "vendor_id": "v001",
+                                            "product_id": "p001"
+                                        }
+                                    },
+                                    "dish_link_fixed": {
+                                        "value": {
+                                            "error": "dish_link_fixed"
+                                        }
+                                    }
                                 }
                             }
                         }

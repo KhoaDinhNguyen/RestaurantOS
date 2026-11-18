@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from time import monotonic
 
 from psycopg_pool import AsyncConnectionPool
 
@@ -28,16 +29,26 @@ class EdgePrimary:
         self.settings = settings
         self.current: str | None = None
         self._refresh_lock = asyncio.Lock()
+        self._last_refresh_completed = 0.0
 
     async def refresh(self) -> str | None:
-        """Probe the local nodes and update the current primary."""
+        """Probe the local nodes, coalescing overlapping refreshes."""
+        waiting_since = monotonic()
+
         async with self._refresh_lock:
+            # Another refresh completed while this caller was waiting.
+            # Its result is fresh for this caller, so reuse it.
+            if self._last_refresh_completed >= waiting_since:
+                return self.current
+
             self.current = await find_local_primary(
                 self.cluster,
                 self.region_id,
                 self.current,
                 self.settings,
             )
+            self._last_refresh_completed = monotonic()
+
             return self.current
 
     async def get_pool(

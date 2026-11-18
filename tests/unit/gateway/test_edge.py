@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -182,3 +183,46 @@ async def test_run_edge_does_not_refresh_after_success() -> None:
     pools.get.assert_awaited_once_with("r1-primary")
     pools.drop_if_same.assert_not_awaited()
     primary.refresh.assert_not_awaited()
+
+
+async def test_overlapping_refreshes_reuse_completed_discovery(
+    monkeypatch,
+) -> None:
+    cluster = object()
+    settings = Settings(_env_file=None)
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def find_primary(*args):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return "r1-primary"
+
+    monkeypatch.setattr(edge, "find_local_primary", find_primary)
+
+    primary = edge.EdgePrimary(
+        cluster,
+        "r1",
+        settings,
+    )
+
+    first = asyncio.create_task(primary.refresh())
+
+    await started.wait()
+
+    second = asyncio.create_task(primary.refresh())
+
+    # Give the second task a chance to reach the refresh lock.
+    await asyncio.sleep(0)
+
+    release.set()
+
+    assert await first == "r1-primary"
+    assert await second == "r1-primary"
+
+    assert calls == 1
+    assert primary.current == "r1-primary"
