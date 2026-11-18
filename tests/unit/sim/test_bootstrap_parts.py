@@ -7,6 +7,7 @@ import io
 from pathlib import Path
 
 import pytest
+from conftest import make_playback, sample_orders
 from pydantic import ValidationError
 
 from restaurantos.sim.config import SimSettings
@@ -65,14 +66,23 @@ def test_negative_jitter_is_rejected():
 
 
 def test_jitter_above_the_smallest_event_gap_is_rejected():
-    """Review item 5: jitter is drawn from [0, J), so at or above the
-    smallest gap between two events of one order (120 s) it could
-    reorder them; the setting refuses to allow it."""
-    from restaurantos.sim.playback import MIN_EVENT_GAP_S
+    """Review item 5: J may be at most the smallest gap between two
+    events of one order (120 s). Draws are in [0, J), so an event is
+    never due before its predecessor - and past the gap the setting
+    refuses to go."""
+    from restaurantos.sim.timeline import MIN_EVENT_GAP_S
 
     assert MIN_EVENT_GAP_S == 120
     with pytest.raises(ValidationError):
         SimSettings(playback_event_jitter_s=121)
+
+
+def test_the_jitter_bound_itself_is_accepted():
+    """Review round 2, item 8: the bound is inclusive - J = the smallest
+    gap still never lets a draw reach the predecessor's deadline, so
+    both the settings and the engine accept 120."""
+    SimSettings(playback_event_jitter_s=120)
+    make_playback(sample_orders(1), Path("/tmp/jbound"), status_events=True, event_jitter_s=120.0)
 
 
 # ---- shards -----------------------------------------------------------------

@@ -5,6 +5,8 @@ right without needing a live run or a cluster."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from restaurantos.sim.cli import app
@@ -185,19 +187,86 @@ def test_restock_days_are_the_interval_days_inside_the_window():
         restock_days(14, 0, 14, 90)
 
 
-def test_restock_vendors_are_sorted_and_header_checked(tmp_path):
+def _vendors_csv_dir(tmp_path, text: str) -> Path:
+    """A data dir holding exactly this vendors.csv plus a MANIFEST.csv
+    entry that matches it (or not, when the caller edits one after)."""
+    import hashlib
+    from pathlib import Path as _Path
+
     from restaurantos.sim.loading import REFERENCE_COLUMNS
+
+    tmp_path = _Path(tmp_path)
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "vendors.csv").write_text(text, encoding="utf-8")
+    raw = (tmp_path / "vendors.csv").read_bytes()
+    (tmp_path / "MANIFEST.csv").write_text(
+        "file,rows,sha256\n"
+        f"vendors.csv,1,{hashlib.sha256(raw).hexdigest()}\n"
+        + "".join(
+            f"{name},0,{hashlib.sha256((tmp_path / name).read_bytes()).hexdigest()}\n"
+            if (tmp_path / name).exists()
+            else ""
+            for name in REFERENCE_COLUMNS
+        ),
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_restock_vendors_are_sorted_and_header_checked(tmp_path):
     from restaurantos.sim.playback_cli import restock_vendors
 
-    columns = ",".join(REFERENCE_COLUMNS["vendors.csv"])
-    (tmp_path / "vendors.csv").write_text(
-        columns + "\nv9,,w21z7,x\nv1,,w21z7,x\nv5,,w21z6,y\n", encoding="utf-8"
-    )
-    assert restock_vendors(tmp_path) == ["v1", "v5", "v9"]
+    header = "vendor_id,chain_id,geohash,primary_cuisine"
+    data = _vendors_csv_dir(tmp_path, header + "\nv9,,w21z7,x\nv1,,w21z7,x\nv5,,w21z6,y\n")
+    assert restock_vendors(data) == [
+        ("v1", "w21z7"),
+        ("v5", "w21z6"),
+        ("v9", "w21z7"),
+    ]
 
-    (tmp_path / "vendors.csv").write_text("wrong,header\n", encoding="utf-8")
+    # a fresh dir whose manifest matches: the header check is what fires
+    bad = _vendors_csv_dir(tmp_path / "bad-header", "wrong,header\n")
     with pytest.raises(RuntimeError, match="header"):
-        restock_vendors(tmp_path)
+        restock_vendors(bad)
+
+
+def test_restock_vendors_reject_a_blank_line_with_its_number(tmp_path):
+    """Review round 2, item 7: a blank line used to raise an IndexError
+    out of the CLI; now it is a ValueError naming the line (the header
+    is line 1), and the CLI already turns ValueError into exit 1."""
+    from restaurantos.sim.playback_cli import restock_vendors
+
+    data = _vendors_csv_dir(
+        tmp_path,
+        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n\nv2,,w21z7,x\n",
+    )
+    with pytest.raises(ValueError, match=r"vendors.csv line 3: expected 4 values, got 0"):
+        restock_vendors(data)
+
+
+def test_restock_vendors_reject_an_empty_vendor_id(tmp_path):
+    from restaurantos.sim.playback_cli import restock_vendors
+
+    # three values and no vendor id: both halves of the check fail
+    data = _vendors_csv_dir(tmp_path, "vendor_id,chain_id,geohash,primary_cuisine\n,w21z7,x\n")
+    with pytest.raises(ValueError, match=r"vendors.csv line 2: expected 4 values, got 3"):
+        restock_vendors(data)
+
+
+def test_restock_vendors_refuse_a_file_that_left_the_manifest(tmp_path):
+    """Review round 2, item 7: on a cache hit nothing bound vendors.csv
+    to MANIFEST.csv, so a changed file would restock a different vendor
+    set than the one bootstrap loaded. Now the sha256 is checked."""
+    from restaurantos.sim.playback_cli import restock_vendors
+
+    data = _vendors_csv_dir(tmp_path, "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n")
+    # the vendor set changes after the manifest was written
+    (data / "vendors.csv").write_text(
+        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\nv2,,w21z7,x\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="does not match its MANIFEST.csv entry"):
+        restock_vendors(data)
 
 
 def test_vendor_regions_match_bootstraps_shards():
@@ -207,6 +276,7 @@ def test_vendor_regions_match_bootstraps_shards():
     bootstrap's `_vendors_by_cell` over the mini fixture."""
     from restaurantos.common.cluster import Cluster
     from restaurantos.sim.bootstrap import _vendors_by_cell
+    from restaurantos.sim.loading import REFERENCE_COLUMNS, read_rows
     from restaurantos.sim.mini import mini_dir
     from restaurantos.sim.playback_cli import vendor_region_map
     from restaurantos.sim.shard import assign_shards, vendor_counts
@@ -220,7 +290,12 @@ def test_vendor_regions_match_bootstraps_shards():
         for cell, rid in cell_region.items()
         for vendor in by_cell.get(cell, ())
     }
-    regions = vendor_region_map(data, cluster)
+    columns = REFERENCE_COLUMNS["vendors.csv"]
+    geohash_column = columns.index("geohash")
+    pairs = sorted(
+        (row[0], row[geohash_column]) for row in read_rows(data / "vendors.csv", columns)
+    )
+    regions = vendor_region_map(pairs, data, cluster)
     assert regions == expected
     assert set(regions) == set(expected)  # every vendor is covered
 

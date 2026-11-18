@@ -12,7 +12,7 @@ from functools import cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from restaurantos.sim.playback import MIN_EVENT_GAP_S
+from restaurantos.sim.timeline import MIN_EVENT_GAP_S
 
 
 class SimSettings(BaseSettings):
@@ -45,11 +45,10 @@ class SimSettings(BaseSettings):
     # of the orders their full event set (an order is in or out, never
     # half). Jitter is uniform in [0, playback_event_jitter_s) simulated
     # seconds per event, drawn per (seed, order, event) - never a shared
-    # generator. The bound is capped at the smallest gap between two
-    # events of one order (120 s, +1 min to +3 min, derived from the
-    # engine's EVENT_SCHEDULE): jitter is drawn from [0, J), so at or
-    # above the gap it could reorder the events, and the region would
-    # answer conflicts.
+    # generator. The bound: J may be at most the smallest gap between
+    # two events of one order (120 s, +1 min to +3 min, derived from
+    # the engine's EVENT_SCHEDULE). Draws are in [0, J), so an event is
+    # never due before its predecessor.
     playback_status_events: bool = True
     playback_event_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     playback_event_jitter_s: float = Field(default=60.0, ge=0.0, le=float(MIN_EVENT_GAP_S))

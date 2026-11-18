@@ -36,6 +36,7 @@ from restaurantos.sim.replaydata import (
     CacheMeta,
     ensure_cache,
     iter_orders,
+    require_manifest_file,
     require_window,
     to_order_request,
 )
@@ -52,24 +53,41 @@ def _orders_fn(cache_file: Path):
     return make
 
 
-def restock_vendors(data_dir: Path) -> list[str]:
-    """Every vendor, sorted: restock order must not depend on the CSV's
-    row order."""
+def restock_vendors(data_dir: Path) -> list[tuple[str, str]]:
+    """(vendor_id, geohash) for every vendor, sorted: restock order must
+    not depend on the CSV's row order, and the geohash routes each
+    restock to its vendor's region.
+
+    The file is checked against MANIFEST.csv first - `ensure_cache`
+    binds only the two order files, so without this a cache hit could
+    restock a different vendor set than the one bootstrap loaded. Rows
+    are numbered with the header as line 1: a blank or short row, or an
+    empty vendor_id, is a ValueError naming the line, not an
+    IndexError."""
+    require_manifest_file(data_dir, "vendors.csv")
     columns = REFERENCE_COLUMNS["vendors.csv"]
-    return sorted(row[0] for row in read_rows(data_dir / "vendors.csv", columns))
+    geohash_column = columns.index("geohash")
+    pairs: list[tuple[str, str]] = []
+    # read_rows checks the header; the numbering starts at 2 because
+    # the header is line 1
+    for number, row in enumerate(read_rows(data_dir / "vendors.csv", columns), start=2):
+        if len(row) != len(columns) or not row[0]:
+            raise ValueError(
+                f"vendors.csv line {number}: expected {len(columns)} values, got {len(row)}"
+            )
+        pairs.append((row[0], row[geohash_column]))
+    return sorted(pairs)
 
 
-def vendor_region_map(data_dir: Path, cluster: Cluster) -> dict[str, str]:
+def vendor_region_map(
+    pairs: list[tuple[str, str]], data_dir: Path, cluster: Cluster
+) -> dict[str, str]:
     """vendor -> its region, built exactly the way bootstrap shards it:
     the same `vendor_counts` + `assign_shards` walk over
     `cluster.region_ids`, then each vendor's geohash looked up in the
     result. Deterministic, and no HQ call at run start."""
     cell_region = dict(assign_shards(vendor_counts(data_dir), cluster.region_ids))
-    geohash_column = REFERENCE_COLUMNS["vendors.csv"].index("geohash")
-    return {
-        row[0]: cell_region[row[geohash_column]]
-        for row in read_rows(data_dir / "vendors.csv", REFERENCE_COLUMNS["vendors.csv"])
-    }
+    return {vendor: cell_region[geohash] for vendor, geohash in pairs}
 
 
 def kitchen_urls(cluster: Cluster, edge_host: str) -> dict[str, str]:
@@ -128,12 +146,13 @@ async def start_command(args: argparse.Namespace) -> int:
         # the banner's days come from the effective window, so a
         # shortened to_day never announces restocks outside the data
         banner_days = restock_days(meta.warm_up_days, restock_every, window.from_day, window.to_day)
-        vendors = restock_vendors(data_dir)
+        pairs = restock_vendors(data_dir)
+        vendors = [vendor for vendor, _geohash in pairs]
         # kitchen routing: the region edges (or the one override URL a
         # stub run passes) and the vendor -> region map, built the way
         # bootstrap shards it
         cluster = load_cluster()
-        vendor_regions = vendor_region_map(data_dir, cluster)
+        vendor_regions = vendor_region_map(pairs, data_dir, cluster)
         kitchen_override = (args.kitchen_target or "").rstrip("/") or None
         edges = kitchen_urls(cluster, sim.playback_edge_host)
     except (OSError, RuntimeError, ValueError) as error:

@@ -26,6 +26,7 @@ deterministically too.
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import sqlite3
@@ -120,6 +121,24 @@ def _manifest_sha256(data_dir: Path) -> dict[str, str]:
             if len(row) == 3:
                 entries[row[0]] = row[2]
         return entries
+
+
+def require_manifest_file(data_dir: Path, name: str) -> None:
+    """The file's sha256 matches its MANIFEST.csv entry, or ValueError
+    naming the file.
+
+    For a file a run reads directly (vendors.csv, read for restocks):
+    `ensure_cache` binds only orders.csv and order_items.csv to the
+    manifest, so without this check a cache hit could restock a
+    different vendor set than the one bootstrap loaded. The file is
+    small; hashing it is instant.
+    """
+    expected = _manifest_sha256(data_dir).get(name)
+    if expected is None:
+        raise ValueError(f"{name} is not listed in MANIFEST.csv")
+    digest = hashlib.sha256((data_dir / name).read_bytes()).hexdigest()
+    if digest != expected:
+        raise ValueError(f"{name} does not match its MANIFEST.csv entry")
 
 
 def load_meta(data_dir: Path) -> CacheMeta | None:

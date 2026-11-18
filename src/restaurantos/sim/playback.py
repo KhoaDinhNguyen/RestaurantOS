@@ -75,6 +75,7 @@ import httpx
 from restaurantos.common.models import OrderRequest, OrderStatus
 from restaurantos.common.simclock import SECONDS_PER_DAY, SimClock, from_sim_seconds, to_sim_seconds
 from restaurantos.sim.determinism import stable_float
+from restaurantos.sim.timeline import EVENT_SCHEDULE, MIN_EVENT_GAP_S
 
 # Re-check the clock at most this often during a long wait, so a speed
 # change is picked up within a slice instead of at the far deadline.
@@ -113,22 +114,8 @@ RESPONSE_FIELDS = (
 # ...and the ones of a status change (StatusResult in common/models.py).
 EVENT_RESPONSE_FIELDS = ("applied", "duplicate", "conflict")
 
-# The kitchen timeline: (to_status, seconds after the order).
-EVENT_SCHEDULE: tuple[tuple[OrderStatus, int], ...] = (
-    (OrderStatus.ACCEPTED, 60),
-    (OrderStatus.PREPARING, 180),
-    (OrderStatus.READY, 900),
-    (OrderStatus.PICKED_UP, 1500),
-)
-
-# The jitter is drawn from [0, J), so it can never reach the smallest
-# gap between two events of one order: at the gap exactly, a later
-# event could draw its full jitter and tie its predecessor. Derived
-# from EVENT_SCHEDULE, not written a second time.
-MIN_EVENT_GAP_S = min(
-    later - earlier
-    for (_, earlier), (_, later) in zip(EVENT_SCHEDULE, EVENT_SCHEDULE[1:], strict=False)
-)
+# The kitchen timeline (EVENT_SCHEDULE) and the jitter bound
+# (MIN_EVENT_GAP_S) live in sim/timeline.py, shared with the settings.
 
 # Dispatch order within one simulated instant: restocks first (they
 # must land before the day's first order), then orders, then status
@@ -322,15 +309,15 @@ class Playback:
         self._event_sample_rate = event_sample_rate
         self._event_jitter_s = event_jitter_s
         # Tests and API callers build the engine directly, so the two
-        # knobs validate here too, not only in the settings: jitter at
-        # or above the smallest event gap could reorder one order's
-        # events (the region would answer conflicts), and a sample rate
-        # outside [0, 1] means nothing.
+        # knobs validate here too, not only in the settings: the jitter
+        # bound keeps one order's events in kitchen order, and a
+        # sample rate outside [0, 1] means nothing.
         if not 0.0 <= event_jitter_s <= MIN_EVENT_GAP_S:
             raise ValueError(
                 f"event_jitter_s {event_jitter_s} must be within [0, {MIN_EVENT_GAP_S}]: "
-                "jitter is drawn from [0, J), so at or above the smallest gap "
-                "between two events of one order it could reorder them"
+                "J may be at most the smallest gap between two events of one order "
+                f"({MIN_EVENT_GAP_S} s); draws are in [0, J), so an event is never "
+                "due before its predecessor"
             )
         if not 0.0 <= event_sample_rate <= 1.0:
             raise ValueError(f"event_sample_rate {event_sample_rate} must be within [0, 1]")
