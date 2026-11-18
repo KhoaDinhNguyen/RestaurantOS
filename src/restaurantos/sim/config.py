@@ -52,6 +52,14 @@ class SimSettings(BaseSettings):
     playback_status_events: bool = True
     playback_event_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     playback_event_jitter_s: float = Field(default=60.0, ge=0.0, le=float(MIN_EVENT_GAP_S))
+    # Kitchen calls (status events, restocks) retry a timeout, a
+    # connection error or a 5xx: the edge does not cancel a call that
+    # missed its deadline, so it may have committed, and giving up
+    # after one attempt would send the order's next event into an
+    # impossible move. Every attempt sends the same event_id, so a
+    # repeat answers duplicate and is counted as acked. A 2xx, 404,
+    # 409 or 422 is never retried.
+    playback_kitchen_attempts: int = Field(default=3, ge=1)
     # Where the region edge APIs listen. Playback routes the kitchen-side
     # calls (status events, restocks) to each region's own edge API -
     # port 8010 + n on this host - because the kitchen is on the region

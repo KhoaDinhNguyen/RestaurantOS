@@ -117,6 +117,13 @@ EVENT_RESPONSE_FIELDS = ("applied", "duplicate", "conflict")
 # The kitchen timeline (EVENT_SCHEDULE) and the jitter bound
 # (MIN_EVENT_GAP_S) live in sim/timeline.py, shared with the settings.
 
+# Wall-time backoff between kitchen-call attempts (review round 3,
+# item 1): 0.5 s after the first attempt, then 1 s, then 2 s for every
+# attempt after that. Wall time, not simulated time - a retry is about
+# the target being unreachable for a moment (a failover, a blip), not
+# about the replay's clock, and it must not shift the schedule.
+_KITCHEN_BACKOFF_S = (0.5, 1.0, 2.0)
+
 # Dispatch order within one simulated instant: restocks first (they
 # must land before the day's first order), then orders, then status
 # events.
@@ -285,6 +292,7 @@ class Playback:
         status_events: bool = False,
         event_sample_rate: float = 1.0,
         event_jitter_s: float = 60.0,
+        kitchen_attempts: int = 3,
         restock_every: int | None = None,
         warm_up_days: int = 0,
         restock_vendors: Sequence[str] = (),
@@ -321,6 +329,11 @@ class Playback:
             )
         if not 0.0 <= event_sample_rate <= 1.0:
             raise ValueError(f"event_sample_rate {event_sample_rate} must be within [0, 1]")
+        # Kitchen-call retries (review round 3, item 1): at least one
+        # attempt; tests and API callers build the engine directly.
+        if kitchen_attempts < 1:
+            raise ValueError(f"kitchen_attempts {kitchen_attempts} must be at least 1")
+        self._kitchen_attempts = kitchen_attempts
         self._restock_every = restock_every
         self._warm_up_days = warm_up_days
         self._restock_vendors = tuple(restock_vendors)
@@ -383,18 +396,23 @@ class Playback:
         self._seq += 1
         return seq
 
-    def _kitchen_base(self, region_id: str | None) -> str:
+    def _kitchen_base(self, region_id: object) -> str | None:
         """The API base a kitchen-side call (status event, restock) goes
-        to: the one override URL (stub runs), the region's own edge API,
-        or - when neither is configured - the same base as the orders,
-        which is the single-URL mode the stub and the tests run on. A
-        region the routing does not know falls back to the target too:
-        the line still carries the region, so the fallback is visible
-        in the log."""
+        to, or None when the call must not go out at all: the one
+        override URL (stub runs) takes everything; in edge mode a
+        region that is not a known string - including a region_id a
+        bad answer made into a non-string - does not fall back to the
+        gateway, because the gateway is exactly what does not survive
+        a cut (T2): the call is failed with "unknown region" on its
+        line instead of being quietly rerouted; with neither
+        configured (tests and the old stub mode) the target, as
+        before."""
         if self._kitchen_url is not None:
             return self._kitchen_url
-        if self._kitchen_urls and region_id is not None and region_id in self._kitchen_urls:
-            return self._kitchen_urls[region_id]
+        if self._kitchen_urls:
+            if isinstance(region_id, str) and region_id in self._kitchen_urls:
+                return self._kitchen_urls[region_id]
+            return None
         return self._api_base
 
     # --- state ------------------------------------------------------------
@@ -1018,10 +1036,19 @@ class Playback:
             return
         seq = self._next_seq()
         self._events_sent += 1
-        # The house style for event ids: deterministic, so the same
-        # replayed window produces the same event ids and a re-run is
-        # idempotent at the region (the same id answers as a duplicate;
-        # a 409 would mean a real state-machine rejection).
+        # The house style for event ids: deterministic, and without the
+        # run id. POST /orders is idempotent by (channel,
+        # external_order_id) - WP1's inbox answers a repeat with the
+        # original order_id - so a re-run of the same window gets the
+        # same order ids and therefore the same event ids, and the
+        # region answers duplicate. A run id in the event id (or a
+        # uuid4) would send *new* ids for orders that have already
+        # moved on: every one of them a conflict and an exception at
+        # HQ, which is exactly what this rule prevents. The same id on
+        # every retry is what makes retries safe: the region's
+        # change_status records the id in processed_events, so a
+        # repeat of a committed change answers duplicate and changes
+        # nothing, while a new id for the same move would conflict.
         record: dict[str, Any] = {
             "kind": "status_event",
             "seq": seq,
@@ -1133,27 +1160,23 @@ class Playback:
     async def _send_event(
         self, seq: int, record: dict[str, Any], previous: asyncio.Task | None
     ) -> None:
-        url = (
-            f"{self._kitchen_base(record.get('region_id'))}"
-            f"/vendors/{record['vendor_id']}/orders/{record['order_id']}/status"
-        )
+        path = f"/vendors/{record['vendor_id']}/orders/{record['order_id']}/status"
         await self._send_aux(
             seq,
             record,
-            url,
+            path,
             {"event_id": record["event_id"], "to_status": record["to_status"]},
             previous,
         )
 
     async def _send_restock(self, seq: int, record: dict[str, Any]) -> None:
-        url = f"{self._kitchen_base(record.get('region_id'))}/vendors/{record['vendor_id']}/restock"
-        await self._send_aux(seq, record, url, None, None)
+        await self._send_aux(seq, record, f"/vendors/{record['vendor_id']}/restock", None, None)
 
     async def _send_aux(
         self,
         seq: int,
         record: dict[str, Any],
-        url: str,
+        path: str,
         body: dict[str, Any] | None,
         previous: asyncio.Task | None = None,
     ) -> None:
@@ -1167,34 +1190,100 @@ class Playback:
         handling, so a task cancelled by the drain while waiting still
         writes its line. If the previous event failed, conflicted or
         was cancelled, this one still goes out: the region decides,
-        and the answer is logged and counted as usual."""
+        and the answer is logged and counted as usual.
+
+        A timeout, a connection error or a 5xx is retried, up to
+        `kitchen_attempts` attempts in total, backing off in wall time
+        between attempts without holding a slot (review round 3,
+        item 1). The edge does not cancel a call that missed its
+        deadline, so the first attempt may have committed: every
+        attempt sends the same body - for an event, the same event_id,
+        which the region's processed_events answers duplicate, and a
+        restock has no body, and a top-up twice is safe - so one
+        retry too many is a no-op duplicate counted as acked, while
+        giving up after one attempt would send the order's next event
+        into an impossible move: a conflict and an HQ exception
+        caused by playback, not by a real race. A 2xx, 404, 409 or
+        422 is never retried: the region answered. The chained next
+        event of the order waits for this task, so it waits for the
+        final answer, retries included. A stop during a backoff
+        cancels the task, and its line says cancelled, as any
+        cancelled send does; a restock that still fails after its
+        last attempt is counted failed and the run goes on - in a
+        fault harness, a call that could not get through is a result
+        to report, not a crash.
+
+        The base the path goes to is resolved inside the counted
+        path as well: in edge mode a region the routing does not know
+        (or a region_id a bad answer made into a non-string) fails
+        the call with "unknown region" on its line, sends nothing,
+        and never falls back to the gateway - the gateway is exactly
+        what does not survive a cut."""
         assert self._log is not None and self._client is not None and self._slots is not None
         is_event = record["kind"] == "status_event"
+        response: httpx.Response | None = None
         try:
             if is_event and previous is not None and not previous.done():
                 # asyncio.wait returns on completion even when the
                 # previous task failed or was cancelled; it does not
                 # re-raise
                 await asyncio.wait({previous})
-            async with self._slots:
-                record["wall_sent_at"] = round(self._wall.now(), 3)
-                try:
-                    response = await self._client.post(url, json=body)
-                    record["http_status"] = response.status_code
-                    if is_event:
-                        record.update(_response_fields(response, EVENT_RESPONSE_FIELDS))
-                    if is_event:
-                        self._count_event_answer(record, response)
-                    elif response.status_code == 200:
-                        # the merged spec: a restock answers 200, and
-                        # playback reads nothing else - any other code
-                        # is a failure, 201 included
-                        self._restocks_acked += 1
-                    else:
-                        self._count_aux_failed(record)
-                except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
-                    record["error"] = type(error).__name__
-                    self._count_aux_failed(record)
+            attempt = 1
+            while True:
+                async with self._slots:
+                    try:
+                        # The base is resolved here, inside the counted
+                        # path, so a bad region_id (or any error in the
+                        # URL) is written to the line and counted, not
+                        # raised out of the task into a missing
+                        # placeholder.
+                        base = self._kitchen_base(record.get("region_id"))
+                        if base is None:
+                            # edge mode, and the routing does not know
+                            # this region: send nothing - falling back
+                            # to the gateway would quietly undo the
+                            # region routing
+                            record["error"] = "unknown region"
+                            break
+                        record["wall_sent_at"] = round(self._wall.now(), 3)
+                        response = await self._client.post(base + path, json=body)
+                        record["http_status"] = response.status_code
+                        record["attempts"] = attempt
+                        if response.status_code < 500:
+                            # the region answered: never retry a 2xx,
+                            # 404, 409 or 422
+                            break
+                        failure = f"http {response.status_code}"
+                    except httpx.TransportError as error:
+                        # a timeout or a connection error: the call may
+                        # still have committed at the region
+                        record["attempts"] = attempt
+                        failure = type(error).__name__
+                    except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
+                        record["attempts"] = attempt
+                        record["error"] = type(error).__name__
+                        break
+                    if attempt >= self._kitchen_attempts:
+                        record["error"] = failure
+                        break
+                # back off in wall time, without the slot, before the
+                # next attempt; a stop cancels the task here and its
+                # line says cancelled
+                await self._wall.sleep(
+                    _KITCHEN_BACKOFF_S[min(attempt - 1, len(_KITCHEN_BACKOFF_S) - 1)]
+                )
+                attempt += 1
+            if is_event:
+                if response is not None:
+                    record.update(_response_fields(response, EVENT_RESPONSE_FIELDS))
+                self._count_event_answer(record, response, attempt)
+            elif response is not None and response.status_code == 200:
+                # the merged spec: a restock answers 200, and
+                # playback reads nothing else - any other code is a
+                # failure, 201 included
+                self._restocks_acked += 1
+            else:
+                self._count_aux_failed(record)
         except asyncio.CancelledError:
             record["error"] = "cancelled"
             self._log.add(seq, record)
@@ -1205,30 +1294,47 @@ class Playback:
         self._log.add(seq, record)
         self._log.flush()
 
-    def _count_event_answer(self, record: dict[str, Any], response: httpx.Response) -> None:
+    def _count_event_answer(
+        self, record: dict[str, Any], response: httpx.Response | None, attempt: int
+    ) -> None:
         """Count a status answer by what it means, not by its code
         alone (review round 2, item 5):
 
         - a 409 is the state machine rejecting the change - a real
           conflict, whatever its body;
+        - an answer that never arrived (response is None, the record
+          carries the transport error) is a failure;
         - on a 2xx, an answer whose body did not parse (the record
           carries `error` from _response_fields) is a failure;
-        - `duplicate` is a replayed event the region already knew;
+        - `duplicate` on the first attempt is a replayed event the
+          region already knew;
+        - `duplicate` on a retry means our own earlier attempt landed
+          (every attempt sends the same event_id, and the region's
+          processed_events makes a repeat a no-op): the change is
+          applied, so it counts as acked, and the line says
+          `landed_earlier`;
         - `conflict` on a 2xx is a real conflict too;
-        - `applied` is the only ack;
+        - `applied` is the only other ack;
         - anything else is a failure, below.
         """
-        if response.status_code == 409:
+        if response is not None and response.status_code == 409:
             self._events_conflicted += 1
             return
         if "error" in record:
             self._events_failed += 1
             return
-        if response.status_code not in (200, 201):
+        if response is None or response.status_code not in (200, 201):
             self._events_failed += 1
             return
         if record.get("duplicate"):
-            self._events_duplicate += 1
+            if attempt > 1:
+                # the same event_id went out on an earlier attempt of
+                # this same send: it landed, the region just never
+                # answered - so the change is applied
+                record["landed_earlier"] = True
+                self._events_acked += 1
+            else:
+                self._events_duplicate += 1
         elif record.get("conflict"):
             self._events_conflicted += 1
         elif record.get("applied"):

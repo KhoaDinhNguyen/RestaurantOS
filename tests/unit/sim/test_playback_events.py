@@ -1360,3 +1360,379 @@ async def test_meta_records_the_extras(tmp_path: Path) -> None:
     meta = json.loads((tmp_path / "meta" / "meta.json").read_text())
     assert meta["events"] == {"enabled": True, "sample_rate": 0.5, "jitter_s": 60.0}
     assert meta["restock"] == {"days": [21], "vendors": 1}
+
+
+# --- kitchen-call retries (review round 3, item 1) ------------------------
+
+
+class FakeEdge(httpx.AsyncBaseTransport):
+    """A fake region edge implementing WP1's change_status rules on the
+    engine's own wire: each event id lands in processed_events and a
+    repeat answers duplicate; an impossible move answers conflict and
+    lands in the exception log; POST /orders is idempotent by
+    (channel, external_order_id) - a repeat gets the original
+    order_id back, so a re-run replays against known orders.
+
+    Scripted outcomes are popped per call, so a test decides what the
+    region does to each attempt: "apply-then-timeout" commits the
+    change and then loses the answer (httpx.ReadTimeout - the edge
+    does not cancel a call that missed its deadline), "503" and "409"
+    answer that code once. Without a script entry the region behaves:
+    a status applies per the state machine, a restock answers 200.
+    """
+
+    def __init__(self) -> None:
+        from restaurantos.common.models import OrderStatus, can_transition
+
+        self._can_transition = can_transition
+        self._statuses = OrderStatus
+        self.seen: set[str] = set()  # the region's processed_events
+        self.status_of: dict[str, str] = {}  # order_id -> current status
+        self.exception_log: list[dict] = []
+        self.placed: set[str] = set()  # external ids through the inbox
+        self.status_calls: dict[str, int] = {}  # event_id -> POSTs seen
+        self.restock_calls: dict[str, int] = {}  # vendor_id -> POSTs seen
+        self.status_script: dict[str, list[str]] = {}  # order_id -> outcomes
+        self.restock_script: dict[str, list[str]] = {}  # vendor_id -> outcomes
+
+    @staticmethod
+    def _pop(script: dict[str, list[str]], key: str) -> str | None:
+        outcomes = script.get(key)
+        if outcomes:
+            return outcomes.pop(0)
+        return None
+
+    def _apply(self, order_id: str, event_id: str, to_status: str) -> None:
+        self.seen.add(event_id)
+        self.status_of[order_id] = to_status
+
+    def _status_result(
+        self, order_id: str, event_id: str, to_status: str, applied: bool, **flags: bool
+    ) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "event_id": event_id,
+                "order_id": order_id,
+                "to_status": to_status,
+                "applied": applied,
+                "duplicate": flags.get("duplicate", False),
+                "conflict": flags.get("conflict", False),
+            },
+        )
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        body = json.loads(request.content) if request.content else {}
+        if path.endswith("/orders"):
+            external = body["external_order_id"]
+            first = external not in self.placed
+            self.placed.add(external)
+            return httpx.Response(
+                201,
+                json={
+                    "outcome": "accepted",
+                    "duplicate": not first,
+                    "order_id": stub_order_id(external),
+                    "region_id": "r-fake",
+                    "queued": False,
+                },
+            )
+        if path.endswith("/status"):
+            order_id = path.split("/orders/")[1].split("/")[0]
+            event_id = body["event_id"]
+            to_status = body["to_status"]
+            self.status_calls[event_id] = self.status_calls.get(event_id, 0) + 1
+            outcome = self._pop(self.status_script, order_id)
+            if outcome == "apply-then-timeout":
+                # the change commits, the answer never arrives
+                self._apply(order_id, event_id, to_status)
+                raise httpx.ReadTimeout("answer lost", request=request)
+            if outcome == "503":
+                return httpx.Response(503, json={"detail": "failover"})
+            if outcome == "409":
+                return httpx.Response(409, json={"detail": "state machine"})
+            if event_id in self.seen:
+                return self._status_result(order_id, event_id, to_status, False, duplicate=True)
+            current = self._statuses(self.status_of.get(order_id, "received"))
+            if not self._can_transition(current, self._statuses(to_status)):
+                self.exception_log.append(
+                    {"order_id": order_id, "event_id": event_id, "to_status": to_status}
+                )
+                return self._status_result(order_id, event_id, to_status, False, conflict=True)
+            self._apply(order_id, event_id, to_status)
+            return self._status_result(order_id, event_id, to_status, True)
+        vendor_id = path.split("/vendors/")[1].split("/")[0]
+        self.restock_calls[vendor_id] = self.restock_calls.get(vendor_id, 0) + 1
+        if self._pop(self.restock_script, vendor_id) == "503":
+            return httpx.Response(503, json={"detail": "failover"})
+        return httpx.Response(
+            200,
+            json={
+                "vendor_id": vendor_id,
+                "region_id": "r-fake",
+                "counters_restocked": 0,
+                "products_back_on": 0,
+            },
+        )
+
+
+async def test_a_retry_after_a_landed_attempt_counts_as_acked(tmp_path: Path) -> None:
+    """Review round 3, item 1: the edge commits the change and then the
+    answer is lost (a timeout). The retry sends the same event_id, the
+    region answers duplicate, and the event counts as acked with
+    landed_earlier on the line - no exception at the region, and the
+    order's next event applies on its first attempt."""
+    fake = FakeEdge()
+    fake.status_script[stub_order_id("1001")] = ["apply-then-timeout"]
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, transport=fake, status_events=True)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="retry-landed")
+    await drive(pb, clock)
+    status = pb.status()
+    assert status["state"] == "done"
+    assert status["events_acked"] == 4
+    assert status["events_duplicate"] == 0
+    assert fake.exception_log == []
+    lines = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
+    accepted = next(line for line in lines if line["to_status"] == "accepted")
+    assert accepted["attempts"] == 2
+    assert accepted["landed_earlier"] is True
+    assert fake.status_calls[accepted["event_id"]] == 2
+    preparing = next(line for line in lines if line["to_status"] == "preparing")
+    assert preparing["attempts"] == 1
+    assert preparing.get("applied") is True
+
+
+async def test_a_retry_after_a_503_applies_and_is_acked(tmp_path: Path) -> None:
+    """Review round 3, item 1: a 503 (the edge answers that for a few
+    seconds during a failover) is retried; the event applies on the
+    second attempt with no exception at the region."""
+    fake = FakeEdge()
+    fake.status_script[stub_order_id("1001")] = ["503"]
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, transport=fake, status_events=True)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="retry-503")
+    await drive(pb, clock)
+    assert pb.status()["events_acked"] == 4
+    assert fake.exception_log == []
+    accepted = next(
+        line
+        for line in run_log_lines(tmp_path, pb)
+        if line["kind"] == "status_event" and line["to_status"] == "accepted"
+    )
+    assert accepted["attempts"] == 2
+    assert accepted["http_status"] == 201
+    assert "error" not in accepted
+
+
+async def test_a_rerun_of_the_same_window_is_all_duplicates(tmp_path: Path) -> None:
+    """Review round 3, item 1: a re-run of the same window sends the
+    same event ids (no run id in them), and every one is answered
+    duplicate by the region - no conflicts, no exceptions at HQ."""
+    fake = FakeEdge()
+    orders = [make_order(14, 0, 0, 5, "1001"), make_order(14, 0, 0, 6, "1002")]
+    clock_a = FakeWallClock()
+    first = make_playback(orders, tmp_path, clock=clock_a, transport=fake, status_events=True)
+    await first.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="rerun-a")
+    await drive(first, clock_a)
+    assert first.status()["events_acked"] == 8
+
+    clock_b = FakeWallClock()
+    second = make_playback(orders, tmp_path, clock=clock_b, transport=fake, status_events=True)
+    await second.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="rerun-b")
+    await drive(second, clock_b)
+    status = second.status()
+    assert status["state"] == "done"
+    assert status["events_acked"] == 0
+    assert status["events_duplicate"] == 8
+    assert status["events_conflicted"] == 0
+    assert fake.exception_log == []
+    for line in run_log_lines(tmp_path, second):
+        if line["kind"] == "status_event":
+            assert line["attempts"] == 1
+            assert line.get("duplicate") is True
+
+
+async def test_a_409_is_never_retried(tmp_path: Path) -> None:
+    """Review round 3, item 1: a 409 is the state machine rejecting the
+    change - the region answered, so there is nothing to retry: one
+    attempt, counted as conflicted."""
+    fake = FakeEdge()
+    fake.status_script[stub_order_id("1001")] = ["409"] * 4
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, transport=fake, status_events=True)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="no-retry-409")
+    await drive(pb, clock)
+    assert pb.status()["events_conflicted"] == 4
+    lines = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
+    assert len(lines) == 4
+    for line in lines:
+        assert line["attempts"] == 1
+        assert line["http_status"] == 409
+        assert fake.status_calls[line["event_id"]] == 1
+
+
+async def test_restocks_retry_a_503_and_a_still_failing_restock_is_not_fatal(
+    tmp_path: Path,
+) -> None:
+    """Review round 3, item 1: a restock answered 503 is retried and
+    acked on the second attempt; a restock that never gets through ends
+    failed after its attempts, and the run still ends done - in a
+    fault harness the failed call is a result to report, not a crash."""
+    fake = FakeEdge()
+    fake.restock_script["v001"] = ["503"]  # one blip, then through
+    fake.restock_script["v002"] = ["503", "503", "503"]  # never gets through
+    orders = [make_order(21, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        transport=fake,
+        status_events=True,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=100.0, run_id="restock-retry")
+    await drive(pb, clock)
+    status = pb.status()
+    assert status["state"] == "done"
+    assert status["restocks_acked"] == 1
+    assert status["restocks_failed"] == 1
+    by_vendor = {
+        line["vendor_id"]: line for line in run_log_lines(tmp_path, pb) if line["kind"] == "restock"
+    }
+    assert by_vendor["v001"]["attempts"] == 2
+    assert by_vendor["v001"]["http_status"] == 200
+    assert by_vendor["v002"]["attempts"] == 3
+    assert by_vendor["v002"]["error"] == "http 503"
+    assert fake.restock_calls["v001"] == 2
+    assert fake.restock_calls["v002"] == 3
+
+
+async def test_a_stop_during_a_backoff_cancels_the_retry(tmp_path: Path) -> None:
+    """Review round 3, item 1: a stop while a retry sits in its backoff
+    cancels the task - the line says cancelled with the attempts that
+    were made, the log stays dense, and the run ends stopped."""
+    fake = FakeEdge()
+    fake.restock_script["v001"] = ["503", "503", "503"]
+    orders = [make_order(21, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        transport=fake,
+        status_events=True,
+        drain_timeout_s=0.3,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001",),
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=1e9, run_id="backoff-stop")
+    await drive(pb, clock, steps=3)  # attempt 1 has its 503; the task backs off
+    await settle()
+    assert fake.restock_calls["v001"] == 1
+    await asyncio.wait_for(pb.stop(), 5)
+    assert pb.status()["state"] == "stopped"
+    lines = run_log_lines(tmp_path, pb)
+    assert [line["seq"] for line in lines] == list(range(len(lines)))
+    restock_line = lines[0]
+    assert restock_line["kind"] == "restock"
+    assert restock_line["error"] == "cancelled"
+    assert restock_line["attempts"] == 1
+
+
+# --- an unknown region is not sent to the gateway (review round 3, item 2)
+
+
+class RegionAnswering(httpx.AsyncBaseTransport):
+    """Answers every order with a fixed region_id, and records every
+    URL it is asked for, so a test can prove nothing but the order
+    POST ever left the target."""
+
+    def __init__(self, region_id: object) -> None:
+        self.region_id = region_id
+        self.requests: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(str(request.url))
+        body = json.loads(request.content) if request.content else {}
+        if request.url.path.endswith("/orders"):
+            return httpx.Response(
+                201,
+                json={
+                    "outcome": "accepted",
+                    "order_id": stub_order_id(body["external_order_id"]),
+                    "region_id": self.region_id,
+                    "queued": False,
+                },
+            )
+        # the edge's own routes: applied, whatever the path was
+        return httpx.Response(201, json={"applied": True, "duplicate": False, "conflict": False})
+
+
+async def test_an_unknown_region_is_failed_not_sent_to_the_gateway(tmp_path: Path) -> None:
+    """Review round 3, item 2: in edge mode an order whose answer names
+    a region the routing does not know sends no kitchen calls at all -
+    each event is failed with "unknown region" on its line, nothing
+    reaches the gateway (or anywhere else), and the log has no missing
+    placeholder."""
+    transport = RegionAnswering("r9")
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        transport=transport,
+        status_events=True,
+        kitchen_urls={"r1": "http://edge-1.test/api/v1"},
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="unknown-region")
+    await drive(pb, clock)
+    status = pb.status()
+    assert status["state"] == "done"
+    assert status["events_failed"] == 4
+    assert status["events_acked"] == 0
+    # only the order POST ever went out - to the target, nowhere else
+    assert transport.requests == ["http://stub.test/api/v1/orders"]
+    lines = run_log_lines(tmp_path, pb)
+    assert not any(line["kind"] == "missing" for line in lines)
+    for line in lines:
+        if line["kind"] == "status_event":
+            assert line["error"] == "unknown region"
+            assert "http_status" not in line
+            assert line["wall_sent_at"] is None
+
+
+async def test_a_non_string_region_id_is_failed_the_same_way(tmp_path: Path) -> None:
+    """Review round 3, item 2: a region_id that is not even a string
+    (a bad answer put a list there) is the same unknown region: the
+    event fails with the error on its line, the task does not die, and
+    the log has no missing placeholder."""
+    transport = RegionAnswering(["r1"])
+    orders = [make_order(14, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        transport=transport,
+        status_events=True,
+        kitchen_urls={"r1": "http://edge-1.test/api/v1"},
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="non-string-region")
+    await drive(pb, clock)
+    assert pb.status()["events_failed"] == 4
+    assert transport.requests == ["http://stub.test/api/v1/orders"]
+    lines = run_log_lines(tmp_path, pb)
+    assert not any(line["kind"] == "missing" for line in lines)
+    for line in lines:
+        if line["kind"] == "status_event":
+            assert line["error"] == "unknown region"
