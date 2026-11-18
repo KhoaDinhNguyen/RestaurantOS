@@ -238,6 +238,20 @@ async def test_one_orders_events_go_out_strictly_one_after_another(tmp_path: Pat
     # and order 1002's first event was not held up by 1001's slow one
     assert expected_event_id("1002", "accepted") in on_wire
 
+    # review round 2, item 12: the second order's whole kitchen timeline
+    # finishes while the first order's accepted is still held - the
+    # chain is per order - and still nothing of 1001 follows its held
+    # event. Bounded loop turns, never a real sleep.
+    for _ in range(500):
+        if expected_event_id("1002", "picked_up") in on_wire:
+            break
+        await settle(2)
+        on_wire = {event_id for _status, event_id in transport.wire}
+    else:
+        pytest.fail("order 1002's picked_up never reached the wire")
+    assert expected_event_id("1001", "preparing") not in on_wire
+    assert expected_event_id("1001", "picked_up") not in on_wire
+
     transport.release.set()
     await pb.wait_done()
     assert pb.status()["state"] == "done"
@@ -273,7 +287,11 @@ async def test_stop_while_an_event_waits_for_its_predecessor(tmp_path: Path) -> 
     await settle()
 
     before = time.monotonic()
-    await pb.stop()
+    try:
+        # a stalled stop must fail the test, not hang the suite
+        await asyncio.wait_for(pb.stop(), 5)
+    finally:
+        transport.release.set()  # never leave the held task behind
     assert pb.status()["state"] == "stopped"
     assert time.monotonic() - before < 5.0
 
@@ -920,7 +938,10 @@ async def test_stop_during_the_restock_barrier_ends_stopped(tmp_path: Path) -> N
     assert pb.status()["orders_sent"] == 0  # the barrier holds the day
 
     before = time.monotonic()
-    await pb.stop()
+    try:
+        await asyncio.wait_for(pb.stop(), 5)
+    finally:
+        transport.release.set()  # never leave the held restocks behind
     assert pb.status()["state"] == "stopped"
     assert time.monotonic() - before < 5.0, "stop sat behind the held restocks"
     lines = run_log_lines(tmp_path, pb)
@@ -1014,7 +1035,10 @@ async def test_stop_during_the_pre_restock_wait_ends_stopped(tmp_path: Path) -> 
     assert pb.status()["restocks_sent"] == 0
 
     before = time.monotonic()
-    await asyncio.wait_for(pb.stop(), 5)
+    try:
+        await asyncio.wait_for(pb.stop(), 5)
+    finally:
+        transport.release.set()  # never leave the held order behind
     assert pb.status()["state"] == "stopped"
     assert time.monotonic() - before < 5.0, "stop sat behind the held order"
     lines = run_log_lines(tmp_path, pb)
@@ -1116,10 +1140,15 @@ async def _extras_scenario(runs_dir: Path, orders, seed: int) -> str:
         await drive(pb, clock, steps=6)  # 30 simulated seconds out
         assert pb.status()["state"] == "running"
 
-        await client.post("/sim/playback", json={"action": "pause"})
+        # review round 2, item 13: each control answer is checked before
+        # the scenario moves on
+        paused = (await client.post("/sim/playback", json={"action": "pause"})).json()
+        assert paused["state"] == "paused"
         await settle()
-        await client.patch("/sim/playback", json={"speed": 2500.0})
-        await client.post("/sim/playback", json={"action": "resume"})
+        sped_up = (await client.patch("/sim/playback", json={"speed": 2500.0})).json()
+        assert sped_up["speed"] == 2500.0
+        resumed = (await client.post("/sim/playback", json={"action": "resume"})).json()
+        assert resumed["state"] == "running"
         await drive(pb, clock)  # to the end, past the last event
     finally:
         await client.aclose()
@@ -1208,7 +1237,11 @@ async def test_stop_ends_the_wait_for_an_unanswered_order(tmp_path: Path) -> Non
     assert pb.status()["inflight"] == 2
 
     before = time.monotonic()
-    await pb.stop()
+    try:
+        # a stalled stop must fail the test, not hang the suite
+        await asyncio.wait_for(pb.stop(), 5)
+    finally:
+        transport.release.set()  # never leave the unanswered order behind
     waited = time.monotonic() - before
     assert pb.status()["state"] == "stopped"
     # one drain window for the never-answered order, not the HTTP
@@ -1280,7 +1313,10 @@ async def test_stop_during_the_final_wait_ends_stopped(tmp_path: Path) -> None:
     assert pb.status()["state"] == "running"
 
     before = time.monotonic()
-    await asyncio.wait_for(pb.stop(), 5)
+    try:
+        await asyncio.wait_for(pb.stop(), 5)
+    finally:
+        transport.release.set()  # never leave the held event behind
     assert pb.status()["state"] == "stopped"
     assert time.monotonic() - before < 5.0
     lines = run_log_lines(tmp_path, pb)

@@ -47,8 +47,17 @@ def test_zero_restock_interval_is_rejected():
 # ---- playback event settings -------------------------------------------------
 
 
-def test_event_defaults_are_on_for_every_accepted_order():
-    sim = SimSettings()
+def test_event_defaults_are_on_for_every_accepted_order(monkeypatch):
+    """Review round 2, item 10: the defaults must not read the real
+    environment or .env - a stray variable on a dev machine must not
+    decide what a fresh checkout does."""
+    for name in (
+        "ROS_SIM_PLAYBACK_STATUS_EVENTS",
+        "ROS_SIM_PLAYBACK_EVENT_SAMPLE_RATE",
+        "ROS_SIM_PLAYBACK_EVENT_JITTER_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    sim = SimSettings(_env_file=None)
     assert sim.playback_status_events is True
     assert sim.playback_event_sample_rate == 1.0
     assert sim.playback_event_jitter_s == 60.0
