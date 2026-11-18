@@ -574,10 +574,19 @@ class Playback:
     # --- reporting ---------------------------------------------------------
 
     def status(self) -> dict[str, Any]:
-        """The run's counters. `events_acked` counts the events the
-        region applied; a replayed event the region already knew
-        (same event id, answered with duplicate) counts as
-        `events_duplicate` instead."""
+        """The run's counters, counted by what the answers mean:
+
+        - `events_acked`: the region applied the change;
+        - `events_duplicate`: a replayed event id the region already
+          knew (2xx with `duplicate`);
+        - `events_conflicted`: a real state-machine rejection (409, or
+          2xx with `conflict`);
+        - `events_failed`: everything else, including a 2xx whose body
+          did not parse or that said nothing - a success code alone
+          does not make an ack;
+        - restocks: only 200 counts as `restocks_acked`, per the merged
+          spec; anything else is `restocks_failed`.
+        """
         return {
             "state": self._state,
             "run_id": self._run_id or None,
@@ -1135,21 +1144,13 @@ class Playback:
                     record["http_status"] = response.status_code
                     if is_event:
                         record.update(_response_fields(response, EVENT_RESPONSE_FIELDS))
-                    if response.status_code in (200, 201):
-                        if is_event and record.get("duplicate"):
-                            # the region already knew this event id: a
-                            # re-replayed window is idempotent through
-                            # the duplicate flag, not through conflict
-                            self._events_duplicate += 1
-                        elif is_event:
-                            self._events_acked += 1
-                        else:
-                            self._restocks_acked += 1
-                    elif is_event and response.status_code == 409:
-                        # a status change that lost to an earlier one is
-                        # the architecture's conflict answer; it means a
-                        # real state-machine rejection, never a replay
-                        self._events_conflicted += 1
+                    if is_event:
+                        self._count_event_answer(record, response)
+                    elif response.status_code == 200:
+                        # the merged spec: a restock answers 200, and
+                        # playback reads nothing else - any other code
+                        # is a failure, 201 included
+                        self._restocks_acked += 1
                     else:
                         self._count_aux_failed(record)
                 except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
@@ -1164,6 +1165,44 @@ class Playback:
         record["wall_acked_at"] = round(self._wall.now(), 3)
         self._log.add(seq, record)
         self._log.flush()
+
+    def _count_event_answer(self, record: dict[str, Any], response: httpx.Response) -> None:
+        """Count a status answer by what it means, not by its code
+        alone (review round 2, item 5):
+
+        - a 409 is the state machine rejecting the change - a real
+          conflict, whatever its body;
+        - on a 2xx, an answer whose body did not parse (the record
+          carries `error` from _response_fields) is a failure;
+        - `duplicate` is a replayed event the region already knew;
+        - `conflict` on a 2xx is a real conflict too;
+        - `applied` is the only ack;
+        - anything else is a failure, below.
+        """
+        if response.status_code == 409:
+            self._events_conflicted += 1
+            return
+        if "error" in record:
+            self._events_failed += 1
+            return
+        if response.status_code not in (200, 201):
+            self._events_failed += 1
+            return
+        if record.get("duplicate"):
+            self._events_duplicate += 1
+        elif record.get("conflict"):
+            self._events_conflicted += 1
+        elif record.get("applied"):
+            self._events_acked += 1
+        else:
+            # A 2xx that is neither applied, duplicate nor conflict has
+            # no meaning in the status state machine (received ->
+            # accepted -> preparing -> ready -> picked_up, first
+            # committed change wins). Counting it as acked would hide a
+            # region or gateway bug behind a success code, so it is
+            # counted as failed, on purpose, and the line says why.
+            record["error"] = "unexpected status answer"
+            self._events_failed += 1
 
     def _count_aux_failed(self, record: dict[str, Any]) -> None:
         if record["kind"] == "status_event":

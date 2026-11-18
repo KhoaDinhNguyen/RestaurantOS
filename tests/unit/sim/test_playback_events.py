@@ -409,6 +409,95 @@ async def test_the_sample_is_a_stable_per_order_decision(tmp_path: Path) -> None
     assert other != subset  # the sample follows the seed
 
 
+async def test_a_restock_answered_201_is_a_failure(tmp_path: Path) -> None:
+    """Review round 2, item 5: the merged spec says a restock answers
+    200 and playback reads nothing else - 201 is not an ack."""
+
+    class Restock201(httpx.AsyncBaseTransport):
+        def __init__(self) -> None:
+            self.inner = httpx.ASGITransport(app=make_stub_app())
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith("/restock"):
+                return httpx.Response(201, json={})
+            return await self.inner.handle_async_request(request)
+
+    orders = [make_order(21, 0, 0, 5, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001",),
+        transport=Restock201(),
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=100.0, run_id="restock-201")
+    await drive(pb, clock)
+    status = pb.status()
+    assert status["restocks_sent"] == 1
+    assert status["restocks_acked"] == 0
+    assert status["restocks_failed"] == 1
+    (line,) = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "restock"]
+    assert line["http_status"] == 201
+
+
+async def test_an_event_answer_saying_nothing_is_a_failure(tmp_path: Path) -> None:
+    """Review round 2, item 5: a success code alone is not an ack. A 2xx
+    whose body did not parse, and a 2xx that says applied: false, are
+    failures; a 2xx that says conflict: true is a conflict, not an
+    ack - the counters say which is which."""
+
+    def canned(body: bytes, note: str) -> httpx.AsyncBaseTransport:
+        class Canned(httpx.AsyncBaseTransport):
+            def __init__(self) -> None:
+                self.inner = httpx.ASGITransport(app=make_stub_app())
+
+            async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+                if request.url.path.endswith("/status"):
+                    return httpx.Response(
+                        200, content=body, headers={"content-type": "application/json"}
+                    )
+                return await self.inner.handle_async_request(request)
+
+        Canned.__name__ = note
+        return Canned()
+
+    for body, note in [
+        (b"not json at all", "unparsable"),
+        (b'{"applied": false}', "not-applied"),
+    ]:
+        orders = [make_order(14, 0, 0, 1, "1001")]
+        clock = FakeWallClock()
+        pb = make_playback(
+            orders, tmp_path, clock=clock, status_events=True, transport=canned(body, note)
+        )
+        await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id=f"ev-{note}")
+        await drive(pb, clock)
+        status = pb.status()
+        assert status["events_failed"] == 4, note
+        assert status["events_acked"] == 0, note
+
+    orders = [make_order(14, 0, 0, 1, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        status_events=True,
+        transport=canned(b'{"applied": false, "conflict": true}', "conflicted"),
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="ev-conflicted")
+    await drive(pb, clock)
+    status = pb.status()
+    assert status["events_conflicted"] == 4
+    assert status["events_acked"] == 0
+    assert status["events_failed"] == 0
+    events = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "status_event"]
+    assert all(line["conflict"] is True for line in events)
+
+
 async def test_a_replayed_event_counts_as_a_duplicate_not_a_conflict(tmp_path: Path) -> None:
     """Review item 7: a replayed event id is answered with
     duplicate: true (usually 2xx), not 409 - 409 is a real state-machine
