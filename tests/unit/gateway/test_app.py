@@ -2406,3 +2406,32 @@ def test_restock_vendor_refreshes_after_stale_epoch(monkeypatch) -> None:
     assert calls == 2
     assert region_pools.get.await_args_list[0].args == ("r1-primary",)
     assert region_pools.get.await_args_list[1].args == ("r1-standby",)
+
+
+def test_restock_vendor_items_not_implemented(monkeypatch) -> None:
+    restock_region_vendor = AsyncMock()
+
+    monkeypatch.setattr(
+        "restaurantos.gateway.app.restock_region_vendor",
+        restock_region_vendor,
+    )
+
+    app = create_app()
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/vendors/v001/restock",
+        json={
+            "items": [
+                {
+                    "item_kind": "ingredient",
+                    "item_id": "garlic",
+                    "add": 20,
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 501
+    assert response.json() == {"error": "not_implemented"}
+    restock_region_vendor.assert_not_awaited()

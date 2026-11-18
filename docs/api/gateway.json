@@ -304,6 +304,23 @@
                         }
                     }
                 ],
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "anyOf": [
+                                    {
+                                        "$ref": "#/components/schemas/RestockRequest"
+                                    },
+                                    {
+                                        "type": "null"
+                                    }
+                                ],
+                                "title": "Body"
+                            }
+                        }
+                    }
+                },
                 "responses": {
                     "200": {
                         "description": "Successful Response",
@@ -1225,6 +1242,28 @@
                     "unknown_product"
                 ],
                 "title": "RefusalReason"
+            },
+            "RestockRequest": {
+                "properties": {
+                    "items": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "additionalProperties": true,
+                                    "type": "object"
+                                },
+                                "type": "array"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Items"
+                    }
+                },
+                "type": "object",
+                "title": "RestockRequest",
+                "description": "Optional vendor restock request."
             },
             "StatusChangeRequest": {
                 "properties": {
