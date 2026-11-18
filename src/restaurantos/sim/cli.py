@@ -82,6 +82,14 @@ def app(argv: Sequence[str] | None = None) -> int:
         help="API base to POST orders to (default ROS_SIM_PLAYBACK_TARGET_URL)",
     )
     pstart.add_argument(
+        "--kitchen-target",
+        type=str,
+        default=None,
+        help="send every status event and restock to this one API base "
+        "instead of each region's own edge - required for stub runs "
+        "(pass the stub's URL); default: the per-region edge APIs",
+    )
+    pstart.add_argument(
         "--inflight",
         type=int,
         default=None,

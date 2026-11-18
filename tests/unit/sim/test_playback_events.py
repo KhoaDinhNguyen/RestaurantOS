@@ -409,6 +409,155 @@ async def test_the_sample_is_a_stable_per_order_decision(tmp_path: Path) -> None
     assert other != subset  # the sample follows the seed
 
 
+class RecordingTransport(httpx.AsyncBaseTransport):
+    """Answers orders with their vendor's region (so the events route
+    to it) and records the (host, port, path) of every request, so the
+    tests can say where each call actually went."""
+
+    def __init__(self, vendor_region: dict[str, str]) -> None:
+        self.inner = httpx.ASGITransport(app=make_stub_app())
+        self.vendor_region = vendor_region
+        self.wire: list[tuple[str, int | None, str]] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.wire.append((request.url.host, request.url.port, request.url.path))
+        path = request.url.path
+        if path.endswith("/orders"):
+            body = json.loads(request.content)
+            return httpx.Response(
+                201,
+                json={
+                    "outcome": "accepted",
+                    "duplicate": False,
+                    "queued": False,
+                    "order_id": str(uuid5(NAMESPACE_URL, body["external_order_id"])),
+                    "region_id": self.vendor_region[body["vendor_id"]],
+                },
+            )
+        if path.endswith("/status"):
+            return httpx.Response(
+                201, json={"applied": True, "duplicate": False, "conflict": False}
+            )
+        if path.endswith("/restock"):
+            return httpx.Response(
+                200,
+                json={
+                    "vendor_id": "v",
+                    "region_id": "r",
+                    "counters_restocked": 0,
+                    "products_back_on": 0,
+                },
+            )
+        return await self.inner.handle_async_request(request)
+
+
+EDGE_URLS = {
+    "r1": "http://edge-r1.test:8011/api/v1",
+    "r2": "http://edge-r2.test:8012/api/v1",
+}
+
+
+async def test_kitchen_calls_go_to_their_regions_edge(tmp_path: Path) -> None:
+    """Review round 2, item 6: status events and restocks are
+    region-side actions - the kitchen is on the region side
+    (architecture 7.2), and the edge API survives a gateway cut (T2)
+    because it talks to its region's primary on the local network. Each
+    event goes to its order's region edge, each restock to its vendor's
+    region edge, and the orders keep going to the gateway."""
+    vendor_region = {"v001": "r1", "v002": "r2"}
+    transport = RecordingTransport(vendor_region)
+    orders = [
+        make_order(21, 0, 0, 5, "1001").model_copy(update={"vendor_id": "v001"}),
+        make_order(21, 0, 0, 6, "1002").model_copy(update={"vendor_id": "v002"}),
+    ]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        status_events=True,
+        event_jitter_s=0.0,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+        target_url="http://gateway.test/api/v1",
+        kitchen_urls=EDGE_URLS,
+        vendor_regions=vendor_region,
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=100.0, run_id="edges")
+    await drive(pb, clock)
+
+    for host, port, path in transport.wire:
+        if path.endswith("/orders"):
+            assert host == "gateway.test"
+        else:
+            vendor = path.split("/vendors/")[1].split("/")[0]
+            expected = EDGE_URLS[vendor_region[vendor]]
+            assert f"http://{host}:{port}/api/v1" == expected, path
+    # every kind of call actually happened, on both regions
+    paths = [path for _host, _port, path in transport.wire]
+    assert sum(path.endswith("/orders") for path in paths) == 2
+    assert sum(path.endswith("/status") for path in paths) == 8
+    assert sum(path.endswith("/restock") for path in paths) == 2
+    # the lines carry the region each call went to
+    lines = run_log_lines(tmp_path, pb)
+    assert {line["region_id"] for line in lines if line["kind"] == "status_event"} == {"r1", "r2"}
+    assert {line["region_id"] for line in lines if line["kind"] == "restock"} == {"r1", "r2"}
+    meta = json.loads((tmp_path / "edges" / "meta.json").read_text())
+    assert meta["kitchen"] == {"mode": "edge", "urls": EDGE_URLS}
+
+
+async def test_the_kitchen_override_sends_every_kitchen_call_to_one_url(tmp_path: Path) -> None:
+    """The stub is one process: `--kitchen-target` (the engine's
+    kitchen_url) sends every event and restock to that one URL, while
+    the orders keep going to the target."""
+    vendor_region = {"v001": "r1", "v002": "r2"}
+    transport = RecordingTransport(vendor_region)
+    orders = [
+        make_order(21, 0, 0, 5, "1001").model_copy(update={"vendor_id": "v001"}),
+        make_order(21, 0, 0, 6, "1002").model_copy(update={"vendor_id": "v002"}),
+    ]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        status_events=True,
+        event_jitter_s=0.0,
+        restock_every=7,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+        target_url="http://gateway.test/api/v1",
+        kitchen_url="http://kitchen.test:8900/api/v1",
+        vendor_regions=vendor_region,
+        transport=transport,
+    )
+    await pb.start(seed=0, from_day=21, to_day=21, speed=100.0, run_id="override")
+    await drive(pb, clock)
+
+    for host, port, path in transport.wire:
+        if path.endswith("/orders"):
+            assert host == "gateway.test"
+        else:
+            assert (host, port) == ("kitchen.test", 8900), path
+    meta = json.loads((tmp_path / "override" / "meta.json").read_text())
+    assert meta["kitchen"] == {"mode": "override", "url": "http://kitchen.test:8900/api/v1"}
+
+
+async def test_meta_records_the_kitchen_routing_default(tmp_path: Path) -> None:
+    """With neither the override nor the edges configured - the
+    single-URL mode the stub and the unit tests run on - meta.json
+    says the kitchen calls went to the target."""
+    orders = [make_order(14, 0, 0, 1, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, status_events=True)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="single")
+    await drive(pb, clock)
+    meta = json.loads((tmp_path / "single" / "meta.json").read_text())
+    assert meta["kitchen"] == {"mode": "target"}
+
+
 async def test_a_restock_answered_201_is_a_failure(tmp_path: Path) -> None:
     """Review round 2, item 5: the merged spec says a restock answers
     200 and playback reads nothing else - 201 is not an ack."""

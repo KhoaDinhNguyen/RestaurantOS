@@ -15,7 +15,7 @@ import heapq
 import itertools
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import time as dt_time
 
 # importlib import mode does not put this directory on sys.path, and the
@@ -138,13 +138,17 @@ def make_playback(
     restock_every: int | None = None,
     warm_up_days: int = 0,
     restock_vendors: Sequence[str] = (),
+    target_url: str = "http://stub.test/api/v1",
+    kitchen_url: str | None = None,
+    kitchen_urls: Mapping[str, str] | None = None,
+    vendor_regions: Mapping[str, str] | None = None,
 ) -> Playback:
     """An engine over a fixed order list, posting to an in-process stub."""
     if transport is None:
         transport = httpx.ASGITransport(app=make_stub_app())
     return Playback(
         lambda a, b: iter(orders),
-        target_url="http://stub.test/api/v1",
+        target_url=target_url,
         inflight=inflight,
         http_timeout_s=5.0,
         drain_timeout_s=drain_timeout_s,
@@ -159,6 +163,9 @@ def make_playback(
         restock_every=restock_every,
         warm_up_days=warm_up_days,
         restock_vendors=restock_vendors,
+        kitchen_url=kitchen_url,
+        kitchen_urls=kitchen_urls,
+        vendor_regions=vendor_regions,
     )
 
 

@@ -26,6 +26,7 @@ from typing import Any
 
 import httpx
 
+from restaurantos.common.cluster import Cluster, load_cluster, service_port
 from restaurantos.common.config import get_settings
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.config import SimSettings, get_sim_settings
@@ -38,6 +39,7 @@ from restaurantos.sim.replaydata import (
     require_window,
     to_order_request,
 )
+from restaurantos.sim.shard import assign_shards, vendor_counts
 
 
 def _orders_fn(cache_file: Path):
@@ -55,6 +57,29 @@ def restock_vendors(data_dir: Path) -> list[str]:
     row order."""
     columns = REFERENCE_COLUMNS["vendors.csv"]
     return sorted(row[0] for row in read_rows(data_dir / "vendors.csv", columns))
+
+
+def vendor_region_map(data_dir: Path, cluster: Cluster) -> dict[str, str]:
+    """vendor -> its region, built exactly the way bootstrap shards it:
+    the same `vendor_counts` + `assign_shards` walk over
+    `cluster.region_ids`, then each vendor's geohash looked up in the
+    result. Deterministic, and no HQ call at run start."""
+    cell_region = dict(assign_shards(vendor_counts(data_dir), cluster.region_ids))
+    geohash_column = REFERENCE_COLUMNS["vendors.csv"].index("geohash")
+    return {
+        row[0]: cell_region[row[geohash_column]]
+        for row in read_rows(data_dir / "vendors.csv", REFERENCE_COLUMNS["vendors.csv"])
+    }
+
+
+def kitchen_urls(cluster: Cluster, edge_host: str) -> dict[str, str]:
+    """region -> its own edge API base: the edge of `region` listens on
+    8010 + n (`common.cluster.service_port`), and the kitchen is on the
+    region side (architecture 7.2)."""
+    return {
+        rid: f"http://{edge_host}:{service_port(cluster, f'edge-{rid}')}/api/v1"
+        for rid in cluster.region_ids
+    }
 
 
 async def start_command(args: argparse.Namespace) -> int:
@@ -104,6 +129,13 @@ async def start_command(args: argparse.Namespace) -> int:
         # shortened to_day never announces restocks outside the data
         banner_days = restock_days(meta.warm_up_days, restock_every, window.from_day, window.to_day)
         vendors = restock_vendors(data_dir)
+        # kitchen routing: the region edges (or the one override URL a
+        # stub run passes) and the vendor -> region map, built the way
+        # bootstrap shards it
+        cluster = load_cluster()
+        vendor_regions = vendor_region_map(data_dir, cluster)
+        kitchen_override = (args.kitchen_target or "").rstrip("/") or None
+        edges = kitchen_urls(cluster, sim.playback_edge_host)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"rosctl playback start: {error}", file=sys.stderr)
         return 1
@@ -125,6 +157,12 @@ async def start_command(args: argparse.Namespace) -> int:
         restock_every=restock_every,
         warm_up_days=meta.warm_up_days,
         restock_vendors=vendors,
+        # kitchen-side routing (review round 2, item 6): events and
+        # restocks go to the region's own edge API - the override URL is
+        # how a stub run keeps them on the one stub process
+        kitchen_url=kitchen_override,
+        kitchen_urls=None if kitchen_override is not None else edges,
+        vendor_regions=vendor_regions,
     )
 
     from restaurantos.sim.control import make_control_app

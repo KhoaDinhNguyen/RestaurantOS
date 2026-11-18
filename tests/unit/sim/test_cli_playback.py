@@ -200,6 +200,31 @@ def test_restock_vendors_are_sorted_and_header_checked(tmp_path):
         restock_vendors(tmp_path)
 
 
+def test_vendor_regions_match_bootstraps_shards():
+    """Review round 2, item 6: the CLI's vendor -> region map is
+    bootstrap's own sharding, not a second derivation - the same
+    vendor_counts + assign_shards walk, cross-checked here against
+    bootstrap's `_vendors_by_cell` over the mini fixture."""
+    from restaurantos.common.cluster import Cluster
+    from restaurantos.sim.bootstrap import _vendors_by_cell
+    from restaurantos.sim.mini import mini_dir
+    from restaurantos.sim.playback_cli import vendor_region_map
+    from restaurantos.sim.shard import assign_shards, vendor_counts
+
+    data = mini_dir()
+    cluster = Cluster(regions=3)
+    cell_region = dict(assign_shards(vendor_counts(data), cluster.region_ids))
+    by_cell = _vendors_by_cell(data)
+    expected = {
+        vendor: cell_region[cell]
+        for cell, rid in cell_region.items()
+        for vendor in by_cell.get(cell, ())
+    }
+    regions = vendor_region_map(data, cluster)
+    assert regions == expected
+    assert set(regions) == set(expected)  # every vendor is covered
+
+
 def test_start_refuses_a_sample_rate_outside_zero_to_one(capsys):
     """Review item 6: the CLI override skips SimSettings validation;
     a negative rate would silently drop every event, a rate above 1
@@ -261,6 +286,20 @@ def test_start_shortens_a_to_day_past_the_data(tmp_path, monkeypatch, capsys, fr
         ["2", "c1", "v1", "w21z7", "3", 15, "12:00:00"],
     ]
     data = make_data_dir(tmp_path, orders, [["1", "p1", 1], ["2", "p1", 1]])
+    # one vendor row, so the kitchen routing's vendor -> region map has
+    # something to shard (the manifest entry follows the file)
+    import hashlib
+
+    vendors = "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n"
+    (data / "vendors.csv").write_text(vendors, encoding="utf-8")
+    raw = (data / "vendors.csv").read_bytes()
+    manifest = [
+        line
+        for line in (data / "MANIFEST.csv").read_text().splitlines()
+        if not line.startswith("vendors.csv,")
+    ]
+    manifest.append(f"vendors.csv,1,{hashlib.sha256(raw).hexdigest()}")
+    (data / "MANIFEST.csv").write_text("\n".join(manifest) + "\n", encoding="utf-8")
     build_cache(data, warm_up_days=14, quiet=True)
     meta = load_meta(data)
     assert meta is not None

@@ -53,6 +53,11 @@ class SimSettings(BaseSettings):
     playback_status_events: bool = True
     playback_event_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     playback_event_jitter_s: float = Field(default=60.0, ge=0.0, le=float(MIN_EVENT_GAP_S))
+    # Where the region edge APIs listen. Playback routes the kitchen-side
+    # calls (status events, restocks) to each region's own edge API -
+    # port 8010 + n on this host - because the kitchen is on the region
+    # side and the edge survives a gateway cut (architecture 7.2, 4).
+    playback_edge_host: str = "127.0.0.1"
     # The gateway's API base, as seen from the machine rosctl runs on:
     # POST goes to {target}/orders. Point it at the stub
     # (http://127.0.0.1:8900) until the gateway exists.

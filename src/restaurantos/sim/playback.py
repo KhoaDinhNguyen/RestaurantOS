@@ -63,7 +63,7 @@ import re
 import sys
 import time
 import traceback
-from collections.abc import Awaitable, Callable, Iterator, Sequence
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -152,11 +152,16 @@ def restock_days(warm_up_days: int, restock_every: int, from_day: int, to_day: i
 
 @dataclass(frozen=True)
 class _OrderOutcome:
-    """What the gateway answered, boiled down to what an event needs."""
+    """What the gateway answered, boiled down to what an event needs.
+
+    `region_id` is where the order landed; an event only ever goes out
+    for an accepted order, so the region is always known, and the
+    event routes to that region's own edge API."""
 
     accepted: bool
     order_id: str | None
     reason: str
+    region_id: str | None = None
 
 
 class _OrderHandle:
@@ -296,6 +301,9 @@ class Playback:
         restock_every: int | None = None,
         warm_up_days: int = 0,
         restock_vendors: Sequence[str] = (),
+        kitchen_url: str | None = None,
+        kitchen_urls: Mapping[str, str] | None = None,
+        vendor_regions: Mapping[str, str] | None = None,
     ) -> None:
         self._orders_fn = orders_fn
         self._api_base = target_url.rstrip("/")
@@ -329,6 +337,21 @@ class Playback:
         self._restock_every = restock_every
         self._warm_up_days = warm_up_days
         self._restock_vendors = tuple(restock_vendors)
+        # Kitchen-side routing (review round 2, item 6): status events
+        # and restocks are region actions - the kitchen is on the region
+        # side, and the edge API survives a gateway cut (T2) because it
+        # talks to its region's primary on the local network. Orders
+        # keep going to the gateway (target_url) either way.
+        # `kitchen_url`: one URL for every kitchen call - the stub runs
+        # on one process, so stub runs pass the stub's URL here.
+        # `kitchen_urls`: region_id -> the region's own edge API base.
+        # `vendor_regions`: vendor_id -> region_id, for the restock
+        # lines' routing and region_id. With neither URL given, kitchen
+        # calls fall back to the target - the single-URL mode the stub
+        # and the unit tests run on.
+        self._kitchen_url = kitchen_url.rstrip("/") if kitchen_url else None
+        self._kitchen_urls = dict(kitchen_urls) if kitchen_urls else None
+        self._vendor_regions = dict(vendor_regions) if vendor_regions else None
 
         self._state = IDLE
         self._wake = asyncio.Event()
@@ -372,6 +395,20 @@ class Playback:
         seq = self._seq
         self._seq += 1
         return seq
+
+    def _kitchen_base(self, region_id: str | None) -> str:
+        """The API base a kitchen-side call (status event, restock) goes
+        to: the one override URL (stub runs), the region's own edge API,
+        or - when neither is configured - the same base as the orders,
+        which is the single-URL mode the stub and the tests run on. A
+        region the routing does not know falls back to the target too:
+        the line still carries the region, so the fallback is visible
+        in the log."""
+        if self._kitchen_url is not None:
+            return self._kitchen_url
+        if self._kitchen_urls and region_id is not None and region_id in self._kitchen_urls:
+            return self._kitchen_urls[region_id]
+        return self._api_base
 
     # --- state ------------------------------------------------------------
 
@@ -472,6 +509,15 @@ class Playback:
                 "days": run_restock_days,
                 "vendors": len(self._restock_vendors),
             },
+            # where the kitchen-side calls (events, restocks) went:
+            # the region edges, one override URL, or the target itself
+            "kitchen": (
+                {"mode": "override", "url": self._kitchen_url}
+                if self._kitchen_url is not None
+                else {"mode": "edge", "urls": self._kitchen_urls}
+                if self._kitchen_urls is not None
+                else {"mode": "target"}
+            ),
             **(meta_extra or {}),
         }
         try:
@@ -995,6 +1041,7 @@ class Playback:
             "external_order_id": handle.request.external_order_id,
             "vendor_id": handle.request.vendor_id,
             "order_id": outcome.order_id,
+            "region_id": outcome.region_id,
             "to_status": to_status.value,
             "event_id": str(uuid5(NAMESPACE_URL, f"{outcome.order_id}:{to_status.value}")),
             "sim_sent_at": round(sim_offset, 3),
@@ -1012,10 +1059,12 @@ class Playback:
     def _dispatch_restock(self, sim_offset: float, day: int, vendor_index: int) -> None:
         seq = self._next_seq()
         self._restocks_sent += 1
+        vendor_id = self._restock_vendors[vendor_index]
         record: dict[str, Any] = {
             "kind": "restock",
             "seq": seq,
-            "vendor_id": self._restock_vendors[vendor_index],
+            "vendor_id": vendor_id,
+            "region_id": self._vendor_regions.get(vendor_id) if self._vendor_regions else None,
             "restock_day": day,
             "sim_sent_at": round(sim_offset, 3),
             "wall_sent_at": None,
@@ -1097,7 +1146,10 @@ class Playback:
     async def _send_event(
         self, seq: int, record: dict[str, Any], previous: asyncio.Task | None
     ) -> None:
-        url = f"{self._api_base}/vendors/{record['vendor_id']}/orders/{record['order_id']}/status"
+        url = (
+            f"{self._kitchen_base(record.get('region_id'))}"
+            f"/vendors/{record['vendor_id']}/orders/{record['order_id']}/status"
+        )
         await self._send_aux(
             seq,
             record,
@@ -1107,7 +1159,7 @@ class Playback:
         )
 
     async def _send_restock(self, seq: int, record: dict[str, Any]) -> None:
-        url = f"{self._api_base}/vendors/{record['vendor_id']}/restock"
+        url = f"{self._kitchen_base(record.get('region_id'))}/vendors/{record['vendor_id']}/restock"
         await self._send_aux(seq, record, url, None, None)
 
     async def _send_aux(
@@ -1257,7 +1309,7 @@ def _outcome_of(record: dict[str, Any]) -> _OrderOutcome:
         reason = _REASONS.get(status, "failed")
     if "error" in record:
         reason = record["error"]  # transport error, or "cancelled"
-    return _OrderOutcome(accepted, order_id, reason)
+    return _OrderOutcome(accepted, order_id, reason, record.get("region_id"))
 
 
 def _stream_key(item: tuple[int, OrderRequest]) -> tuple[int, int, int, int]:
