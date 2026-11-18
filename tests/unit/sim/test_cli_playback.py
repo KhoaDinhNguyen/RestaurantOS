@@ -460,3 +460,187 @@ def test_start_shortens_a_to_day_past_the_data(tmp_path, monkeypatch, capsys, fr
     assert "restock on 1 day(s)" in err
     # and the banner names the effective end, not the requested one
     assert f"started: 14 -> {meta.last_day}," in err
+
+
+def _install_fake_start(monkeypatch, captured: dict) -> None:
+    """The engine boundary faked: the CLI's own wiring (routing
+    arguments, meta, exit codes) is what is under test. FakePlayback
+    records the kwargs it was built with; a start that would dispatch
+    to the real control loop is not needed here."""
+    import asyncio
+
+    import uvicorn
+
+    import restaurantos.sim.playback_cli as playback_cli
+
+    class FakeServer:
+        started = True
+
+        def __init__(self, config):
+            self.should_exit = False
+
+        async def serve(self):
+            while not self.should_exit:
+                await asyncio.sleep(0.01)
+
+    class FakePlayback:
+        default_speed = 1000.0
+
+        def __init__(self, *args, **kwargs):
+            self._state = "idle"
+            captured.update(kwargs)
+
+        async def start(self, **kwargs):
+            self._state = "done"
+            captured["start_kwargs"] = kwargs
+
+        async def pause(self):
+            pass
+
+        async def resume(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def set_speed(self, speed):
+            pass
+
+        async def wait_done(self):
+            pass
+
+        @property
+        def state(self):
+            return self._state
+
+        def status(self):
+            return {
+                "run_id": "fake",
+                "state": self._state,
+                "orders_sent": 0,
+                "orders_acked": 0,
+                "orders_parked": 0,
+                "orders_refused": 0,
+                "orders_failed": 0,
+                "events_sent": 0,
+                "events_acked": 0,
+                "events_duplicate": 0,
+                "events_conflicted": 0,
+                "events_failed": 0,
+                "events_skipped": 0,
+                "restocks_sent": 0,
+                "restocks_acked": 0,
+                "restocks_failed": 0,
+            }
+
+        def clock(self):
+            return {}
+
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(playback_cli, "Playback", FakePlayback)
+
+
+def _make_data_with_vendors(tmp_path, orders, items, vendors_csv: str) -> Path:
+    """A built cache over a data dir whose vendors.csv is in the
+    manifest, so restock_vendors accepts it."""
+    import hashlib
+
+    from test_replaydata import make_data_dir
+
+    from restaurantos.sim.replaydata import build_cache
+
+    data = make_data_dir(tmp_path, orders, items)
+    (data / "vendors.csv").write_text(vendors_csv, encoding="utf-8")
+    raw = (data / "vendors.csv").read_bytes()
+    manifest = [
+        line
+        for line in (data / "MANIFEST.csv").read_text().splitlines()
+        if not line.startswith("vendors.csv,")
+    ]
+    manifest.append(
+        f"vendors.csv,{vendors_csv.count(chr(10)) - 1},{hashlib.sha256(raw).hexdigest()}"
+    )
+    (data / "MANIFEST.csv").write_text("\n".join(manifest) + "\n", encoding="utf-8")
+    build_cache(data, warm_up_days=14, quiet=True)
+    return data
+
+
+def test_a_kitchen_target_run_needs_no_cluster_file(tmp_path, monkeypatch, capsys, fresh_settings):
+    """Review round 3, item 3: a stub run resolves --kitchen-target
+    first and never reads a cluster file, so it starts fine in a
+    directory without one."""
+    orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
+    data = _make_data_with_vendors(
+        tmp_path,
+        orders,
+        [["1", "p1", 1]],
+        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n",
+    )
+    captured: dict = {}
+    _install_fake_start(monkeypatch, captured)
+    monkeypatch.setenv("ROS_DATA_DIR", str(data))
+    monkeypatch.chdir(tmp_path)  # no infra/cluster.toml in here
+    rc = app(
+        [
+            "playback",
+            "start",
+            "--from-day",
+            "14",
+            "--to-day",
+            "14",
+            "--kitchen-target",
+            "http://127.0.0.1:8900/api/v1",
+            "--port",
+            "1",
+        ]
+    )
+    assert rc == 0
+    assert captured["kitchen_url"] == "http://127.0.0.1:8900/api/v1"
+    assert captured["kitchen_urls"] is None
+    assert captured["vendor_regions"] == {}
+    # no cluster file was used, so none is recorded
+    assert "cluster" not in captured["start_kwargs"]["meta_extra"]
+
+
+def test_config_decides_the_region_routing(tmp_path, monkeypatch, capsys, fresh_settings):
+    """Review round 3, item 3: routing per region loads the cluster
+    file bootstrap ran with, so vendors map to both regions of a
+    two-region file exactly the way bootstrap shards them."""
+    orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
+    vendors_csv = (
+        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\nv2,,w21z7,x\nv3,,w21z6,y\n"
+    )
+    data = _make_data_with_vendors(tmp_path, orders, [["1", "p1", 1]], vendors_csv)
+    cluster_file = tmp_path / "two-regions.toml"
+    cluster_file.write_text("[cluster]\nregions = 2\n", encoding="utf-8")
+    captured: dict = {}
+    _install_fake_start(monkeypatch, captured)
+    monkeypatch.setenv("ROS_DATA_DIR", str(data))
+    monkeypatch.chdir(tmp_path)
+    rc = app(
+        [
+            "playback",
+            "start",
+            "--from-day",
+            "14",
+            "--to-day",
+            "14",
+            "--config",
+            str(cluster_file),
+            "--port",
+            "1",
+        ]
+    )
+    assert rc == 0
+    from restaurantos.common.cluster import load_cluster
+    from restaurantos.sim.playback_cli import restock_vendors
+    from restaurantos.sim.shard import assign_shards, vendor_counts
+
+    cluster = load_cluster(cluster_file)
+    cell_region = dict(assign_shards(vendor_counts(data), cluster.region_ids))
+    expected = {vendor: cell_region[geohash] for vendor, geohash in restock_vendors(data)}
+    # both regions of the two-region file carry vendors
+    assert set(expected.values()) == {"r1", "r2"}
+    assert captured["vendor_regions"] == expected
+    assert set(captured["kitchen_urls"]) == {"r1", "r2"}
+    assert captured["start_kwargs"]["meta_extra"]["cluster"]["config"] == str(cluster_file)

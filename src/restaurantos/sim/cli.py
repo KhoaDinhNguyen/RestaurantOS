@@ -56,6 +56,13 @@ def app(argv: Sequence[str] | None = None) -> int:
         help="run a replay in the foreground and serve its /sim control routes",
     )
     pstart.add_argument(
+        "--config",
+        type=Path,
+        default=Path("infra/cluster.toml"),
+        help="cluster description to route kitchen calls with - use the "
+        "file bootstrap ran with (default: infra/cluster.toml)",
+    )
+    pstart.add_argument(
         "--speed",
         type=float,
         default=None,

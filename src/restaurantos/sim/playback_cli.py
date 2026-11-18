@@ -148,13 +148,22 @@ async def start_command(args: argparse.Namespace) -> int:
         banner_days = restock_days(meta.warm_up_days, restock_every, window.from_day, window.to_day)
         pairs = restock_vendors(data_dir)
         vendors = [vendor for vendor, _geohash in pairs]
-        # kitchen routing: the region edges (or the one override URL a
-        # stub run passes) and the vendor -> region map, built the way
-        # bootstrap shards it
-        cluster = load_cluster()
-        vendor_regions = vendor_region_map(pairs, data_dir, cluster)
+        # kitchen routing: resolve the override first - a stub run
+        # sends every kitchen call to the one URL and never reads a
+        # cluster file, so it does not need one. Only a run routing
+        # per region loads the cluster (the file bootstrap ran with,
+        # so the region count and the edge ports match the shards) and
+        # builds the vendor -> region map the way bootstrap shards it.
         kitchen_override = (args.kitchen_target or "").rstrip("/") or None
-        edges = kitchen_urls(cluster, sim.playback_edge_host)
+        cluster_path: Path | None = None
+        if kitchen_override is not None:
+            vendor_regions = {}
+            edges = None
+        else:
+            cluster_path = args.config
+            cluster = load_cluster(cluster_path)
+            vendor_regions = vendor_region_map(pairs, data_dir, cluster)
+            edges = kitchen_urls(cluster, sim.playback_edge_host)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"rosctl playback start: {error}", file=sys.stderr)
         return 1
@@ -171,6 +180,9 @@ async def start_command(args: argparse.Namespace) -> int:
         status_events=events_on,
         event_sample_rate=event_rate,
         event_jitter_s=sim.playback_event_jitter_s,
+        # kitchen-call retries: a timeout, connection error or 5xx is
+        # retried with the same event id (review round 3, item 1)
+        kitchen_attempts=sim.playback_kitchen_attempts,
         # the engine computes the restock days per run from its own
         # window; the banner below prints the first run's count
         restock_every=restock_every,
@@ -214,20 +226,24 @@ async def start_command(args: argparse.Namespace) -> int:
         # the original to_day goes to the engine: it records it as
         # to_day_requested in meta.json and its window check does the
         # same shortening this command already reported
+        meta_extra: dict[str, Any] = {
+            "cache": {
+                "orders_sha256": meta.orders_sha256,
+                "warm_up_days": meta.warm_up_days,
+                "cached_orders": meta.orders,
+            },
+            "argv": sys.argv[1:],
+        }
+        if cluster_path is not None:
+            # routing per region: which cluster file decided the edges
+            meta_extra["cluster"] = {"config": str(cluster_path)}
         await playback.start(
             seed=args.seed,
             from_day=from_day,
             to_day=to_day,
             speed=speed,
             run_id=args.run_id,
-            meta_extra={
-                "cache": {
-                    "orders_sha256": meta.orders_sha256,
-                    "warm_up_days": meta.warm_up_days,
-                    "cached_orders": meta.orders,
-                },
-                "argv": sys.argv[1:],
-            },
+            meta_extra=meta_extra,
         )
         events_note = "on" if events_on else "off"
         if events_on and event_rate < 1.0:
