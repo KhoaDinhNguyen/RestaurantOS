@@ -1246,33 +1246,46 @@ class Playback:
         }
         try:
             async with self._slots:
-                record["wall_sent_at"] = round(self._wall.now(), 3)
-                try:
-                    # One wall-clock deadline over the whole answer
-                    # (review round 5, item 3): httpx's timeout bounds
-                    # each operation - connect, write, each read - so a
-                    # server that keeps a byte coming now and then never
-                    # trips it, and a single POST could last far past
-                    # http_timeout_s. This deadline covers the call,
-                    # which reads the full body.
-                    async with asyncio.timeout(self._http_timeout_s):
-                        response = await self._client.post(
-                            self._orders_url, json=request.model_dump(mode="json")
-                        )
-                    record["http_status"] = response.status_code
-                    record.update(_response_fields(response))
-                    self._count(response)
-                except TimeoutError:
-                    # the outer wall-clock deadline expired: the order
-                    # is failed, exactly like an httpx timeout
-                    record["error"] = "Timeout"
+                if self._state == STOPPING:
+                    # A stop lets only what is already on the wire
+                    # finish (review round 5, item 4, widening round 4's
+                    # item 1 from retries to every attempt): a request
+                    # still queued for its slot when the stop was
+                    # accepted sends nothing new - not a retry, and not a
+                    # first attempt either. The line says cancelled, and
+                    # the call counts failed the way the drain counts a
+                    # cancelled call; the handle resolves cancelled
+                    # below, like the existing cancel path.
+                    record["error"] = "cancelled"
                     self._failed += 1
-                except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
-                    # httpx errors, bad URLs, anything: the line is still
-                    # written and the failure still counted, or the
-                    # reorder buffer would hold every later record hostage
-                    record["error"] = type(error).__name__
-                    self._failed += 1
+                else:
+                    record["wall_sent_at"] = round(self._wall.now(), 3)
+                    try:
+                        # One wall-clock deadline over the whole answer
+                        # (review round 5, item 3): httpx's timeout bounds
+                        # each operation - connect, write, each read - so a
+                        # server that keeps a byte coming now and then never
+                        # trips it, and a single POST could last far past
+                        # http_timeout_s. This deadline covers the call,
+                        # which reads the full body.
+                        async with asyncio.timeout(self._http_timeout_s):
+                            response = await self._client.post(
+                                self._orders_url, json=request.model_dump(mode="json")
+                            )
+                        record["http_status"] = response.status_code
+                        record.update(_response_fields(response))
+                        self._count(response)
+                    except TimeoutError:
+                        # the outer wall-clock deadline expired: the order
+                        # is failed, exactly like an httpx timeout
+                        record["error"] = "Timeout"
+                        self._failed += 1
+                    except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
+                        # httpx errors, bad URLs, anything: the line is still
+                        # written and the failure still counted, or the
+                        # reorder buffer would hold every later record hostage
+                        record["error"] = type(error).__name__
+                        self._failed += 1
         except asyncio.CancelledError:
             record["error"] = "cancelled"
             self._log.add(seq, record)
@@ -1381,12 +1394,15 @@ class Playback:
                 response = None
                 record.pop("http_status", None)
                 async with self._slots:
-                    if attempt > 1 and self._state == STOPPING:
-                        # a stop lets only what is already on the wire
-                        # finish: no new attempt after it, whether the
-                        # task woke from its backoff or just took the
-                        # slot. The line says cancelled, and the call
-                        # counts failed the way any cancelled call does
+                    if self._state == STOPPING:
+                        # A stop lets only what is already on the wire
+                        # finish: no new POST after it, on any attempt -
+                        # not a retry (round 4, item 1), and not a first
+                        # attempt that was still queued for its slot when
+                        # the stop was accepted (review round 5, item 4).
+                        # The line says cancelled, and the call counts
+                        # failed the way the drain counts a cancelled
+                        # call.
                         record["error"] = "cancelled"
                         break
                     try:

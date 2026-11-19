@@ -260,14 +260,23 @@ async def test_stop_drains_in_flight_requests(tmp_path: Path) -> None:
     orders = sample_orders(6)
     pb = make_playback(orders, tmp_path, inflight=6, speed=1e9, transport=transport)
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="drain")
-    await settle()
+    # enough turns that every request that gets a slot reaches the wire
+    await settle(20)
     assert pb.status()["inflight"] > 0
     await pb.stop()
-    # everything already sent was answered and logged
+    # everything dispatched has its line: the six that were already on
+    # the wire were answered 201, and the two still queued for a slot
+    # when the stop was accepted never sent - their lines say cancelled
+    # (review round 5, item 4)
     lines = run_log_lines(tmp_path, pb)
     assert len(lines) == pb.status()["orders_sent"]
-    assert all(line["http_status"] == 201 for line in lines)
-    assert pb.status()["orders_acked"] == len(lines)
+    on_wire = [line for line in lines if "http_status" in line]
+    queued = [line for line in lines if line.get("error") == "cancelled"]
+    assert len(on_wire) == 6
+    assert all(line["http_status"] == 201 for line in on_wire)
+    assert len(queued) == 2
+    assert pb.status()["orders_acked"] == 6
+    assert pb.status()["orders_failed"] == 2
 
 
 # --- what gets logged -------------------------------------------------------

@@ -2010,6 +2010,68 @@ async def test_a_slow_answer_is_retried_and_then_failed(tmp_path: Path) -> None:
     assert len([url for url in transport.requests if url.endswith("/restock")]) == 3
 
 
+class RecordingHoldingOrders(HoldingOrders):
+    """HoldingOrders that also records every path it is asked for."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.paths: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.paths.append(request.url.path)
+        return await super().handle_async_request(request)
+
+
+async def test_a_queued_request_never_sends_after_a_stop(tmp_path: Path) -> None:
+    """Review round 5, item 4, widening round 4's item 1 from retries to
+    every attempt: a task still waiting for its slot when the stop was
+    accepted sends nothing - the STOPPING check runs right after the
+    slot is taken, on any attempt. Only the request already on the wire
+    reaches the transport; every queued one gets a cancelled line, and
+    the log is dense - one line per dispatched item. (A restock cannot
+    queue behind a held order: the restock gate waits for in-flight
+    sends, so it is the orders that pile up on the semaphore.)"""
+    transport = RecordingHoldingOrders()
+    orders = [make_order(14, 0, 0, 0, f"100{i}") for i in (1, 2, 3, 4)]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders, tmp_path, clock=clock, transport=transport, inflight=1, drain_timeout_s=0.3
+    )
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1000.0, run_id="queued-stop")
+    # fast fake spin: order 1001 takes the one slot and holds it; the
+    # other three queue behind it
+    for _ in range(2000):
+        await clock.advance(clock.now() + 0.05)
+        await settle()
+        if pb.status()["orders_sent"] == 4:
+            break
+    assert pb.status()["orders_sent"] == 4
+
+    stopper = asyncio.create_task(pb.stop())
+    # real time for the bounded drain, fake advances for the wakeups
+    for _ in range(500):
+        await asyncio.sleep(0.02)
+        await clock.advance(clock.now() + 0.05)
+        await settle()
+        if stopper.done():
+            break
+    await asyncio.wait_for(stopper, 5)
+
+    # only the held order ever reached the transport
+    assert len(transport.paths) == 1
+    assert transport.paths[0].endswith("/orders")
+    status = pb.status()
+    assert status["state"] == "stopped"
+    assert status["orders_failed"] == 4
+    lines = run_log_lines(tmp_path, pb)
+    # dense: one line per dispatched item, all four orders
+    assert len(lines) == 4
+    assert all(line["kind"] == "order" for line in lines)
+    for line in lines:
+        assert line["error"] == "cancelled"
+        assert "http_status" not in line
+
+
 async def test_a_non_string_region_id_is_failed_the_same_way(tmp_path: Path) -> None:
     """Review round 3, item 2: a region_id that is not even a string
     (a bad answer put a list there) is the same unknown region: the
