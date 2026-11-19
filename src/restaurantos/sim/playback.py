@@ -881,21 +881,25 @@ class Playback:
                 # control requests must be able to run between the
                 # items that are all due at once.
                 await asyncio.sleep(0)
-            if not stopped:
+            if not stopped and self._state != STOPPING:
                 # Normal end: the dispatcher dispatched its last item.
-                # Freeze the reported clock here, before the final wait
-                # for outstanding sends, so cleanup time never moves
-                # the moment the replay reached (review round 4,
-                # item 3), and seek to the last item's own instant
-                # (review round 5, item 2): the wake moment this loop
-                # exits at can sit a slice past the deadline, and it
-                # depends on wake latency, which makes the frozen
-                # value differ from run to run - the item's instant is
-                # the same on every run. At the very end this can step
-                # the reported clock back by that latency, which is
-                # harmless: nothing orders by the clock. A stop already
-                # froze the clock when it was accepted; a failure
-                # freezes below.
+                # A stop that arrived during the yield after the last
+                # dispatch is not a normal end: the clock already froze
+                # at the moment the stop was accepted, and the seek
+                # here would replace it with the last item's instant
+                # (review round 6, item 2b). Freeze the reported clock
+                # here, before the final wait for outstanding sends, so
+                # cleanup time never moves the moment the replay
+                # reached (review round 4, item 3), and seek to the
+                # last item's own instant (review round 5, item 2):
+                # the wake moment this loop exits at can sit a slice
+                # past the deadline, and it depends on wake latency,
+                # which makes the frozen value differ from run to run -
+                # the item's instant is the same on every run. At the
+                # very end this can step the reported clock back by
+                # that latency, which is harmless: nothing orders by
+                # the clock. A stop already froze the clock when it
+                # was accepted; a failure freezes below.
                 self._freeze_clock(last_dispatched_at)
                 # From here on the run only waits for the last answers
                 # (review round 5, item 1): pause, resume and speed
@@ -977,6 +981,11 @@ class Playback:
                     if failed or cleanup_cancelled
                     else (STOPPED if stopped or self._state == STOPPING else DONE)
                 )
+                # the final-wait flag ends with the run (review round
+                # 6, item 2a): a pause on a finished run must answer
+                # with the ordinary state message, not with "dispatch
+                # has finished; waiting for the last answers"
+                self._dispatch_ended = False
                 self._done.set()
 
     async def _wait_until(self, target_sim: float) -> None:
