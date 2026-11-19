@@ -654,6 +654,16 @@
                             }
                         }
                     },
+                    "404": {
+                        "description": "Vendor does not belong to this region.",
+                        "content": {
+                            "application/json": {
+                                "example": {
+                                    "error": "not_found"
+                                }
+                            }
+                        }
+                    },
                     "409": {
                         "description": "Order refused.",
                         "content": {

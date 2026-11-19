@@ -960,6 +960,14 @@ def create_app() -> FastAPI:
                 "model": OrderResponse,
                 "description": "Duplicate order; same result as the original request.",
             },
+            404: {
+                "description": "Vendor does not belong to this region.",
+                "content": {
+                    "application/json": {
+                        "example": {"error": "not_found"},
+                    }
+                },
+            },
             409: {
                 "model": OrderResponse,
                 "description": "Order refused.",
@@ -1001,11 +1009,16 @@ def create_app() -> FastAPI:
                 work,
             )
         except StaleEpochError:
-            result = await run_edge(
-                request.app.state.edge_primary,
-                request.app.state.region_pools,
-                work,
-            )
+            try:
+                result = await run_edge(
+                    request.app.state.edge_primary,
+                    request.app.state.region_pools,
+                    work,
+                )
+            except StaleEpochError as exc:
+                raise RegionUnreachableError(
+                    region_id=region_id,
+                ) from exc
 
         response = order_response(
             result,

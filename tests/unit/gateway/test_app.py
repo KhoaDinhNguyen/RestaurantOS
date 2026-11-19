@@ -2921,3 +2921,115 @@ def test_edge_create_order_retries_after_stale_epoch(monkeypatch) -> None:
         "old-pool",
     )
     edge_primary.refresh.assert_awaited_once_with()
+
+
+def test_edge_create_order_second_stale_epoch_returns_503(
+    monkeypatch,
+) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.common.errors import StaleEpochError
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    epochs = [1, 2]
+    calls = 0
+
+    async def fake_read_epoch(pool, region_id):
+        assert region_id == "r1"
+        return epochs.pop(0)
+
+    async def fake_place(
+        pool,
+        order,
+        region_id,
+        epoch,
+        received_at,
+        place_order,
+    ):
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            assert pool == "old-pool"
+            assert epoch == 1
+        else:
+            assert pool == "new-pool"
+            assert epoch == 2
+
+        raise StaleEpochError()
+
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        lambda: edge_settings,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "read_region_epoch",
+        fake_read_epoch,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "place_region_order",
+        fake_place,
+    )
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    async def fake_refresh():
+        edge_primary.current = "r1-standby"
+        return "r1-standby"
+
+    edge_primary.refresh.side_effect = fake_refresh
+
+    region_pools = AsyncMock()
+    region_pools.get.side_effect = [
+        "old-pool",
+        "new-pool",
+    ]
+    region_pools.drop_if_same = AsyncMock()
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "channel": "dhrd",
+            "external_order_id": "double-stale-test",
+            "vendor_id": "v001",
+            "customer_id": "c001",
+            "customer_geohash": "w21z7",
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "items": [
+                {
+                    "product_id": "p003",
+                    "quantity": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "region_unreachable",
+        "region_id": "r1",
+    }
+
+    assert calls == 2
+    assert epochs == []
+
+    assert region_pools.get.await_args_list[0].args == ("r1-primary",)
+    assert region_pools.get.await_args_list[1].args == ("r1-standby",)
