@@ -2072,6 +2072,58 @@ async def test_a_queued_request_never_sends_after_a_stop(tmp_path: Path) -> None
         assert "http_status" not in line
 
 
+async def test_a_new_restock_batch_waits_for_the_earlier_batch(tmp_path: Path) -> None:
+    """Review round 5, item 5: at the first restock of an instant the
+    gate waits for every in-flight send, restocks included. With two
+    restock days and nothing between them, the first batch's held
+    restock is an earlier batch's outstanding send - the second batch
+    must not start until it is released, where the old gate (which
+    subtracted the restock tasks) found nothing to wait for."""
+    transport = HoldingRestocks()
+    clock = FakeWallClock()
+    pb = make_playback(
+        [],
+        tmp_path,
+        clock=clock,
+        transport=transport,
+        restock_every=1,
+        warm_up_days=14,
+        restock_vendors=("v001", "v002"),
+    )
+    await pb.start(seed=0, from_day=14, to_day=16, speed=1000.0, run_id="two-batches")
+    # fast fake spin until the day-15 batch is dispatched and held
+    for _ in range(20000):
+        await clock.advance(clock.now() + 0.05)
+        await settle()
+        if pb.status()["restocks_sent"] == 2:
+            break
+    assert pb.status()["restocks_sent"] == 2
+    # let the dispatcher travel to the day-16 gate (0.05 wall = 50
+    # simulated seconds per iteration, day 16 is 1728 away): the gate
+    # must sit there holding the second batch back while the first
+    # batch is still held
+    for _ in range(2200):
+        await clock.advance(clock.now() + 0.05)
+        await settle()
+    assert pb.status()["restocks_sent"] == 2  # the second batch never started
+    assert pb.status()["state"] == "running"
+    assert len(transport.paths) == 2
+    # release: the first batch's answers come back, and only then does
+    # the day-16 batch go out
+    transport.release.set()
+    for _ in range(20000):
+        await clock.advance(clock.now() + 0.05)
+        await settle()
+        if pb.state in {"done", "stopped", "failed"}:
+            break
+    assert pb.status()["state"] == "done"
+    assert pb.status()["restocks_sent"] == 4
+    assert pb.status()["restocks_acked"] == 4
+    assert len(transport.paths) == 4
+    lines = [line for line in run_log_lines(tmp_path, pb) if line["kind"] == "restock"]
+    assert sorted(line["restock_day"] for line in lines) == [15, 15, 16, 16]
+
+
 async def test_a_non_string_region_id_is_failed_the_same_way(tmp_path: Path) -> None:
     """Review round 3, item 2: a region_id that is not even a string
     (a bad answer put a list there) is the same unknown region: the

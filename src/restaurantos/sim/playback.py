@@ -844,27 +844,26 @@ class Playback:
                     else:
                         if deadline != last_restock_deadline:
                             # The first restock of an instant waits for
-                            # every in-flight non-restock send first
-                            # (review round 2, item 2): an order sent at
-                            # 23:59:58 could still be in flight at
-                            # 00:00:00, and "order, then restock" ends
-                            # the cycle at par while "restock, then
-                            # order" ends it at par minus the order -
-                            # the oracle applies the order first, so
-                            # the wire must too. Waiting for events too
-                            # is fine: they never touch stock, and it
-                            # makes the restock instant a clean sync
-                            # point, at most one in-flight window per
-                            # restock day. The later restocks of the
-                            # same instant find nothing outstanding:
-                            # the dispatcher is sequential, and no
-                            # non-restock send started meanwhile.
+                            # every in-flight send first (review round
+                            # 2, item 2): an order sent at 23:59:58 could
+                            # still be in flight at 00:00:00, and
+                            # "order, then restock" ends the cycle at par
+                            # while "restock, then order" ends it at par
+                            # minus the order - the oracle applies the
+                            # order first, so the wire must too. It is
+                            # all of _send_tasks, restocks included
+                            # (review round 5, item 5): at this point
+                            # every outstanding restock belongs to an
+                            # earlier batch - this instant's batch has
+                            # dispatched nothing yet - so waiting for
+                            # all of it is exact even when a whole
+                            # restock interval passed with no order or
+                            # event in between. The later restocks of
+                            # the same instant stay concurrent: they are
+                            # dispatched after this gate, and the
+                            # dispatcher is sequential.
                             while True:
-                                outstanding = {
-                                    task
-                                    for task in self._send_tasks - self._restock_tasks
-                                    if not task.done()
-                                }
+                                outstanding = {task for task in self._send_tasks if not task.done()}
                                 if not outstanding:
                                     break
                                 if not await self._await_or_stop(asyncio.wait(outstanding)):
