@@ -951,6 +951,74 @@ def create_app() -> FastAPI:
             content=response.model_dump(mode="json"),
         )
 
+    @edge.post(
+        "/orders",
+        response_model=OrderResponse,
+        status_code=201,
+        responses={
+            200: {
+                "model": OrderResponse,
+                "description": "Duplicate order; same result as the original request.",
+            },
+            409: {
+                "model": OrderResponse,
+                "description": "Order refused.",
+            },
+            503: {
+                "description": "Local region unavailable.",
+            },
+        },
+    )
+    async def edge_create_order(
+        order: OrderRequest,
+        request: Request,
+    ) -> OrderResponse:
+        received_at = datetime.now(UTC)
+
+        region_id = settings.region_id
+        if region_id is None:
+            raise RuntimeError("ROS_REGION_ID is required in edge mode")
+
+        async def work(pool):
+            epoch = await read_region_epoch(
+                pool,
+                region_id,
+            )
+
+            return await place_region_order(
+                pool,
+                order,
+                region_id,
+                epoch,
+                received_at,
+                place_order,
+            )
+
+        try:
+            result = await run_edge(
+                request.app.state.edge_primary,
+                request.app.state.region_pools,
+                work,
+            )
+        except StaleEpochError:
+            result = await run_edge(
+                request.app.state.edge_primary,
+                request.app.state.region_pools,
+                work,
+            )
+
+        response = order_response(
+            result,
+            region_id,
+            received_at,
+            datetime.now(UTC),
+        )
+
+        return JSONResponse(
+            status_code=order_status_code(result),
+            content=response.model_dump(mode="json"),
+        )
+
     @gateway.post(
         "/menu/products",
         response_model=MenuPublishResponse,

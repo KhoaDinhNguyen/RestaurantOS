@@ -610,7 +610,6 @@ def test_hq_only_routes_not_registered_in_edge_mode(monkeypatch) -> None:
     assert client.get("/health").json()["mode"] == "edge"
 
     assert client.get("/api/v1/regions").status_code == 404
-    assert client.post("/api/v1/orders", json={}).status_code == 404
 
 
 async def test_periodic_directory_refresh(monkeypatch) -> None:
@@ -2435,3 +2434,490 @@ def test_restock_vendor_items_not_implemented(monkeypatch) -> None:
     assert response.status_code == 501
     assert response.json() == {"error": "not_implemented"}
     restock_region_vendor.assert_not_awaited()
+
+
+def test_edge_create_order_accepted(monkeypatch) -> None:
+    from tests.unit.gateway.fakes import place_order_accepted
+
+    from restaurantos.common.config import Settings
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_read_epoch(pool, region_id):
+        assert pool == "edge-pool"
+        assert region_id == "r1"
+        return 3
+
+    async def fake_place(
+        pool,
+        order,
+        region_id,
+        epoch,
+        received_at,
+        place_order,
+    ):
+        assert pool == "edge-pool"
+        assert order.vendor_id == "v001"
+        assert region_id == "r1"
+        assert epoch == 3
+        assert received_at is not None
+
+        return await place_order_accepted()
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+    monkeypatch.setattr(gateway_app, "read_region_epoch", fake_read_epoch)
+    monkeypatch.setattr(gateway_app, "place_region_order", fake_place)
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "channel": "dhrd",
+            "external_order_id": "123",
+            "vendor_id": "v001",
+            "customer_id": "c001",
+            "customer_geohash": "w21z7",
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "items": [
+                {
+                    "product_id": "p003",
+                    "quantity": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+
+    body = response.json()
+    assert body["outcome"] == "accepted"
+    assert body["duplicate"] is False
+    assert body["queued"] is False
+    assert body["region_id"] == "r1"
+    assert body["status"] == "received"
+    assert body["received_at"] is not None
+    assert body["acked_at"] is not None
+
+    region_pools.get.assert_awaited_once_with("r1-primary")
+
+
+def test_edge_create_order_duplicate_returns_200(monkeypatch) -> None:
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from restaurantos.common.config import Settings
+    from restaurantos.common.models import (
+        OrderOutcome,
+        OrderResult,
+        OrderStatus,
+    )
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    order_id = uuid4()
+
+    async def fake_read_epoch(pool, region_id):
+        return 3
+
+    async def fake_place(
+        pool,
+        order,
+        region_id,
+        epoch,
+        received_at,
+        place_order,
+    ):
+        return OrderResult(
+            outcome=OrderOutcome.ACCEPTED,
+            duplicate=True,
+            order_id=order_id,
+            order_day=14,
+            status=OrderStatus.RECEIVED,
+            menu_version=1,
+            committed_at=datetime.now(UTC),
+        )
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+    monkeypatch.setattr(gateway_app, "read_region_epoch", fake_read_epoch)
+    monkeypatch.setattr(gateway_app, "place_region_order", fake_place)
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "channel": "dhrd",
+            "external_order_id": "123",
+            "vendor_id": "v001",
+            "customer_id": "c001",
+            "customer_geohash": "w21z7",
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "items": [
+                {
+                    "product_id": "p003",
+                    "quantity": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+    assert body["order_id"] == str(order_id)
+    assert body["outcome"] == "accepted"
+    assert body["duplicate"] is True
+    assert body["queued"] is False
+    assert body["region_id"] == "r1"
+    assert body["status"] == "received"
+
+
+def test_edge_create_order_refused_returns_409(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.common.models import (
+        OrderOutcome,
+        OrderResult,
+        RefusalReason,
+    )
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_read_epoch(pool, region_id):
+        return 3
+
+    async def fake_place(
+        pool,
+        order,
+        region_id,
+        epoch,
+        received_at,
+        place_order,
+    ):
+        return OrderResult(
+            outcome=OrderOutcome.REFUSED,
+            refusal_reason=RefusalReason.OUT_OF_STOCK,
+        )
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+    monkeypatch.setattr(gateway_app, "read_region_epoch", fake_read_epoch)
+    monkeypatch.setattr(gateway_app, "place_region_order", fake_place)
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "channel": "dhrd",
+            "external_order_id": "123",
+            "vendor_id": "v001",
+            "customer_id": "c001",
+            "customer_geohash": "w21z7",
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "items": [
+                {
+                    "product_id": "p003",
+                    "quantity": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 409
+
+    body = response.json()
+    assert body["outcome"] == "refused"
+    assert body["refusal_reason"] == "out_of_stock"
+    assert body["queued"] is False
+    assert body["region_id"] == "r1"
+
+
+def test_edge_create_order_unreachable_returns_503_without_parking(
+    monkeypatch,
+) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.common.errors import RegionUnreachableError
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+    edge_primary.refresh.return_value = None
+
+    region_pools = AsyncMock()
+    region_pools.get.side_effect = RegionUnreachableError(
+        region_id="r1",
+    )
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    park = AsyncMock()
+    monkeypatch.setattr(gateway_app, "park_order", park)
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "channel": "dhrd",
+            "external_order_id": "123",
+            "vendor_id": "v001",
+            "customer_id": "c001",
+            "customer_geohash": "w21z7",
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "items": [
+                {
+                    "product_id": "p003",
+                    "quantity": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": "region_unreachable",
+        "region_id": "r1",
+    }
+
+    park.assert_not_awaited()
+
+
+def test_edge_create_order_foreign_vendor_returns_404(monkeypatch) -> None:
+    from restaurantos.common.config import Settings
+    from restaurantos.common.errors import UnknownVendorError
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    async def fake_read_epoch(pool, region_id):
+        assert region_id == "r1"
+        return 3
+
+    async def fake_place(
+        pool,
+        order,
+        region_id,
+        epoch,
+        received_at,
+        place_order,
+    ):
+        raise UnknownVendorError(f"vendor {order.vendor_id} is not on this node")
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+    monkeypatch.setattr(gateway_app, "read_region_epoch", fake_read_epoch)
+    monkeypatch.setattr(gateway_app, "place_region_order", fake_place)
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    region_pools = AsyncMock()
+    region_pools.get.return_value = "edge-pool"
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    park = AsyncMock()
+    monkeypatch.setattr(gateway_app, "park_order", park)
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "channel": "dhrd",
+            "external_order_id": "foreign-vendor-test",
+            "vendor_id": "r2-vendor",
+            "customer_id": "c001",
+            "customer_geohash": "w21z7",
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "items": [
+                {
+                    "product_id": "p003",
+                    "quantity": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "not_found"}
+
+    park.assert_not_awaited()
+
+
+def test_edge_create_order_retries_after_stale_epoch(monkeypatch) -> None:
+    from tests.unit.gateway.fakes import place_order_accepted
+
+    from restaurantos.common.config import Settings
+    from restaurantos.common.errors import StaleEpochError
+    from restaurantos.gateway import app as gateway_app
+
+    edge_settings = Settings(
+        _env_file=None,
+        mode="edge",
+        region_id="r1",
+        network="host",
+    )
+
+    epochs = [1, 2]
+    calls = 0
+
+    async def fake_read_epoch(pool, region_id):
+        assert region_id == "r1"
+        return epochs.pop(0)
+
+    async def fake_place(
+        pool,
+        order,
+        region_id,
+        epoch,
+        received_at,
+        place_order,
+    ):
+        nonlocal calls
+        calls += 1
+
+        if calls == 1:
+            assert pool == "old-pool"
+            assert epoch == 1
+            raise StaleEpochError()
+
+        assert pool == "new-pool"
+        assert epoch == 2
+        return await place_order_accepted()
+
+    monkeypatch.setattr(gateway_app, "get_settings", lambda: edge_settings)
+    monkeypatch.setattr(gateway_app, "read_region_epoch", fake_read_epoch)
+    monkeypatch.setattr(gateway_app, "place_region_order", fake_place)
+
+    app = gateway_app.create_app()
+
+    edge_primary = AsyncMock()
+    edge_primary.current = "r1-primary"
+
+    async def fake_refresh():
+        edge_primary.current = "r1-standby"
+        return "r1-standby"
+
+    edge_primary.refresh.side_effect = fake_refresh
+
+    region_pools = AsyncMock()
+    region_pools.get.side_effect = [
+        "old-pool",
+        "new-pool",
+    ]
+    region_pools.drop_if_same = AsyncMock()
+
+    app.state.edge_primary = edge_primary
+    app.state.region_pools = region_pools
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/orders",
+        json={
+            "channel": "dhrd",
+            "external_order_id": "stale-epoch-test",
+            "vendor_id": "v001",
+            "customer_id": "c001",
+            "customer_geohash": "w21z7",
+            "order_day": 14,
+            "order_time": "12:03:29",
+            "items": [
+                {
+                    "product_id": "p003",
+                    "quantity": 1,
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 201
+    assert response.json()["outcome"] == "accepted"
+
+    assert calls == 2
+    assert epochs == []
+
+    assert region_pools.get.await_args_list[0].args == ("r1-primary",)
+    assert region_pools.get.await_args_list[1].args == ("r1-standby",)
+
+    region_pools.drop_if_same.assert_awaited_once_with(
+        "r1-primary",
+        "old-pool",
+    )
+    edge_primary.refresh.assert_awaited_once_with()
