@@ -89,11 +89,11 @@ Stretch goal, only if the report needs a write-throughput comparison: no new cod
 - Read orders in (`order_day`, `order_time`, `order_id` compared as a number) order, starting at day W (1,707,401 orders from day 14 to day 90). `order_items.csv` has no restaurant, line number or price: join it to its order on `order_id`. The data dictionary shows how one order becomes one `POST /orders`. The third key makes the order total: orders in the same second must always go out in the same sequence, or a sequential run cannot match the oracle. Sort once and cache the sorted file.
 - **Scheduling:** an order t simulated seconds after the start goes out t / speed wall-clock seconds after the start. Speed can change mid-run, so keep an anchor (wall-clock now, simulated now) and re-anchor on every change. Do not precompute send times. Default speed 1,000x.
 - Send with a bounded number of requests in flight.
-- **Status events** (on by default): for each accepted order, schedule accepted, preparing, ready and picked-up at +1, +3, +15, +25 simulated minutes plus jitter. Send them to the region's own API.
-- **Restock** every R simulated days: at 00:00:00 of days W + R, W + 2R, and so on, for every vendor, before the first order of that day. In sequential mode, wait for the restock calls to finish before sending that order. A restock tops counters up to par and answers `200` (architecture Section 6.1); send no body.
+- **Status events** (on by default): for each accepted order, schedule accepted, preparing, ready and picked-up at +1, +3, +15, +25 simulated minutes plus jitter. Send them to the region's own edge API, never the gateway. Each event has a fixed id, and a retry reuses it (architecture Section 7.2).
+- **Restock** every R simulated days: at 00:00:00 of days W + R, W + 2R, and so on, for every vendor, at its region's edge API, before the first order of that day. In sequential mode, wait for the restock calls to finish before sending that order. A restock tops counters up to par and answers `200` (architecture Section 6.1); send no body.
 - **Duplicates and shuffling:** resend a configurable share of orders; optionally reorder delivery.
 - **Randomness:** derive every random value from a hash of (`seed`, `order_id`, purpose). Never draw from one shared generator in send order.
-- **Run log:** one line per order in `runs/<run_id>/orders.jsonl` with the three gateway timestamps and the outcome.
+- **Run log:** `runs/<run_id>/orders.jsonl`, one line per order (with the three gateway timestamps and the outcome), per status event and per restock, each with a `kind`.
 - Controls: start, pause, resume, stop, change speed, `from_day`, `to_day`. The bodies and answers of `/sim/clock` and `/sim/playback` are in architecture Section 6.3; a command the state does not allow answers `409` with `{"error": "invalid_state", ...}`.
 
 ### Single-region mode

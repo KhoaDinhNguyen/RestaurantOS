@@ -382,7 +382,7 @@ All JSON. No authentication (simulation). FastAPI serves OpenAPI at `/docs` on e
 | `GET /vendors/{vendor_id}/menu` | menu with availability | each row carries its `dish_id` |
 | `GET /vendors/{vendor_id}/stock` | stock counters | `on_hand` and `par_level` per counter; details below |
 | `PUT /vendors/{vendor_id}/products/{product_id}/availability` | manual sold-out switch | body `{available}`; changes the manual mark only; details below |
-| `POST /vendors/{vendor_id}/restock` | restock to par | also called by playback; no body needed; details below |
+| `POST /vendors/{vendor_id}/restock` | restock to par | also called by playback, at the region's edge API (Section 7.2); no body needed; details below |
 | `GET /vendors?geohash=&q=` | find restaurants in one cell | exact cell only, no neighbours (that is `/query/nearby`); details below |
 | `GET /dishes?q=&limit=` | search dishes by name | gateway reads HQ, edge reads its own node; details below |
 | `GET /dishes/{dish_id}` | one dish | `404` if unknown |
@@ -421,7 +421,7 @@ Response:
 }
 ```
 
-The edge API (`edge-r{n}`) serves the same `/vendors/...` routes, and `/regions/{region_id}/summary`, for its own region only.
+The edge API (`edge-r{n}`) serves the same `/vendors/...` routes, and `/regions/{region_id}/summary`, for its own region only. That includes the region-side writes: the status change, the sold-out switch and the restock. The edge reaches its region's primary on the local network (Section 4), so these keep working while the region is cut off from HQ (T2). That is why the kitchen, and playback's status events and restocks, use the edge API and not the gateway.
 
 `GET /vendors?geohash=&q=`, the customer's restaurant search:
 
@@ -746,7 +746,7 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
 
 "Optional" routes must work as `rosctl` commands; putting them on the Ops view is extra. Their shapes are fixed here either way.
 
-**Playback.** `GET /sim/clock` answers `{"state", "sim_day", "sim_time", "speed"}`. Before the first run the last three are `null`: there is no "today" yet, and a screen should ask for a day. While a run is paused, and after it has ended, the clock stands at its last moment. `state` is `idle`, `running`, `paused`, `stopping`, `done`, `stopped` or `failed`.
+**Playback.** `GET /sim/clock` answers `{"state", "sim_day", "sim_time", "speed"}`. Before the first run the last three are `null`: there is no "today" yet, and a screen should ask for a day. The clock shows how far the replay got, never how long cleanup took. While a run is paused it stands where the pause caught it. After a normal end it stands at the last item's own instant, the same on every run. After a stop it stands at the moment the stop was accepted, and after a failure at the moment the run failed. From then on it does not move, including while the state is still `stopping`. `state` is `idle`, `running`, `paused`, `stopping`, `done`, `stopped` or `failed`.
 
 `GET /sim/playback`, and every `POST` and `PATCH` on it, answer:
 
@@ -754,12 +754,21 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
 {
   "state": "running", "run_id": "2026-11-20-a", "seed": 0, "from_day": 14, "to_day": 20, "speed": 1000.0,
   "orders_sent": 0, "orders_acked": 0, "orders_parked": 0, "orders_refused": 0, "orders_failed": 0,
-  "events_sent": 0, "events_acked": 0, "events_conflicted": 0, "events_failed": 0, "events_skipped": 0,
+  "events_sent": 0, "events_acked": 0, "events_duplicate": 0, "events_conflicted": 0, "events_failed": 0, "events_skipped": 0,
   "restocks_sent": 0, "restocks_acked": 0, "restocks_failed": 0, "inflight": 0
 }
 ```
 
 - `start` needs `from_day`; `to_day`, `speed`, `seed` and `run_id` are optional. `duplicate_rate` and `shuffle` (Section 7.2) will join the body when they are built. Status events and restocks are switched on when the playback process starts, not per run.
+- A `to_day` past the last day that has orders is shortened to that day. The answer's `to_day` shows the day used, and a warning names it. A `from_day` past the data, or inside the warm-up window, is refused.
+- How a status event's final answer is counted:
+  - `events_acked`: the region applied it.
+  - `events_duplicate`: the region already had that event id. This happens when a window is replayed, or when a retry follows an attempt that landed.
+  - `events_conflicted`: a real state-machine rejection (`409`, or a `2xx` with `conflict`).
+  - `events_failed`: everything else. That includes a `2xx` that is neither applied, duplicate nor conflict, which has no meaning in the state machine, so a success code alone is not counted as an ack.
+  - `events_skipped`: the order was not accepted, so its events were never sent.
+- Restocks count only `200` as acked.
+- Once the last item has been dispatched, the run only waits for the last answers: `pause`, `resume` and speed changes answer `409`, and `stop` still works.
 - A command the current state does not allow answers `409` with `{"error": "invalid_state", "state": "idle", "message": "..."}`.
 
 **Faults.** `POST /sim/faults` takes `{"target": "<link group>", "fault": "...", "params": {}}`:
@@ -832,9 +841,21 @@ The dataset averages about 0.25 orders per second, so the speed factor decides b
 
 So every run needs a **window** (`from_day`, `to_day`) as well as a speed. Default speed is **1,000x**. Speed can be changed while a run is in progress (`PATCH /sim/playback`), so playback must schedule incrementally: on a speed change it re-anchors (wall-clock now, simulated now) and continues from there, rather than precomputing send times.
 
-Playback also sends status events for each order, triggers restocks every R simulated days, resends a configurable share of orders, and shuffles delivery. Per-order timestamps go to `runs/<run_id>/orders.jsonl`.
+Playback also sends status events for each order, triggers restocks every R simulated days, resends a configurable share of orders, and shuffles delivery. The run log `runs/<run_id>/orders.jsonl` has one line per order, status event and restock (field `kind`), in dispatch order.
 
-**Status events.** On by default (`status_events: all`); a flag can turn them off or sample them for a measurement run. Each event fires at a baseline simulated offset after the order (+1, +3, +15, +25 minutes) plus a random jitter. They go to the region's own API, because the kitchen is on the region side.
+**Status events.** On by default (`status_events: all`); a flag can turn them off or sample them for a measurement run. Each event fires at a baseline simulated offset after the order (+1, +3, +15, +25 minutes) plus a random jitter.
+
+- **Jitter:** 60 s by default, never more than 120 s, the smallest gap between two events, so one order's events never swap.
+- **Where they go:** the edge API of the order's region (the `region_id` in the `POST /orders` answer), not the gateway, because the kitchen is on the region side and must keep working while the region is cut off from HQ (T2).
+- **Order:** one order's events go out strictly one after another, each waiting for the previous answer.
+- **Event id:** `uuid5(order_id:to_status)`, fixed per event and with no run id in it. `POST /orders` is idempotent, so a replayed window gets the same order ids, and therefore the same event ids, and the region answers `duplicate` instead of logging a conflict.
+- **Retries:** a timeout, a connection error or a `5xx` is retried, up to `ROS_SIM_PLAYBACK_KITCHEN_ATTEMPTS` attempts (default 3), always with the same event id. The region's `processed_events` makes a repeat a no-op, so a retry never shows up as a conflict or as an exception at HQ.
+
+**Restocks.** At 00:00:00 of days W + R, W + 2R, and so on, every vendor is restocked at its region's edge API, for the same T2 reason, and retried like a status event.
+
+- The batch waits for every earlier send to finish, because an order still in flight from before midnight must land first: the oracle applies it first.
+- That day's orders wait for the whole batch.
+- A restock that still fails after its attempts is counted and reported, and the run goes on.
 
 **Repeatability.** Random values are never drawn from one shared generator in send order. Each is computed from a hash of (`seed`, `order_id`, purpose), for example the jitter of the "ready" event or whether an order is resent. The same seed then gives the same run whatever the concurrency, speed changes, pauses or snapshot restores.
 
