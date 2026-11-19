@@ -51,6 +51,13 @@ async def place_order(
         # 1. The epoch fence, before anything is read or written.
         await assert_epoch(cur, epoch)
 
+        # Reject a vendor that does not belong to this region before checking
+        # the idempotency key. A foreign vendor must never reuse the stored
+        # outcome of a local order with the same channel/external_order_id.
+        await _require_vendor(cur, req.vendor_id)
+
+        # 2. Claim the order in the inbox; if it was seen before, answer as then.
+
         # 2. Claim the order in the inbox; if it was seen before, answer as then.
         order_id = uuid4()
         await cur.execute(
@@ -68,8 +75,6 @@ async def place_order(
         # 3. Every product, looked up for this vendor.
         products = await _look_up_products(cur, req)
         reason = _check_products(req, products)
-        if reason is RefusalReason.UNKNOWN_PRODUCT:
-            await _require_vendor(cur, req.vendor_id)
         if reason is not None:
             return await _refuse(cur, req, reason)
 

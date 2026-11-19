@@ -374,3 +374,31 @@ async def test_a_manual_mark_survives_running_out(region):
 
     assert result.outcome == OrderOutcome.ACCEPTED
     assert await marks(conn) == {"p_rice": "manual", "p_rice_small": "stock"}
+
+
+async def test_foreign_vendor_cannot_reuse_local_inbox_key(region):
+    conn = await region()
+
+    local = make_order(
+        ("p_rice_small", 1),
+        ext="shared-key",
+    )
+    first = await place_order(conn, local, 1)
+
+    foreign = make_order(
+        ("p_tea", 1),
+        ext="shared-key",
+        vendor="v9",
+    )
+
+    with pytest.raises(UnknownVendorError):
+        await place_order(conn, foreign, 1)
+
+    assert await count(conn, "inbox") == 1
+    assert await count(conn, "orders") == 1
+    assert await count(conn, "outbox") == 1
+
+    duplicate = await place_order(conn, local, 1)
+
+    assert duplicate.duplicate
+    assert duplicate.order_id == first.order_id
