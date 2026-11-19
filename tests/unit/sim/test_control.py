@@ -378,7 +378,7 @@ async def test_the_clock_stays_at_the_last_dispatch_through_the_final_wait(tmp_p
 
     hold = expected_event_id("1001", "picked_up")
     transport = HoldingEvent(hold)
-    orders = [make_order(14, 0, 0, 1, "1001")]
+    orders = [make_order(14, 0, 0, 0, "1001")]  # midnight: the last deadline is exactly +25 min
     clock = FakeWallClock()
     # no jitter, so the last deadline is exactly +25 minutes; fine
     # steps so the fake clock lands on it without a coarse overshoot
@@ -409,11 +409,12 @@ async def test_the_clock_stays_at_the_last_dispatch_through_the_final_wait(tmp_p
         assert pb.status()["state"] == "running"  # waiting for the held event
         at_end = (await client.get("/sim/clock")).json()
         # the last dispatched item is picked_up, at +25 simulated
-        # minutes; the slice-wise wake may cross the deadline's second
-        # by a step, so the frozen reading is the deadline's own second
-        # or one past it - and never past that
+        # minutes: the freeze seeks the item's own instant (review
+        # round 5, item 2), so the reading is exact and the same on
+        # every run, whatever the wake latency of the dispatch loop
+        # was - round 4's one-tick allowance is gone
         assert at_end["sim_day"] == 14
-        assert at_end["sim_time"] in {"00:25:00", "00:25:01"}
+        assert at_end["sim_time"] == "00:25:00"
         # the final wait runs with the wall clock moving on: the
         # reported clock does not
         await clock.advance(clock.now() + 5.0)
@@ -430,6 +431,54 @@ async def test_the_clock_stays_at_the_last_dispatch_through_the_final_wait(tmp_p
     assert final["sim_time"] == at_end["sim_time"]
 
 
+async def test_the_normal_end_clock_is_exact_at_1000x(tmp_path: Path):
+    """Review round 5, item 2's other half: at 1000x one millisecond of
+    wake latency is a simulated second, so round 4's freeze - the wake
+    moment - read `00:25:02` here. Seeking the last item's own instant
+    makes the frozen clock exact at any speed."""
+    from conftest import settle
+    from test_playback_events import HoldingEvent, expected_event_id
+
+    hold = expected_event_id("1001", "picked_up")
+    transport = HoldingEvent(hold)
+    # midnight, so the last item's deadline is exactly +25 minutes
+    orders = [make_order(14, 0, 0, 0, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders, tmp_path, clock=clock, status_events=True, event_jitter_s=0.0, transport=transport
+    )
+    from restaurantos.sim.control import make_control_app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        await client.post(
+            "/sim/playback", json={"action": "start", "from_day": 14, "speed": 1000.0}
+        )
+        # 1 ms steps, each worth a simulated second at 1000x: reaching
+        # +25 minutes takes about 1.5 s of wall, so the loop has room;
+        # the wake overshoot can be seconds past the deadline, and the
+        # freeze must still land exactly on it
+        for _ in range(2500):
+            if pb.status()["events_sent"] == 4:
+                break
+            await clock.advance(clock.now() + 0.001)
+            await settle()
+        await settle(10)
+        assert pb.status()["state"] == "running"
+        at_end = (await client.get("/sim/clock")).json()
+        assert at_end["sim_day"] == 14
+        assert at_end["sim_time"] == "00:25:00"
+        try:
+            transport.release.set()
+            await asyncio.wait_for(pb.wait_done(), 5)
+        finally:
+            transport.release.set()
+        assert pb.status()["state"] == "done"
+    final = pb.clock()
+    assert final["sim_time"] == "00:25:00"
+
+
 async def test_only_stop_is_accepted_once_dispatch_has_ended(tmp_path: Path):
     """Review round 5, item 1: once the dispatcher dispatched its last
     item, the run only waits for the last answers - pause, resume and
@@ -441,7 +490,8 @@ async def test_only_stop_is_accepted_once_dispatch_has_ended(tmp_path: Path):
 
     hold = expected_event_id("1001", "picked_up")
     transport = HoldingEvent(hold)
-    orders = [make_order(14, 0, 0, 1, "1001")]
+    # midnight, so the last item's deadline is exactly +25 minutes
+    orders = [make_order(14, 0, 0, 0, "1001")]
     clock = FakeWallClock()
     pb = make_playback(
         orders, tmp_path, clock=clock, status_events=True, event_jitter_s=0.0, transport=transport

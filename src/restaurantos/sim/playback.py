@@ -666,7 +666,7 @@ class Playback:
         self._wake.set()
         await self._done.wait()
 
-    def _freeze_clock(self) -> None:
+    def _freeze_clock(self, at: float | None = None) -> None:
         """Freeze the reported clock where the replay stopped.
 
         Called at a normal end (when the dispatcher dispatched its
@@ -674,10 +674,24 @@ class Playback:
         a failure (when the dispatcher raised). Harmless when the
         clock is already frozen - the cleanup's own pause is the
         safety net. Pause keeps its own freeze, as before.
+
+        A normal end passes `at`, the last item's own instant, and the
+        freeze seeks there after pausing (review round 5, item 2): the
+        frozen value is then the item's instant, the same on every
+        run, instead of the moment the dispatcher woke up, which sits
+        a wake latency past the deadline and differs from run to run.
+        At the very end this can step the reported clock back by that
+        latency, which is harmless - nothing orders by the clock. Stop
+        and failure pass no `at`: they have no item instant, and the
+        moment of the stop request (or of the raise) is the right
+        answer there. If nothing was dispatched at all, the plain
+        pause stands.
         """
         if self._simclock is not None:
             with contextlib.suppress(Exception):
                 self._simclock.pause()
+                if at is not None:
+                    self._simclock.seek(at)
 
     async def wait_done(self) -> None:
         """Block until the run is over (done, stopped or failed)."""
@@ -749,6 +763,14 @@ class Playback:
         stopped = False
         failed = False
         last_restock_deadline: float | None = None
+        # the last dispatched item's own instant, in absolute simulated
+        # seconds: the target of an order, the heap deadline of an event
+        # or a restock (review round 5, item 2). The normal-end freeze
+        # seeks here, so the frozen clock is the item's instant and not
+        # the moment the dispatcher woke up - which is up to a slice
+        # past the deadline and depends on wake latency, at 1000x one
+        # millisecond of it is a simulated second.
+        last_dispatched_at: float | None = None
         try:
             # One dispatcher, one total order: the next stream order
             # against the earliest scheduled event or restock, both
@@ -780,6 +802,7 @@ class Playback:
                         if not await self._after_gate():
                             stopped = True
                             break
+                    last_dispatched_at = order_target
                     self._dispatch_order(order_target - sim_start, request)
                     pending = next(stream_items, None)
                 else:
@@ -816,6 +839,7 @@ class Playback:
                         if not await self._after_gate():
                             stopped = True
                             break
+                        last_dispatched_at = deadline
                         self._dispatch_event(deadline - sim_start, handle, to_status, jitter)
                     else:
                         if deadline != last_restock_deadline:
@@ -852,6 +876,7 @@ class Playback:
                                 stopped = True
                                 break
                             last_restock_deadline = deadline
+                        last_dispatched_at = deadline
                         self._dispatch_restock(deadline - sim_start, tie_a, tie_b)
                 # One loop turn per dispatch, even in a burst: sends and
                 # control requests must be able to run between the
@@ -862,9 +887,17 @@ class Playback:
                 # Freeze the reported clock here, before the final wait
                 # for outstanding sends, so cleanup time never moves
                 # the moment the replay reached (review round 4,
-                # item 3). A stop already froze the clock when it was
-                # accepted; a failure freezes below.
-                self._freeze_clock()
+                # item 3), and seek to the last item's own instant
+                # (review round 5, item 2): the wake moment this loop
+                # exits at can sit a slice past the deadline, and it
+                # depends on wake latency, which makes the frozen
+                # value differ from run to run - the item's instant is
+                # the same on every run. At the very end this can step
+                # the reported clock back by that latency, which is
+                # harmless: nothing orders by the clock. A stop already
+                # froze the clock when it was accepted; a failure
+                # freezes below.
+                self._freeze_clock(last_dispatched_at)
                 # From here on the run only waits for the last answers
                 # (review round 5, item 1): pause, resume and speed
                 # changes are refused - there is nothing left to pause,
