@@ -72,6 +72,18 @@ async def settle(rounds: int = 8) -> None:
         await asyncio.sleep(0)
 
 
+async def until(predicate, timeout: float = 5.0) -> None:
+    """Bounded wait for a condition (review round 6, item 3): poll the
+    counters with real short sleeps instead of running a fixed count of
+    loop turns, which makes a test pass or fail on scheduling."""
+
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), timeout)
+
+
 async def drive(playback: Playback, clock: FakeWallClock, *, steps: int | None = None) -> int:
     """Advance fake time until the run is over (or `steps` steps taken).
 

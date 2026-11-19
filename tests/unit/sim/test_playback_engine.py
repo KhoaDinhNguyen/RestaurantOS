@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle
+from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle, until
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -175,10 +175,12 @@ class CountingTransport(httpx.AsyncBaseTransport):
         self.inner = inner
         self.active = 0
         self.max_active = 0
+        self.entries: list[str] = []  # every request that reached the wire
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
+        self.entries.append(request.url.path)
         try:
             return await self.inner.handle_async_request(request)
         finally:
@@ -256,18 +258,36 @@ async def test_drain_timeout_records_every_dispatched_order(tmp_path: Path) -> N
 
 
 async def test_stop_drains_in_flight_requests(tmp_path: Path) -> None:
-    transport = CountingTransport(httpx.ASGITransport(app=make_stub_app(delay_seconds=0.05)))
-    orders = sample_orders(6)
+    """A stop lets only the requests already on the wire finish. The
+    stub answers are held by an event, so the six in-flight POSTs sit
+    on the wire while the last two orders queue for their slots; the
+    stop is accepted while they do. After the release the six answer
+    201, and the two still queued never send - their lines say
+    cancelled (review round 5, item 4). The coordination is explicit:
+    bounded polls on the transport and the dispatch counters, never a
+    fixed count of sleep turns (review round 6, item 3)."""
+    release = asyncio.Event()
+
+    async def held_app(scope, receive, send):
+        await release.wait()
+        await make_stub_app()(scope, receive, send)
+
+    transport = CountingTransport(httpx.ASGITransport(app=held_app))
+    orders = sample_orders(6)  # eight orders
     pb = make_playback(orders, tmp_path, inflight=6, speed=1e9, transport=transport)
+
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="drain")
-    # enough turns that every request that gets a slot reaches the wire
-    await settle(20)
-    assert pb.status()["inflight"] > 0
-    await pb.stop()
+    # every order is dispatched; the six slots are held on the wire,
+    # the two extra orders queue behind them
+    await until(lambda: pb.status()["orders_sent"] == len(orders) and len(transport.entries) == 6)
+    stopper = asyncio.create_task(pb.stop())
+    await until(lambda: pb.status()["state"] == "stopping")
+    release.set()
+    await asyncio.wait_for(stopper, 10)
+
     # everything dispatched has its line: the six that were already on
     # the wire were answered 201, and the two still queued for a slot
-    # when the stop was accepted never sent - their lines say cancelled
-    # (review round 5, item 4)
+    # when the stop was accepted never sent
     lines = run_log_lines(tmp_path, pb)
     assert len(lines) == pb.status()["orders_sent"]
     on_wire = [line for line in lines if "http_status" in line]

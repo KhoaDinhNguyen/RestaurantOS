@@ -605,22 +605,29 @@ def test_config_decides_the_region_routing(tmp_path, monkeypatch, capsys, fresh_
 def test_vendors_csv_is_read_once_by_a_playback_start(
     tmp_path, monkeypatch, capsys, fresh_settings
 ):
-    """Review round 3, item 11, now measured through the CLI itself
-    (review round 5, item 6): the cache is built first, then the open
-    counter, then a playback start with the fake server and engine -
-    and vendors.csv is opened exactly once during the start. The map
-    still equals bootstrap's own derivation."""
+    """Review round 3, item 11, measured through the CLI itself (review
+    round 5, item 6), now on the per-region path (review round 6,
+    item 4): the cache is built first, then the open counter, then a
+    playback start that routes per region - and vendors.csv is opened
+    exactly once during the start. The map FakePlayback received is
+    bootstrap's own map."""
     orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
-    data = _make_data_with_vendors(
-        tmp_path,
-        orders,
-        [["1", "p1", 1]],
-        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\nv2,,w21z7,x\nv3,,w21z6,y\n",
+    vendors_csv = (
+        "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\nv2,,w21z7,x\nv3,,w21z6,y\n"
     )
+    data = _make_data_with_vendors(tmp_path, orders, [["1", "p1", 1]], vendors_csv)
     captured: dict = {}
     _install_fake_start(monkeypatch, captured)
     monkeypatch.setenv("ROS_DATA_DIR", str(data))
+    monkeypatch.setenv("ROS_SIM_STOCK_WARM_UP_DAYS", "14")
     monkeypatch.chdir(tmp_path)
+    # per-region startup: load_cluster is stubbed with the two-region
+    # fixture, and no --kitchen-target is given
+    import restaurantos.sim.playback_cli as playback_cli
+    from restaurantos.common.cluster import Cluster
+
+    cluster = Cluster(regions=2)
+    monkeypatch.setattr(playback_cli, "load_cluster", lambda _path: cluster)
 
     # the counter goes on after the cache is built: only the start's
     # own reads are counted
@@ -633,34 +640,22 @@ def test_vendors_csv_is_read_once_by_a_playback_start(
         return real_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", counting_open)
-    rc = app(
-        [
-            "playback",
-            "start",
-            "--from-day",
-            "14",
-            "--to-day",
-            "14",
-            "--kitchen-target",
-            "http://127.0.0.1:8900/api/v1",
-            "--port",
-            "1",
-        ]
-    )
+    rc = app(["playback", "start", "--from-day", "14", "--to-day", "14", "--port", "1"])
     assert rc == 0
     assert len(opens) == 1
 
-    # and the map still equals bootstrap's own derivation
-    from restaurantos.common.cluster import Cluster
-    from restaurantos.sim.playback_cli import restock_vendors, vendor_region_map
-    from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_counts
+    # the map the engine received is bootstrap's own map: the same
+    # checked rows, sharded the same way
+    from restaurantos.sim.playback_cli import restock_vendors
+    from restaurantos.sim.shard import assign_shards, vendor_counts
 
-    pairs = restock_vendors(data)
-    counts = counts_by_cell(pairs)
-    cluster = Cluster(regions=2)
-    regions = vendor_region_map(pairs, counts, cluster)
     cell_region = dict(assign_shards(vendor_counts(data), cluster.region_ids))
-    assert regions == {vendor: cell_region[geohash] for vendor, geohash in pairs}
+    expected = {vendor: cell_region[geohash] for vendor, geohash in restock_vendors(data)}
+    # both regions of the two-region fixture carry vendors, so the
+    # start really routed per region
+    assert set(expected.values()) == {"r1", "r2"}
+    assert captured["vendor_regions"] == expected
+    assert set(captured["kitchen_urls"]) == {"r1", "r2"}
 
 
 def test_an_empty_vendors_csv_is_a_value_error_naming_the_file(tmp_path):

@@ -12,13 +12,14 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 import pytest
-from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle
+from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle, until
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -2002,6 +2003,7 @@ async def test_a_slow_answer_is_retried_and_then_failed(tmp_path: Path) -> None:
     status = pb.status()
     assert status["restocks_sent"] == 1
     assert status["restocks_acked"] == 0
+    assert status["restocks_failed"] == 1
     line = next(line for line in run_log_lines(tmp_path, pb) if line["kind"] == "restock")
     assert line["attempts"] == 3
     assert line["error"] == "Timeout"
@@ -2047,29 +2049,97 @@ async def test_a_queued_request_never_sends_after_a_stop(tmp_path: Path) -> None
             break
     assert pb.status()["orders_sent"] == 4
 
+    # the stop is accepted while the first order still holds the slot
+    # and the other three sit queued (review round 6, item 3: bounded
+    # polls, not fixed sleep counts); then the held answer is released
+    # before the bounded drain expires
     stopper = asyncio.create_task(pb.stop())
-    # real time for the bounded drain, fake advances for the wakeups
-    for _ in range(500):
-        await asyncio.sleep(0.02)
-        await clock.advance(clock.now() + 0.05)
-        await settle()
-        if stopper.done():
-            break
+    await until(lambda: pb.status()["state"] == "stopping")
+    transport.release.set()
     await asyncio.wait_for(stopper, 5)
 
-    # only the held order ever reached the transport
+    # only the held order ever reached the transport, and it got its
+    # answer through
     assert len(transport.paths) == 1
     assert transport.paths[0].endswith("/orders")
     status = pb.status()
     assert status["state"] == "stopped"
-    assert status["orders_failed"] == 4
+    assert status["orders_acked"] == 1
+    assert status["orders_failed"] == 3
     lines = run_log_lines(tmp_path, pb)
     # dense: one line per dispatched item, all four orders
     assert len(lines) == 4
-    assert all(line["kind"] == "order" for line in lines)
-    for line in lines:
-        assert line["error"] == "cancelled"
+    acked = [line for line in lines if "http_status" in line]
+    cancelled = [line for line in lines if line.get("error") == "cancelled"]
+    # the held request got its 201; the three queued requests were
+    # cancelled on slot acquisition - the check after taking the slot,
+    # which is what the test is named for - and never reached the
+    # transport
+    assert len(acked) == 1
+    assert acked[0]["http_status"] == 201
+    assert len(cancelled) == 3
+    for line in cancelled:
         assert "http_status" not in line
+
+
+class StopInTheYieldTransport(httpx.AsyncBaseTransport):
+    """Stops the run from inside the send task, so the stop is
+    accepted while the dispatcher sits in the yield after the last
+    dispatch: FakeWallClock.advance runs without yielding, and stop()
+    runs its whole synchronous prefix - the state change and the
+    freeze - before its first await, so the dispatcher sees STOPPING
+    the moment it wakes."""
+
+    def __init__(self) -> None:
+        self.inner = httpx.ASGITransport(app=make_stub_app())
+        self.release = asyncio.Event()
+        self.advance: Callable[[], Awaitable[None]] | None = None  # the test's clock step
+        self.stop: Callable[[], Awaitable[None]] | None = None  # playback.stop, wired later
+        self.paths: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.paths.append(request.url.path)
+        # the stop's moment must differ from the item's instant: move
+        # the simulated clock a known 30 seconds forward first
+        await self.advance()
+        await self.stop()
+        await self.release.wait()
+        return await self.inner.handle_async_request(request)
+
+
+async def test_a_stop_during_the_yield_after_the_last_dispatch_is_not_a_normal_end(
+    tmp_path: Path,
+) -> None:
+    """Review round 6, item 2b: a stop accepted during the yield after
+    the last dispatch must not be overwritten by the normal-end freeze.
+    The clock keeps the moment the stop was accepted - not the last
+    item's instant - and the run ends stopped."""
+    clock = FakeWallClock()
+    transport = StopInTheYieldTransport()
+    orders = [make_order(14, 0, 0, 0, "1001")]  # midnight: the item's instant is 00:00:00
+    pb = make_playback(orders, tmp_path, clock=clock, transport=transport, drain_timeout_s=0.3)
+
+    async def advance30() -> None:
+        # +0.03 fake seconds at 1000x = 30 simulated seconds
+        await clock.advance(clock.now() + 0.03)
+
+    transport.advance = advance30
+    transport.stop = pb.stop
+
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1000.0, run_id="stop-in-yield")
+    try:
+        # the order dispatches at midnight, reaches the wire, and the
+        # stop is accepted from inside the send task
+        await until(lambda: pb.status()["state"] == "stopping")
+    finally:
+        transport.release.set()
+        await asyncio.wait_for(pb.wait_done(), 5)
+    assert pb.status()["state"] == "stopped"
+    # the clock shows the stop's moment, not the item's instant: the
+    # normal-end seek never ran
+    final = pb.clock()
+    assert final["sim_day"] == 14
+    assert final["sim_time"] == "00:00:30"
 
 
 async def test_a_new_restock_batch_waits_for_the_earlier_batch(tmp_path: Path) -> None:

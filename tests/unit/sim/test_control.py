@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle
+from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle, until
 
 
 @pytest.fixture
@@ -455,25 +455,28 @@ async def test_the_normal_end_clock_is_exact_at_1000x(tmp_path: Path):
         await client.post(
             "/sim/playback", json={"action": "start", "from_day": 14, "speed": 1000.0}
         )
-        # 1 ms steps, each worth a simulated second at 1000x: reaching
-        # +25 minutes takes about 1.5 s of wall, so the loop has room;
-        # the wake overshoot can be seconds past the deadline, and the
-        # freeze must still land exactly on it
-        for _ in range(2500):
-            if pb.status()["events_sent"] == 4:
-                break
-            await clock.advance(clock.now() + 0.001)
-            await settle()
-        await settle(10)
-        assert pb.status()["state"] == "running"
-        at_end = (await client.get("/sim/clock")).json()
-        assert at_end["sim_day"] == 14
-        assert at_end["sim_time"] == "00:25:00"
         try:
-            transport.release.set()
-            await asyncio.wait_for(pb.wait_done(), 5)
+            # 1 ms steps, each worth a simulated second at 1000x.
+            # Advance to a known instant two simulated seconds past
+            # the final deadline (midnight + 25 min): by then the
+            # dispatch loop has been through whatever wake latency it
+            # has, and the freeze must still land exactly on the
+            # deadline (review round 6, item 4)
+            deadline_at = clock.now() + (25 * 60 + 2) / 1000
+            while clock.now() < deadline_at:
+                await clock.advance(clock.now() + 0.001)
+                await settle()
+            assert pb.status()["events_sent"] == 4
+            assert pb.status()["state"] == "running"  # waiting for the held event
+            # picked_up reached the held transport, so the last item
+            # did dispatch and the freeze has run
+            assert ("picked_up", hold) in transport.wire
+            at_end = (await client.get("/sim/clock")).json()
+            assert at_end["sim_day"] == 14
+            assert at_end["sim_time"] == "00:25:00"
         finally:
             transport.release.set()
+            await asyncio.wait_for(pb.wait_done(), 5)
         assert pb.status()["state"] == "done"
     final = pb.clock()
     assert final["sim_time"] == "00:25:00"
@@ -507,38 +510,69 @@ async def test_only_stop_is_accepted_once_dispatch_has_ended(tmp_path: Path):
                 break
             await clock.advance(clock.now() + 0.005)
             await settle()
-        await settle(10)
-        assert pb.status()["state"] == "running"  # sitting in the final wait
-
-        # pause, resume and a speed change are all refused, with the
-        # message naming the state
-        for body in ({"action": "pause"}, {"action": "resume"}):
-            answer = await client.post("/sim/playback", json=body)
-            assert answer.status_code == 409, answer.text
-            assert answer.json()["error"] == "invalid_state"
-            assert answer.json()["message"] == "dispatch has finished; waiting for the last answers"
-        patched = await client.patch("/sim/playback", json={"speed": 200.0})
-        assert patched.status_code == 409, patched.text
-        assert patched.json()["error"] == "invalid_state"
-        assert patched.json()["message"] == "dispatch has finished; waiting for the last answers"
-        # the status still shows running, not some new state
-        assert (await client.get("/sim/playback")).json()["state"] == "running"
-
-        # the clock is frozen and stays frozen while the wait goes on
-        frozen = (await client.get("/sim/clock")).json()
-        await clock.advance(clock.now() + 5.0)
-        await settle()
-        assert (await client.get("/sim/clock")).json() == frozen
-
-        # stop still works and ends the run as stopped
-        stopped = await client.post("/sim/playback", json={"action": "stop"})
-        assert stopped.status_code == 200
         try:
-            transport.release.set()
-            await asyncio.wait_for(pb.wait_done(), 5)
+            await settle(10)
+            assert pb.status()["state"] == "running"  # sitting in the final wait
+
+            # pause, resume and a speed change are all refused, with the
+            # message naming the state
+            for body in ({"action": "pause"}, {"action": "resume"}):
+                answer = await client.post("/sim/playback", json=body)
+                assert answer.status_code == 409, answer.text
+                assert answer.json()["error"] == "invalid_state"
+                assert (
+                    answer.json()["message"]
+                    == "dispatch has finished; waiting for the last answers"
+                )
+            patched = await client.patch("/sim/playback", json={"speed": 200.0})
+            assert patched.status_code == 409, patched.text
+            assert patched.json()["error"] == "invalid_state"
+            assert (
+                patched.json()["message"] == "dispatch has finished; waiting for the last answers"
+            )
+            # the status still shows running, not some new state
+            assert (await client.get("/sim/playback")).json()["state"] == "running"
+
+            # the clock is frozen and stays frozen while the wait goes on
+            frozen = (await client.get("/sim/clock")).json()
+            await clock.advance(clock.now() + 5.0)
+            await settle()
+            assert (await client.get("/sim/clock")).json() == frozen
+
+            # stop still works: the POST runs as a task, the stop is
+            # accepted while the last answer is still held (review
+            # round 6, item 3), and it answers 200
+            stop_task = asyncio.create_task(client.post("/sim/playback", json={"action": "stop"}))
+            await until(lambda: pb.status()["state"] == "stopping")
+            stopped = await asyncio.wait_for(stop_task, 5)
+            assert stopped.status_code == 200
         finally:
             transport.release.set()
+            await asyncio.wait_for(pb.wait_done(), 5)
         assert pb.status()["state"] == "stopped"
+
+
+async def test_a_pause_after_the_run_answers_the_ordinary_state_message(tmp_path: Path):
+    """Review round 6, item 2a: the final-wait flag ends with the run.
+    After a run ends done, a pause answers 409 with the ordinary state
+    message - not with "dispatch has finished; waiting for the last
+    answers"."""
+    orders = [make_order(14, 0, 0, 0, "1001")]
+    pb = make_playback(orders, tmp_path)  # real wall clock, stub answers
+    from restaurantos.sim.control import make_control_app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        await client.post("/sim/playback", json={"action": "start", "from_day": 14, "to_day": 14})
+        await asyncio.wait_for(pb.wait_done(), 10)
+        assert pb.status()["state"] == "done"
+        paused = await client.post("/sim/playback", json={"action": "pause"})
+        assert paused.status_code == 409, paused.text
+        body = paused.json()
+        assert body["error"] == "invalid_state"
+        assert body["state"] == "done"
+        assert body["message"] == "cannot pause while the run is done"
 
 
 async def test_speed_change_before_to_day_zero(client, pb):
