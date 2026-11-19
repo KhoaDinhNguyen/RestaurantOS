@@ -430,6 +430,67 @@ async def test_the_clock_stays_at_the_last_dispatch_through_the_final_wait(tmp_p
     assert final["sim_time"] == at_end["sim_time"]
 
 
+async def test_only_stop_is_accepted_once_dispatch_has_ended(tmp_path: Path):
+    """Review round 5, item 1: once the dispatcher dispatched its last
+    item, the run only waits for the last answers - pause, resume and
+    a speed change are refused (a resume would restart the clock that
+    round 4 froze at the last item's instant), while stop still ends
+    the run and the status keeps showing running until it does."""
+    from conftest import settle
+    from test_playback_events import HoldingEvent, expected_event_id
+
+    hold = expected_event_id("1001", "picked_up")
+    transport = HoldingEvent(hold)
+    orders = [make_order(14, 0, 0, 1, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders, tmp_path, clock=clock, status_events=True, event_jitter_s=0.0, transport=transport
+    )
+    from restaurantos.sim.control import make_control_app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=make_control_app(pb)), base_url="http://control.test"
+    ) as client:
+        await client.post("/sim/playback", json={"action": "start", "from_day": 14, "speed": 100.0})
+        for _ in range(3500):
+            if pb.status()["events_sent"] == 4:
+                break
+            await clock.advance(clock.now() + 0.005)
+            await settle()
+        await settle(10)
+        assert pb.status()["state"] == "running"  # sitting in the final wait
+
+        # pause, resume and a speed change are all refused, with the
+        # message naming the state
+        for body in ({"action": "pause"}, {"action": "resume"}):
+            answer = await client.post("/sim/playback", json=body)
+            assert answer.status_code == 409, answer.text
+            assert answer.json()["error"] == "invalid_state"
+            assert answer.json()["message"] == "dispatch has finished; waiting for the last answers"
+        patched = await client.patch("/sim/playback", json={"speed": 200.0})
+        assert patched.status_code == 409, patched.text
+        assert patched.json()["error"] == "invalid_state"
+        assert patched.json()["message"] == "dispatch has finished; waiting for the last answers"
+        # the status still shows running, not some new state
+        assert (await client.get("/sim/playback")).json()["state"] == "running"
+
+        # the clock is frozen and stays frozen while the wait goes on
+        frozen = (await client.get("/sim/clock")).json()
+        await clock.advance(clock.now() + 5.0)
+        await settle()
+        assert (await client.get("/sim/clock")).json() == frozen
+
+        # stop still works and ends the run as stopped
+        stopped = await client.post("/sim/playback", json={"action": "stop"})
+        assert stopped.status_code == 200
+        try:
+            transport.release.set()
+            await asyncio.wait_for(pb.wait_done(), 5)
+        finally:
+            transport.release.set()
+        assert pb.status()["state"] == "stopped"
+
+
 async def test_speed_change_before_to_day_zero(client, pb):
     """A paused run can change speed: the anchor moves, the clock stays
     frozen, and simulated time never jumps when it resumes."""

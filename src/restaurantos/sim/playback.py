@@ -384,6 +384,11 @@ class Playback:
         # the restocks dispatched at the current instant: the barrier
         # waits for them before the day's first order goes out
         self._restock_tasks: set[asyncio.Task] = set()
+        # True while the final wait for the last answers runs (review
+        # round 5, item 1): the replay itself is over, so only stop is
+        # still accepted - a pause would leave nothing to pause, and a
+        # resume would restart the frozen clock
+        self._dispatch_ended = False
         # scheduled-but-not-yet-dispatched events and restocks:
         # (sim deadline, rank, tiebreak a, tiebreak b, kind, payload)
         self._heap: list[tuple] = []
@@ -442,6 +447,17 @@ class Playback:
     def _require(self, expected: frozenset[str], what: str) -> None:
         if self._state not in expected:
             raise StateError(f"cannot {what} while the run is {self._state}")
+
+    def _require_dispatch_live(self, what: str) -> None:
+        """Refuse a control while the final wait runs (review round 5,
+        item 1). Once the dispatcher dispatched its last item there is
+        nothing left to pause - every item is out, and the in-flight
+        sends cannot be held back - and a resume would call
+        simclock.start() on the clock round 4 froze at the last item's
+        instant, undoing the freeze. Stop stays available, and the
+        status keeps showing running until the run is done."""
+        if self._dispatch_ended:
+            raise StateError("dispatch has finished; waiting for the last answers")
 
     # --- controls ---------------------------------------------------------
 
@@ -604,11 +620,17 @@ class Playback:
         self._run_id = candidate
         self._client = client
         self._state = RUNNING
+        self._dispatch_ended = False
         self._simclock.start()
         self._task = asyncio.create_task(self._run(), name=f"playback-{self._run_id}")
         return self._run_id
 
     async def pause(self) -> None:
+        # the dispatch check comes first: in the final wait the state
+        # is still running, so the state check alone would let a pause
+        # through (and a resume's state error would name the wrong
+        # reason)
+        self._require_dispatch_live("pause")
         self._require(frozenset({RUNNING}), "pause")
         assert self._simclock is not None
         self._simclock.pause()
@@ -616,6 +638,7 @@ class Playback:
         self._wake.set()
 
     async def resume(self) -> None:
+        self._require_dispatch_live("resume")
         self._require(frozenset({PAUSED}), "resume")
         assert self._simclock is not None
         self._simclock.start()
@@ -624,6 +647,7 @@ class Playback:
 
     async def set_speed(self, speed: float) -> None:
         """Change speed mid-run; the SimClock re-anchors, time never jumps."""
+        self._require_dispatch_live("change speed")
         self._require(frozenset({RUNNING, PAUSED}), "change speed")
         assert self._simclock is not None
         self._simclock.set_speed(speed)
@@ -841,6 +865,13 @@ class Playback:
                 # item 3). A stop already froze the clock when it was
                 # accepted; a failure freezes below.
                 self._freeze_clock()
+                # From here on the run only waits for the last answers
+                # (review round 5, item 1): pause, resume and speed
+                # changes are refused - there is nothing left to pause,
+                # and a resume would restart the frozen clock - while
+                # stop stays available and the status keeps showing
+                # running until the run is done.
+                self._dispatch_ended = True
         except Exception as error:  # noqa: BLE001 - the run must not die silently
             # logging.exception carries the traceback; a handler that
             # cannot write reports that itself and never raises here
