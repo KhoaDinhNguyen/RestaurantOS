@@ -151,6 +151,37 @@ def test_traps_one_low_stock_counter(data):
     assert len(low) == 1
 
 
+def test_every_counter_covers_one_unit_of_each_product(data):
+    """The API-review floor rule, as a fixture invariant: one unit of a
+    product takes factor x multiplier from its counters, and no counter
+    may start below that, or the product could never be sold. (This is
+    why caramel starts at 6: p001 needs amount 3 x multiplier 2.)"""
+    stock = {
+        (row["vendor_id"], row["item_kind"], row["item_id"]): int(row["on_hand"])
+        for row in data["stock.csv"]
+    }
+    mode = {row["dish_id"]: row["stock_mode"] for row in data["dishes.csv"]}
+    recipe: dict[str, list[tuple[str, float]]] = {}
+    for row in data["dish_ingredients.csv"]:
+        recipe.setdefault(row["dish_id"], []).append((row["ingredient_id"], float(row["amount"])))
+
+    for link in data["product_dish.csv"]:
+        counters: list[tuple[str, str, float]] = []
+        if mode[link["dish_id"]] == "per_ingredient":
+            counters = [
+                ("ingredient", item, amount) for item, amount in recipe.get(link["dish_id"], ())
+            ]
+        elif mode[link["dish_id"]] == "per_item":
+            counters = [("dish", link["dish_id"], 1.0)]
+        for kind, item, factor in counters:
+            need = factor * float(link["multiplier"])
+            key = (link["vendor_id"], kind, item)
+            assert key in stock, f"no counter for {key}"
+            assert stock[key] >= need, (
+                f"{key} starts at {stock[key]} but one unit of {link['product_id']} needs {need}"
+            )
+
+
 def test_no_empty_fields_outside_the_two_nullable_columns(data):
     """Data dictionary rule 4: an empty field exists only in
     vendors.chain_id and dishes.dish_name, and means NULL. The loader

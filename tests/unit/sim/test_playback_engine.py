@@ -16,7 +16,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle
+from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle, until
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
@@ -175,10 +175,12 @@ class CountingTransport(httpx.AsyncBaseTransport):
         self.inner = inner
         self.active = 0
         self.max_active = 0
+        self.entries: list[str] = []  # every request that reached the wire
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         self.active += 1
         self.max_active = max(self.max_active, self.active)
+        self.entries.append(request.url.path)
         try:
             return await self.inner.handle_async_request(request)
         finally:
@@ -223,11 +225,14 @@ async def test_log_is_in_send_order_despite_reordered_acks(tmp_path: Path) -> No
 
 
 async def test_drain_timeout_records_every_dispatched_order(tmp_path: Path) -> None:
-    """A burst faster than the consumer: the drain timeout cancels
-    tasks still queued for a slot, and every dispatched order must
-    still get its log line - found by the real-data throughput probe,
-    which lost 460 lines before the record moved before the
-    semaphore."""
+    """A burst faster than the consumer. Before review round 2, item 3,
+    a run that ended normally had its still-queued sends cancelled at
+    the drain timeout (0.05 s here, against a 0.2 s stub) and lost them
+    as failures; now a normal end waits for every send it started, so
+    the burst is answered, not cancelled - while the one-line-per-
+    dispatched-order invariant (the throughput probe's lesson: 460
+    lines were lost before the record moved before the semaphore)
+    holds either way."""
     transport = CountingTransport(httpx.ASGITransport(app=make_stub_app(delay_seconds=0.2)))
     orders = sample_orders(6)
     pb = Playback(
@@ -235,7 +240,7 @@ async def test_drain_timeout_records_every_dispatched_order(tmp_path: Path) -> N
         target_url="http://stub.test/api/v1",
         inflight=1,
         http_timeout_s=5.0,
-        drain_timeout_s=0.05,  # nothing can finish in time
+        drain_timeout_s=0.05,  # nothing can finish within it
         runs_dir=tmp_path,
         transport=transport,
     )  # real wall clock: the stub's 0.2 s delay must actually elapse
@@ -246,23 +251,52 @@ async def test_drain_timeout_records_every_dispatched_order(tmp_path: Path) -> N
     lines = run_log_lines(tmp_path, pb)
     assert len(lines) == len(orders)  # one line per dispatched order
     assert [line["seq"] for line in lines] == list(range(len(orders)))
-    assert all(line["error"] == "cancelled" for line in lines)
-    assert pb.status()["orders_failed"] == len(orders)
+    # the run waited past its drain timeout for its own sends
+    assert all(line["http_status"] == 201 for line in lines)
+    assert pb.status()["orders_acked"] == len(orders)
+    assert pb.status()["orders_failed"] == 0
 
 
 async def test_stop_drains_in_flight_requests(tmp_path: Path) -> None:
-    transport = CountingTransport(httpx.ASGITransport(app=make_stub_app(delay_seconds=0.05)))
-    orders = sample_orders(6)
+    """A stop lets only the requests already on the wire finish. The
+    stub answers are held by an event, so the six in-flight POSTs sit
+    on the wire while the last two orders queue for their slots; the
+    stop is accepted while they do. After the release the six answer
+    201, and the two still queued never send - their lines say
+    cancelled (review round 5, item 4). The coordination is explicit:
+    bounded polls on the transport and the dispatch counters, never a
+    fixed count of sleep turns (review round 6, item 3)."""
+    release = asyncio.Event()
+
+    async def held_app(scope, receive, send):
+        await release.wait()
+        await make_stub_app()(scope, receive, send)
+
+    transport = CountingTransport(httpx.ASGITransport(app=held_app))
+    orders = sample_orders(6)  # eight orders
     pb = make_playback(orders, tmp_path, inflight=6, speed=1e9, transport=transport)
+
     await pb.start(seed=0, from_day=14, to_day=14, speed=1e9, run_id="drain")
-    await settle()
-    assert pb.status()["inflight"] > 0
-    await pb.stop()
-    # everything already sent was answered and logged
+    # every order is dispatched; the six slots are held on the wire,
+    # the two extra orders queue behind them
+    await until(lambda: pb.status()["orders_sent"] == len(orders) and len(transport.entries) == 6)
+    stopper = asyncio.create_task(pb.stop())
+    await until(lambda: pb.status()["state"] == "stopping")
+    release.set()
+    await asyncio.wait_for(stopper, 10)
+
+    # everything dispatched has its line: the six that were already on
+    # the wire were answered 201, and the two still queued for a slot
+    # when the stop was accepted never sent
     lines = run_log_lines(tmp_path, pb)
     assert len(lines) == pb.status()["orders_sent"]
-    assert all(line["http_status"] == 201 for line in lines)
-    assert pb.status()["orders_acked"] == len(lines)
+    on_wire = [line for line in lines if "http_status" in line]
+    queued = [line for line in lines if line.get("error") == "cancelled"]
+    assert len(on_wire) == 6
+    assert all(line["http_status"] == 201 for line in on_wire)
+    assert len(queued) == 2
+    assert pb.status()["orders_acked"] == 6
+    assert pb.status()["orders_failed"] == 2
 
 
 # --- what gets logged -------------------------------------------------------
@@ -415,7 +449,8 @@ def test_runlog_writes_in_sequence_order(tmp_path: Path) -> None:
 
 def test_runlog_close_marks_only_the_missing_sends(tmp_path: Path) -> None:
     """A gap gets a placeholder line; the records that did complete are
-    written unchanged, not relabelled as missing (review A3)."""
+    written unchanged, not relabelled as missing (review A3). The
+    placeholder carries a kind like every other line (review item 10)."""
     log = RunLog(tmp_path / "orders.jsonl")
     log.add(0, {"seq": 0, "http_status": 201})
     log.add(2, {"seq": 2, "http_status": 201})
@@ -423,6 +458,7 @@ def test_runlog_close_marks_only_the_missing_sends(tmp_path: Path) -> None:
     lines = [json.loads(line) for line in (tmp_path / "orders.jsonl").read_text().splitlines()]
     assert [line["seq"] for line in lines] == [0, 1, 2]
     assert lines[0]["http_status"] == 201 and "error" not in lines[0]
+    assert lines[1]["kind"] == "missing"
     assert lines[1]["error"] == "missing: the send task produced no result"
     assert lines[2]["http_status"] == 201 and "error" not in lines[2]
 

@@ -11,18 +11,58 @@ a real boundary.
 
 from __future__ import annotations
 
-import csv
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 
+from restaurantos.sim.loading import REFERENCE_COLUMNS, read_rows
 
-def vendor_counts(data_dir: Path, *, column: str = "geohash") -> dict[str, int]:
-    """Cell name → number of vendors whose home cell it is."""
+
+def counts_by_cell(pairs: Iterable[tuple[str, str]]) -> dict[str, int]:
+    """Cell name -> number of vendors whose home cell it is, from
+    (vendor_id, geohash) pairs. Both bootstrap (through vendor_counts)
+    and playback count through this one function, so the two cannot
+    drift apart (review round 3, item 11)."""
     counts: dict[str, int] = {}
-    with (data_dir / "vendors.csv").open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            counts[row[column]] = counts.get(row[column], 0) + 1
+    for _vendor, cell in pairs:
+        counts[cell] = counts.get(cell, 0) + 1
     return counts
+
+
+def vendor_pairs(rows: Iterable[list[str]]) -> list[tuple[str, str]]:
+    """(vendor_id, geohash) from vendors.csv rows, each row checked
+    (review round 4, item 7): a wrong value count first, then an empty
+    vendor_id, each a ValueError with its own message and the line
+    number (the header is line 1). Both playback's restock list and
+    bootstrap's vendor_counts go through here, so the two paths give
+    the same errors."""
+    columns = REFERENCE_COLUMNS["vendors.csv"]
+    geohash_column = columns.index("geohash")
+    pairs: list[tuple[str, str]] = []
+    for number, row in enumerate(rows, start=2):  # the header is line 1
+        if len(row) != len(columns):
+            raise ValueError(
+                f"vendors.csv line {number}: expected {len(columns)} values, got {len(row)}"
+            )
+        if not row[0]:
+            raise ValueError(f"vendors.csv line {number}: empty vendor_id")
+        pairs.append((row[0], row[geohash_column]))
+    return pairs
+
+
+def vendor_counts(data_dir: Path) -> dict[str, int]:
+    """Cell name -> number of vendors whose home cell it is:
+    bootstrap's own read of vendors.csv, through the same checked
+    `vendor_pairs` the playback side uses (review round 4, item 7).
+    A broken header is a ValueError naming the file, like every other
+    data error, not a RuntimeError escaping the CLI; any other
+    RuntimeError passes through unchanged."""
+    try:
+        rows = list(read_rows(data_dir / "vendors.csv", REFERENCE_COLUMNS["vendors.csv"]))
+    except RuntimeError as error:
+        if "header is" in str(error):
+            raise ValueError(str(error)) from None
+        raise
+    return counts_by_cell(vendor_pairs(rows))
 
 
 def assign_shards(counts: dict[str, int], regions: Sequence[str]) -> list[tuple[str, str]]:

@@ -56,6 +56,13 @@ def app(argv: Sequence[str] | None = None) -> int:
         help="run a replay in the foreground and serve its /sim control routes",
     )
     pstart.add_argument(
+        "--config",
+        type=Path,
+        default=Path("infra/cluster.toml"),
+        help="cluster description to route kitchen calls with - use the "
+        "file bootstrap ran with (default: infra/cluster.toml)",
+    )
+    pstart.add_argument(
         "--speed",
         type=float,
         default=None,
@@ -82,10 +89,39 @@ def app(argv: Sequence[str] | None = None) -> int:
         help="API base to POST orders to (default ROS_SIM_PLAYBACK_TARGET_URL)",
     )
     pstart.add_argument(
+        "--kitchen-target",
+        type=str,
+        default=None,
+        help="send every status event and restock to this one API base "
+        "instead of each region's own edge - required for stub runs "
+        "(pass the stub's URL); default: the per-region edge APIs",
+    )
+    pstart.add_argument(
         "--inflight",
         type=int,
         default=None,
         help="requests kept in flight at once (default ROS_SIM_PLAYBACK_INFLIGHT)",
+    )
+    pstart.add_argument(
+        "--events",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="send each accepted order its four status events "
+        "(default ROS_SIM_PLAYBACK_STATUS_EVENTS, on)",
+    )
+    pstart.add_argument(
+        "--event-sample-rate",
+        type=float,
+        default=None,
+        help="share of orders that get their full event set, 0 to 1 "
+        "(default ROS_SIM_PLAYBACK_EVENT_SAMPLE_RATE)",
+    )
+    pstart.add_argument(
+        "--restock-days",
+        type=int,
+        default=None,
+        help="restock every R days at 00:00:00 of days W+R, W+2R, ... "
+        "(default ROS_SIM_STOCK_RESTOCK_DAYS)",
     )
     pstart.add_argument(
         "--port",

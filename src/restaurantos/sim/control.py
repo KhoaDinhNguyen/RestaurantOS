@@ -15,12 +15,21 @@ port. WP6b will resolve it; the port is a setting either way.
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from restaurantos.sim.playback import Playback, StateError
+
+# The control process's diagnostics go through logging, not a bare
+# print to stderr (review round 3, item 9): the CLI process installs
+# the stderr handler, and a handler that cannot write - a closed pipe
+# - reports the problem itself instead of raising into a route that
+# has already succeeded.
+_LOGGER = logging.getLogger("restaurantos.sim.playback")
 
 
 class PlaybackCommand(BaseModel):
@@ -28,7 +37,7 @@ class PlaybackCommand(BaseModel):
     to_day, speed, seed, ...}` body (speed here is the run's initial
     speed; `PATCH /sim/playback` is the mid-run speed change)."""
 
-    action: str
+    action: Literal["start", "pause", "resume", "stop"]
     from_day: int | None = Field(default=None, ge=0)
     to_day: int | None = Field(default=None, ge=0)
     speed: float | None = Field(default=None, gt=0)
@@ -44,8 +53,19 @@ class PlaybackSpeed(BaseModel):
 def make_control_app(playback: Playback) -> FastAPI:
     app = FastAPI(title="RestaurantOS playback control", docs_url="/docs")
 
-    def _state_error(error: StateError) -> None:
-        raise HTTPException(status_code=409, detail=str(error)) from error
+    @app.exception_handler(StateError)
+    async def _invalid_state(request: Request, error: StateError) -> JSONResponse:
+        """The project's error body, on both routes that can raise it:
+        409 with what the run is in and what it refuses to do. The CLI
+        prints `message`."""
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "invalid_state",
+                "state": playback.state,
+                "message": str(error),
+            },
+        )
 
     @app.get("/sim/clock")
     async def sim_clock() -> dict[str, Any]:
@@ -71,30 +91,40 @@ def make_control_app(playback: Playback) -> FastAPI:
                     speed=command.speed or playback.default_speed,
                     run_id=command.run_id,
                 )
+                status = playback.status()
+                if (
+                    command.to_day is not None
+                    and status["to_day"] is not None
+                    and command.to_day > status["to_day"]
+                ):
+                    # the window check shortened to_day to the last day
+                    # the data holds; the answer already shows the
+                    # effective day, so say so through the logger (the
+                    # CLI process prints it to stderr)
+                    _LOGGER.warning(
+                        f"playback start: data only goes to day {status['to_day']}; "
+                        f"running to day {status['to_day']} instead of {command.to_day}"
+                    )
             elif command.action == "pause":
                 await playback.pause()
             elif command.action == "resume":
                 await playback.resume()
             elif command.action == "stop":
                 await playback.stop()
-            else:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"unknown action {command.action!r}; "
-                    "expected start, pause, resume or stop",
-                )
-        except StateError as error:
-            _state_error(error)
+        except StateError:
+            # StateError subclasses ValueError; left here it would be
+            # swallowed by the 422 below. It goes to the app's handler:
+            # the project's 409 body, not FastAPI's {"detail": ...}
+            raise
         except ValueError as error:
+            # a bad window or a bad run id: 422 with the message, like
+            # the gateway's validation answers
             raise HTTPException(status_code=422, detail=str(error)) from error
         return playback.status()
 
     @app.patch("/sim/playback")
     async def sim_playback_speed(change: PlaybackSpeed) -> dict[str, Any]:
-        try:
-            await playback.set_speed(change.speed)
-        except StateError as error:
-            _state_error(error)
+        await playback.set_speed(change.speed)
         return playback.status()
 
     return app

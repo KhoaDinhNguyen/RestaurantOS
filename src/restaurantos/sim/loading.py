@@ -125,14 +125,20 @@ def table_of(file_name: str) -> str:
     return file_name.removesuffix(".csv")
 
 
+def check_header(file_name: str, header: list[str], columns: tuple[str, ...]) -> None:
+    """One header check, shared by every CSV reading path (review
+    round 3, item 11): a changed column order fails loudly, not
+    subtly - file readers and in-memory parsers alike."""
+    if tuple(header) != columns:
+        raise RuntimeError(f"{file_name}: header is {header}, expected {list(columns)}")
+
+
 def read_rows(path: Path, columns: tuple[str, ...]) -> Iterator[list[str]]:
     """Rows of one CSV as text tuples, its header checked against
     `columns` so a changed column order fails loudly, not subtly."""
     with path.open(newline="", encoding="utf-8") as f:
         reader = csv.reader(f)
-        header = next(reader)
-        if tuple(header) != columns:
-            raise RuntimeError(f"{path.name}: header is {header}, expected {list(columns)}")
+        check_header(path.name, next(reader), columns)
         yield from reader
 
 

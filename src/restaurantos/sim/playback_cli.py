@@ -17,6 +17,8 @@ import argparse
 import asyncio
 import contextlib
 import json
+import logging
+import math
 import signal
 import sys
 from collections.abc import Iterator
@@ -25,17 +27,20 @@ from typing import Any
 
 import httpx
 
+from restaurantos.common.cluster import Cluster, load_cluster, service_port
 from restaurantos.common.config import get_settings
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.config import SimSettings, get_sim_settings
-from restaurantos.sim.playback import Playback, StateError
+from restaurantos.sim.playback import Playback, StateError, restock_days
 from restaurantos.sim.replaydata import (
     CacheMeta,
     ensure_cache,
     iter_orders,
+    manifest_rows,
     require_window,
     to_order_request,
 )
+from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_pairs
 
 
 def _orders_fn(cache_file: Path):
@@ -48,7 +53,78 @@ def _orders_fn(cache_file: Path):
     return make
 
 
+def restock_vendors(data_dir: Path) -> list[tuple[str, str]]:
+    """(vendor_id, geohash) for every vendor, sorted: restock order must
+    not depend on the CSV's row order, and the geohash routes each
+    restock to its vendor's region.
+
+    One read, checked (review round 3, item 11): the file's sha256
+    against its MANIFEST.csv entry and the header, then the rows
+    parsed from those same bytes - the cell counts and the region map
+    both build from what this returns, so nothing is derived from a
+    second, unchecked read. The row checks (value count first, then
+    the empty vendor_id, each with its own message and the line
+    number) are `shard.vendor_pairs`, shared with bootstrap's
+    `vendor_counts` (review round 4, item 7), so the two paths give
+    the same errors."""
+    pairs = vendor_pairs(manifest_rows(data_dir, "vendors.csv"))
+    return sorted(pairs)
+
+
+def vendor_region_map(
+    pairs: list[tuple[str, str]], counts: dict[str, int], cluster: Cluster
+) -> dict[str, str]:
+    """vendor -> its region, built exactly the way bootstrap shards it:
+    the same `assign_shards` walk over `cluster.region_ids`, then each
+    vendor's geohash looked up in the result. `counts` is the
+    vendors-per-cell count of these same pairs (`shard.counts_by_cell`),
+    so the map cannot drift from bootstrap's sharding. Deterministic,
+    and no HQ call at run start."""
+    cell_region = dict(assign_shards(counts, cluster.region_ids))
+    return {vendor: cell_region[geohash] for vendor, geohash in pairs}
+
+
+def kitchen_urls(cluster: Cluster, edge_host: str) -> dict[str, str]:
+    """region -> its own edge API base: the edge of `region` listens on
+    8010 + n (`common.cluster.service_port`), and the kitchen is on the
+    region side (architecture 7.2)."""
+    return {
+        rid: f"http://{edge_host}:{service_port(cluster, f'edge-{rid}')}/api/v1"
+        for rid in cluster.region_ids
+    }
+
+
 async def start_command(args: argparse.Namespace) -> int:
+    # The run's diagnostics (the shortening warning, a failed run) go
+    # through the restaurantos.sim.playback logger; give it a plain
+    # stderr handler here so the operator sees the same text as before
+    # (review round 3, item 9). The `rosctl ...` lines this command
+    # prints itself stay print: they are the command's own output, not
+    # diagnostics of the running process.
+    _stderr_handler = logging.StreamHandler(sys.stderr)
+    _stderr_handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+    _logger = logging.getLogger("restaurantos.sim.playback")
+    _logger.addHandler(_stderr_handler)
+    # removed on every exit after the install, the early returns
+    # included (review round 4, item 5): two starts in one process
+    # must never stack handlers
+    try:
+        return await _run_start(args)
+    finally:
+        _logger.removeHandler(_stderr_handler)
+
+
+async def _run_start(args: argparse.Namespace) -> int:
+    # The CLI override skips SimSettings validation, so it is checked
+    # here, before anything is built: a NaN or a share outside [0, 1]
+    # would otherwise silently drop or keep every event (review item 6).
+    rate_arg = args.event_sample_rate
+    if rate_arg is not None and not (math.isfinite(rate_arg) and 0.0 <= rate_arg <= 1.0):
+        print(
+            f"rosctl playback start: --event-sample-rate {rate_arg} must be a number in [0, 1]",
+            file=sys.stderr,
+        )
+        return 1
     common = get_settings()
     sim = get_sim_settings()
     data_dir = common.data_dir
@@ -58,14 +134,55 @@ async def start_command(args: argparse.Namespace) -> int:
     )
     to_day = args.to_day
     try:
-        require_window(meta, from_day, to_day)
+        window = require_window(meta, from_day, to_day)
     except ValueError as error:
         print(f"rosctl playback start: {error}", file=sys.stderr)
         return 1
+    if window.shortened_from is not None:
+        # before the banner: the run that follows is not the one asked for
+        print(
+            f"rosctl playback start: data only goes to day {meta.last_day}; "
+            f"running to day {meta.last_day} instead of {window.shortened_from}",
+            file=sys.stderr,
+        )
 
     speed = args.speed or sim.playback_speed
     inflight = args.inflight or sim.playback_inflight
     target = args.target or sim.playback_target_url
+    events_on = sim.playback_status_events if args.events is None else args.events
+    event_rate = (
+        args.event_sample_rate
+        if args.event_sample_rate is not None
+        else sim.playback_event_sample_rate
+    )
+    restock_every = args.restock_days if args.restock_days is not None else sim.stock_restock_days
+    try:
+        # the banner's days come from the effective window, so a
+        # shortened to_day never announces restocks outside the data
+        banner_days = restock_days(meta.warm_up_days, restock_every, window.from_day, window.to_day)
+        pairs = restock_vendors(data_dir)
+        vendors = [vendor for vendor, _geohash in pairs]
+        # the region map shards these same rows, not a second read
+        cell_counts = counts_by_cell(pairs)
+        # kitchen routing: resolve the override first - a stub run
+        # sends every kitchen call to the one URL and never reads a
+        # cluster file, so it does not need one. Only a run routing
+        # per region loads the cluster (the file bootstrap ran with,
+        # so the region count and the edge ports match the shards) and
+        # builds the vendor -> region map the way bootstrap shards it.
+        kitchen_override = (args.kitchen_target or "").rstrip("/") or None
+        cluster_path: Path | None = None
+        if kitchen_override is not None:
+            vendor_regions = {}
+            edges = None
+        else:
+            cluster_path = args.config
+            cluster = load_cluster(cluster_path)
+            vendor_regions = vendor_region_map(pairs, cell_counts, cluster)
+            edges = kitchen_urls(cluster, sim.playback_edge_host)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"rosctl playback start: {error}", file=sys.stderr)
+        return 1
     playback = Playback(
         _orders_fn(data_dir / "cached" / "orders-sorted.jsonl"),
         target_url=target,
@@ -74,8 +191,27 @@ async def start_command(args: argparse.Namespace) -> int:
         drain_timeout_s=sim.playback_drain_timeout_s,
         runs_dir=Path("runs"),
         default_speed=sim.playback_speed,
-        # the window is refused, never clamped, for API starts as well
+        # the window is shortened, never refused, for API starts as
+        # well (a to_day past the data runs to the last cached day,
+        # and the engine records both days in meta.json)
         window_check=lambda f, t: require_window(meta, f, t),
+        status_events=events_on,
+        event_sample_rate=event_rate,
+        event_jitter_s=sim.playback_event_jitter_s,
+        # kitchen-call retries: a timeout, connection error or 5xx is
+        # retried with the same event id (review round 3, item 1)
+        kitchen_attempts=sim.playback_kitchen_attempts,
+        # the engine computes the restock days per run from its own
+        # window; the banner below prints the first run's count
+        restock_every=restock_every,
+        warm_up_days=meta.warm_up_days,
+        restock_vendors=vendors,
+        # kitchen-side routing (review round 2, item 6): events and
+        # restocks go to the region's own edge API - the override URL is
+        # how a stub run keeps them on the one stub process
+        kitchen_url=kitchen_override,
+        kitchen_urls=None if kitchen_override is not None else edges,
+        vendor_regions=vendor_regions,
     )
 
     from restaurantos.sim.control import make_control_app
@@ -105,25 +241,36 @@ async def start_command(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        # the original to_day goes to the engine: it records it as
+        # to_day_requested in meta.json and its window check does the
+        # same shortening this command already reported
+        meta_extra: dict[str, Any] = {
+            "cache": {
+                "orders_sha256": meta.orders_sha256,
+                "warm_up_days": meta.warm_up_days,
+                "cached_orders": meta.orders,
+            },
+            "argv": sys.argv[1:],
+        }
+        if cluster_path is not None:
+            # routing per region: which cluster file decided the edges
+            meta_extra["cluster"] = {"config": str(cluster_path)}
         await playback.start(
             seed=args.seed,
             from_day=from_day,
             to_day=to_day,
             speed=speed,
             run_id=args.run_id,
-            meta_extra={
-                "cache": {
-                    "orders_sha256": meta.orders_sha256,
-                    "warm_up_days": meta.warm_up_days,
-                    "cached_orders": meta.orders,
-                },
-                "argv": sys.argv[1:],
-            },
+            meta_extra=meta_extra,
         )
+        events_note = "on" if events_on else "off"
+        if events_on and event_rate < 1.0:
+            events_note += f" (sample rate {event_rate})"
         print(
             f"run {playback.status()['run_id']} started: {from_day} -> "
-            f"{to_day if to_day is not None else meta.last_day}, speed {speed}x, "
-            f"{inflight} in flight, control on {sim.control_host}:"
+            f"{window.to_day}, speed {speed}x, "
+            f"{inflight} in flight, events {events_note}, restock on "
+            f"{len(banner_days)} day(s) x {len(vendors)} vendors, control on {sim.control_host}:"
             f"{args.port or sim.control_port}",
             file=sys.stderr,
         )
@@ -151,6 +298,16 @@ async def start_command(args: argparse.Namespace) -> int:
         "run {run_id} {state}: {orders_sent} sent, {orders_acked} acked, "
         "{orders_parked} parked, {orders_refused} refused, {orders_failed} failed; "
         "log: runs/{run_id}/orders.jsonl".format(**status)
+    )
+    # the kitchen results too (review round 3, item 6): the operator
+    # should not have to open the log to see how events and restocks
+    # ended
+    print(
+        "events: {events_sent} sent, {events_acked} acked, {events_duplicate} duplicate, "
+        "{events_conflicted} conflicted, {events_failed} failed, {events_skipped} skipped; "
+        "restocks: {restocks_sent} sent, {restocks_acked} acked, {restocks_failed} failed".format(
+            **status
+        )
     )
     return 0 if status["state"] in ("done", "stopped") else 1
 
@@ -192,7 +349,14 @@ async def control_command(args: argparse.Namespace, *, method: str, body: dict[s
         print(f"rosctl playback {command}: {error}", file=sys.stderr)
         return 1
     if response.status_code == 409:
-        print(f"rosctl playback {command}: {response.json()['detail']}", file=sys.stderr)
+        # the control plane's project error body carries `message`
+        # ({"error": "invalid_state", "state": ..., "message": ...});
+        # fall back to detail for any other 409 shape
+        body = response.json()
+        print(
+            f"rosctl playback {command}: {body.get('message') or body.get('detail')}",
+            file=sys.stderr,
+        )
         return 1
     if response.status_code >= 400:
         print(f"rosctl playback {command}: {response.text}", file=sys.stderr)

@@ -7,6 +7,7 @@ import io
 from pathlib import Path
 
 import pytest
+from conftest import make_playback, sample_orders
 from pydantic import ValidationError
 
 from restaurantos.sim.config import SimSettings
@@ -35,6 +36,62 @@ def test_negative_cover_days_is_rejected():
 def test_negative_floor_is_rejected():
     with pytest.raises(ValidationError):
         SimSettings(stock_floor=-1)
+
+
+def test_zero_restock_interval_is_rejected():
+    # R = 0 would mean "restock continuously", which is not a replay
+    with pytest.raises(ValidationError):
+        SimSettings(stock_restock_days=0)
+
+
+# ---- playback event settings -------------------------------------------------
+
+
+def test_event_defaults_are_on_for_every_accepted_order(monkeypatch):
+    """Review round 2, item 10: the defaults must not read the real
+    environment or .env - a stray variable on a dev machine must not
+    decide what a fresh checkout does."""
+    for name in (
+        "ROS_SIM_PLAYBACK_STATUS_EVENTS",
+        "ROS_SIM_PLAYBACK_EVENT_SAMPLE_RATE",
+        "ROS_SIM_PLAYBACK_EVENT_JITTER_S",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    sim = SimSettings(_env_file=None)
+    assert sim.playback_status_events is True
+    assert sim.playback_event_sample_rate == 1.0
+    assert sim.playback_event_jitter_s == 60.0
+
+
+def test_event_sample_rate_must_be_a_share():
+    for bad in (-0.1, 1.5):
+        with pytest.raises(ValidationError):
+            SimSettings(playback_event_sample_rate=bad)
+
+
+def test_negative_jitter_is_rejected():
+    with pytest.raises(ValidationError):
+        SimSettings(playback_event_jitter_s=-1)
+
+
+def test_jitter_above_the_smallest_event_gap_is_rejected():
+    """Review item 5: J may be at most the smallest gap between two
+    events of one order (120 s). Draws are in [0, J), so an event is
+    never due before its predecessor - and past the gap the setting
+    refuses to go."""
+    from restaurantos.sim.timeline import MIN_EVENT_GAP_S
+
+    assert MIN_EVENT_GAP_S == 120
+    with pytest.raises(ValidationError):
+        SimSettings(playback_event_jitter_s=121)
+
+
+def test_the_jitter_bound_itself_is_accepted():
+    """Review round 2, item 8: the bound is inclusive - J = the smallest
+    gap still never lets a draw reach the predecessor's deadline, so
+    both the settings and the engine accept 120."""
+    SimSettings(playback_event_jitter_s=120)
+    make_playback(sample_orders(1), Path("/tmp/jbound"), status_events=True, event_jitter_s=120.0)
 
 
 # ---- shards -----------------------------------------------------------------
@@ -262,6 +319,79 @@ def test_stock_never_used_counters_get_the_floor(tmp_path):
 def test_stock_covers_every_counter_a_vendor_needs(tmp_path):
     rows = warm_up_stock(_dataset(tmp_path), warm_days=14, cover_days=7, floor=5)
     assert len(rows) == 3  # beef, rice, d2 - and nothing for other vendors
+
+
+def test_a_counter_floor_covers_one_unit_of_a_never_sold_product(tmp_path):
+    """API review 1.6: a flat floor F can sit below one unit of a
+    product - a set of 6 needs 6, and a counter at 5 can never sell it.
+    The counter's floor is F or the largest one-unit need, whichever is
+    higher, so an unused per_item counter starts at the multiplier."""
+    path = _dataset(tmp_path)
+    with (path / "product_dish.csv").open("a", encoding="utf-8") as f:
+        f.write("p4,v1,d2,6,false\n")  # a set of 6: needs 6 from the dish counter
+    with (path / "products.csv").open("a", encoding="utf-8") as f:
+        f.write("p4,v1,combo,0.01,10\n")
+    rows = warm_up_stock(path, warm_days=14, cover_days=7, floor=5)
+    stock = {(kind, item): on_hand for vendor, kind, item, on_hand, _ in rows}
+    # never sold in the warm-up, but one unit needs 6: the counter starts
+    # at 6, not at the flat floor of 5
+    assert stock[("dish", "d2")] == 6
+
+
+def test_an_ingredient_counter_floor_includes_the_recipe_amount(tmp_path):
+    """One unit of a per_ingredient product takes amount x multiplier;
+    a recipe amount of 3 with a multiplier of 4 floors the counter at
+    12, not at F."""
+    path = _dataset(tmp_path)
+    with (path / "ingredients.csv").open("a", encoding="utf-8") as f:
+        f.write("herbs,recipenlg\n")
+    with (path / "dish_ingredients.csv").open("a", encoding="utf-8") as f:
+        f.write("d1,herbs,3,portion\n")  # amount 3
+    with (path / "products.csv").open("a", encoding="utf-8") as f:
+        f.write("p4,v1,herby,0.01,10\n")
+    with (path / "product_dish.csv").open("a", encoding="utf-8") as f:
+        f.write("p4,v1,d1,4,false\n")  # multiplier 4 -> one unit needs 3 x 4 = 12
+    rows = warm_up_stock(path, warm_days=14, cover_days=7, floor=5)
+    stock = {(kind, item): on_hand for vendor, kind, item, on_hand, _ in rows}
+    assert stock[("ingredient", "herbs")] == 12
+
+
+def test_a_shared_counter_takes_the_largest_one_unit_need(tmp_path):
+    """Two products of one vendor use the same counter with needs 2 and
+    8: the counter's floor is the larger one, not either alone."""
+    path = _dataset(tmp_path)
+    for product, multiplier in (("p4", 2), ("p5", 8)):
+        with (path / "products.csv").open("a", encoding="utf-8") as f:
+            f.write(f"{product},v1,combo,0.01,10\n")
+        with (path / "product_dish.csv").open("a", encoding="utf-8") as f:
+            f.write(f"{product},v1,d2,{multiplier},false\n")
+    rows = warm_up_stock(path, warm_days=14, cover_days=7, floor=5)
+    stock = {(kind, item): on_hand for vendor, kind, item, on_hand, _ in rows}
+    assert stock[("dish", "d2")] == 8
+
+
+def test_usage_above_the_counter_floor_still_wins(tmp_path):
+    """The counter floor raises the start; it does not cap it. Warm-up
+    usage that demands more than the floor is unchanged by the rule."""
+    path = _dataset(tmp_path)
+    with (path / "orders.csv").open("a", encoding="utf-8") as f:
+        f.write("o3,c3,v1,w21z7,2,1,12:00:00\n")  # day 1: warm-up
+    with (path / "order_items.csv").open("a", encoding="utf-8") as f:
+        f.write("o3,p1,2\n")
+    # beef: usage (3 + 2) x multiplier 2 x amount 2 = 20 over 14 days,
+    # ceil(20 / 14 x 7) = 10, above the counter floor max(5, ceil(2 x 2))
+    rows = warm_up_stock(path, warm_days=14, cover_days=7, floor=5)
+    stock = {(kind, item): on_hand for vendor, kind, item, on_hand, _ in rows}
+    assert stock[("ingredient", "beef")] == 10
+
+
+def test_a_need_of_one_still_gets_the_flat_floor(tmp_path):
+    """The rule only raises floors: a product whose one unit needs 1
+    still starts at F when nothing was sold."""
+    path = _dataset(tmp_path)
+    rows = warm_up_stock(path, warm_days=14, cover_days=7, floor=5)
+    stock = {(kind, item): on_hand for vendor, kind, item, on_hand, _ in rows}
+    assert stock[("dish", "d2")] == 5  # p2, multiplier 1, never sold
 
 
 def test_a_none_dish_gets_no_counter_even_with_a_recipe(tmp_path):

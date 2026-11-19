@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import FastAPI
 
@@ -30,6 +30,8 @@ from restaurantos.common.models import (
     OrderRequest,
     OrderResponse,
     OrderStatus,
+    StatusChangeRequest,
+    StatusResult,
 )
 from restaurantos.common.simclock import to_sim_seconds
 
@@ -43,9 +45,12 @@ def make_stub_app(delay_seconds: float = 0.0) -> FastAPI:
     app = FastAPI(title="RestaurantOS order stub")
     app.state.delay_seconds = delay_seconds
 
-    async def place_order(request: OrderRequest) -> OrderResponse:
+    async def slow_down() -> None:
         if app.state.delay_seconds:
             await asyncio.sleep(app.state.delay_seconds)
+
+    async def place_order(request: OrderRequest) -> OrderResponse:
+        await slow_down()
         moment = STUB_EPOCH + timedelta(
             seconds=to_sim_seconds(request.order_day, request.order_time)
         )
@@ -61,11 +66,42 @@ def make_stub_app(delay_seconds: float = 0.0) -> FastAPI:
             acked_at=moment,
         )
 
-    # The gateway serves POST /orders behind the /api/v1 prefix
+    async def change_status(
+        vendor_id: str, order_id: UUID, request: StatusChangeRequest
+    ) -> StatusResult:
+        await slow_down()
+        # The stateless stand-in for the region's status machine: every
+        # change applies, nothing conflicts, and every field comes from
+        # the request (an event id played twice answers the same twice).
+        return StatusResult(order_id=order_id, status=request.to_status, applied=True)
+
+    async def restock(vendor_id: str) -> dict[str, object]:
+        await slow_down()
+        # The shape decided in the API review (api-gaps 1.2): 200 with
+        # what the region did. The stub has no stock, so the counts are
+        # zero; playback counts both 200 and 201 as an ack.
+        return {
+            "vendor_id": vendor_id,
+            "region_id": "r-stub",
+            "counters_restocked": 0,
+            "products_back_on": 0,
+        }
+
+    # The gateway serves its routes behind the /api/v1 prefix
     # (architecture Section 6.1); both paths work so the stub is a
     # drop-in for any base URL.
     app.add_api_route("/orders", place_order, methods=["POST"], status_code=201)
     app.add_api_route("/api/v1/orders", place_order, methods=["POST"], status_code=201)
+    for prefix in ("", "/api/v1"):
+        app.add_api_route(
+            f"{prefix}/vendors/{{vendor_id}}/orders/{{order_id}}/status",
+            change_status,
+            methods=["POST"],
+            status_code=201,
+        )
+        app.add_api_route(
+            f"{prefix}/vendors/{{vendor_id}}/restock", restock, methods=["POST"], status_code=200
+        )
 
     @app.get("/sim/stub/health")
     async def health() -> dict[str, Any]:

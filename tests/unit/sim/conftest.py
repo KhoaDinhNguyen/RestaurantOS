@@ -15,6 +15,7 @@ import heapq
 import itertools
 import os
 import sys
+from collections.abc import Mapping, Sequence
 from datetime import time as dt_time
 
 # importlib import mode does not put this directory on sys.path, and the
@@ -69,6 +70,18 @@ async def settle(rounds: int = 8) -> None:
     """Give in-flight coroutines the loop, without any real waiting."""
     for _ in range(rounds):
         await asyncio.sleep(0)
+
+
+async def until(predicate, timeout: float = 5.0) -> None:
+    """Bounded wait for a condition (review round 6, item 3): poll the
+    counters with real short sleeps instead of running a fixed count of
+    loop turns, which makes a test pass or fail on scheduling."""
+
+    async def poll() -> None:
+        while not predicate():
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(poll(), timeout)
 
 
 async def drive(playback: Playback, clock: FakeWallClock, *, steps: int | None = None) -> int:
@@ -130,22 +143,44 @@ def make_playback(
     transport: httpx.AsyncBaseTransport | None = None,
     from_day: int = 14,
     drain_timeout_s: float = 5.0,
+    http_timeout_s: float = 5.0,
     window_check=None,
+    status_events: bool = False,
+    event_sample_rate: float = 1.0,
+    event_jitter_s: float = 60.0,
+    kitchen_attempts: int = 3,
+    restock_every: int | None = None,
+    warm_up_days: int = 0,
+    restock_vendors: Sequence[str] = (),
+    target_url: str = "http://stub.test/api/v1",
+    kitchen_url: str | None = None,
+    kitchen_urls: Mapping[str, str] | None = None,
+    vendor_regions: Mapping[str, str] | None = None,
 ) -> Playback:
     """An engine over a fixed order list, posting to an in-process stub."""
     if transport is None:
         transport = httpx.ASGITransport(app=make_stub_app())
     return Playback(
         lambda a, b: iter(orders),
-        target_url="http://stub.test/api/v1",
+        target_url=target_url,
         inflight=inflight,
-        http_timeout_s=5.0,
+        http_timeout_s=http_timeout_s,
         drain_timeout_s=drain_timeout_s,
         runs_dir=runs_dir,
         default_speed=speed,
         wall=clock,
         transport=transport,
         window_check=window_check,
+        status_events=status_events,
+        event_sample_rate=event_sample_rate,
+        event_jitter_s=event_jitter_s,
+        kitchen_attempts=kitchen_attempts,
+        restock_every=restock_every,
+        warm_up_days=warm_up_days,
+        restock_vendors=restock_vendors,
+        kitchen_url=kitchen_url,
+        kitchen_urls=kitchen_urls,
+        vendor_regions=vendor_regions,
     )
 
 

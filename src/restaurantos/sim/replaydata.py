@@ -26,6 +26,8 @@ deterministically too.
 from __future__ import annotations
 
 import csv
+import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -37,7 +39,7 @@ from pathlib import Path
 
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.datacheck import check_manifest
-from restaurantos.sim.loading import read_rows
+from restaurantos.sim.loading import REFERENCE_COLUMNS, check_header, read_rows
 
 CACHE_DIR_NAME = "cached"
 CACHE_FILE = "orders-sorted.jsonl"
@@ -58,6 +60,27 @@ ORDERS_COLUMNS = (
 ITEMS_COLUMNS = ("order_id", "product_id", "quantity")
 
 IMPORT_BATCH = 100_000
+
+
+@dataclass(frozen=True)
+class ReplayWindow:
+    """The replay window a run will actually use, after validation.
+
+    `to_day` is the effective end: the caller's to_day, the cache's
+    last day when the caller left it open, or the cache's last day
+    again when the caller asked for more than the data holds - the
+    last case is reported in `shortened_from` so the caller can say
+    so; this module never prints.
+    """
+
+    from_day: int
+    to_day: int
+    shortened_from: int | None = None
+
+    def __iter__(self) -> Iterator[int]:
+        # unpacking stays legal for the callers that only want the days
+        yield self.from_day
+        yield self.to_day
 
 
 @dataclass(frozen=True)
@@ -99,6 +122,34 @@ def _manifest_sha256(data_dir: Path) -> dict[str, str]:
             if len(row) == 3:
                 entries[row[0]] = row[2]
         return entries
+
+
+def manifest_rows(data_dir: Path, name: str) -> list[list[str]]:
+    """One read of one data file, checked before anything is parsed
+    from it: the sha256 matches its MANIFEST.csv entry, the header
+    matches `REFERENCE_COLUMNS`, and the rows come back so every
+    derived thing (vendor list, cell counts, region map) is built from
+    these same checked bytes - never from a second, unchecked read
+    (review round 3, item 11).
+
+    Blank rows are kept: the caller numbers them - the header is
+    line 1 - and rejects them. An empty file is a data error too, not
+    a StopIteration escaping the CLI (review round 4, item 7):
+    `next(reader, [])` lets check_header report the missing header,
+    and the header error is a ValueError naming the file, like every
+    other data error."""
+    expected = _manifest_sha256(data_dir).get(name)
+    if expected is None:
+        raise ValueError(f"{name} is not listed in MANIFEST.csv")
+    raw = (data_dir / name).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != expected:
+        raise ValueError(f"{name} does not match its MANIFEST.csv entry")
+    reader = csv.reader(io.StringIO(raw.decode("utf-8"), newline=""))
+    try:
+        check_header(name, next(reader, []), REFERENCE_COLUMNS[name])
+    except RuntimeError as error:
+        raise ValueError(str(error)) from None
+    return list(reader)
 
 
 def load_meta(data_dir: Path) -> CacheMeta | None:
@@ -379,7 +430,7 @@ def to_order_request(order: dict) -> OrderRequest:
     )
 
 
-def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> tuple[int, int]:
+def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> ReplayWindow:
     """Validate the replay window against the cache, or raise ValueError.
 
     from_day below the warm-up window is refused, not clamped: those
@@ -387,6 +438,11 @@ def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> tuple[
     its usage), so replaying them would count every ingredient twice
     and no oracle could ever match. The two settings stay decoupled;
     this only rejects the combination that cannot mean anything.
+
+    A to_day past the last cached day is shortened to it and reported
+    in `shortened_from`, not refused: the caller prints the warning,
+    never this module. Days with no orders inside the window stay
+    empty, but the window itself never runs past the data.
     """
     if from_day < max(meta.warm_up_days, meta.first_day):
         raise ValueError(
@@ -401,4 +457,12 @@ def require_window(meta: CacheMeta, from_day: int, to_day: int | None) -> tuple[
         )
     if to_day is not None and to_day < from_day:
         raise ValueError(f"to_day {to_day} is before from_day {from_day}")
-    return from_day, to_day if to_day is not None else meta.last_day
+    shortened_from = None
+    if to_day is not None and to_day > meta.last_day:
+        shortened_from = to_day
+        to_day = meta.last_day
+    return ReplayWindow(
+        from_day=from_day,
+        to_day=to_day if to_day is not None else meta.last_day,
+        shortened_from=shortened_from,
+    )
