@@ -1888,6 +1888,128 @@ async def test_an_unknown_region_is_failed_not_sent_to_the_gateway(tmp_path: Pat
         assert line["wall_sent_at"] is None
 
 
+class SlowBodyStream(httpx.AsyncByteStream):
+    """A response body that arrives one chunk per short real sleep:
+    past the outer wall-clock deadline in total (asyncio.timeout
+    around the POST), never past httpx's per-read timeout."""
+
+    def __init__(self, chunks: int, delay: float) -> None:
+        self.chunks = chunks
+        self.delay = delay
+
+    async def __aiter__(self):  # type: ignore[override]
+        for _ in range(self.chunks):
+            await asyncio.sleep(self.delay)
+            yield b"x"
+
+
+class SlowBodyTransport(httpx.AsyncBaseTransport):
+    """Answers 200, but the matched paths stream their body slowly
+    (review round 5, item 3): httpx's own timeout never trips - each
+    read waits only one short sleep - while the outer wall-clock
+    deadline around the POST expires and must cut the answer."""
+
+    def __init__(self, slow_paths: tuple[str, ...], delay: float = 0.02) -> None:
+        self.slow_paths = slow_paths
+        self.delay = delay
+        self.requests: list[str] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(str(request.url))
+        if any(request.url.path.endswith(path) for path in self.slow_paths):
+            return httpx.Response(200, stream=SlowBodyStream(20, self.delay))
+        return httpx.Response(
+            200,
+            json={
+                "applied": True,
+                "duplicate": False,
+                "conflict": False,
+                "order_id": "o1",
+                "outcome": "accepted",
+            },
+        )
+
+
+async def test_a_slow_answer_fails_the_order_within_the_deadline(tmp_path: Path) -> None:
+    """Review round 5, item 3: httpx's timeout bounds each operation -
+    connect, write, each read - so a server that keeps a byte coming
+    now and then never trips it, and a single POST could last far past
+    http_timeout_s. Every POST now carries one outer wall-clock
+    deadline over the whole answer: a streamed answer that never trips
+    httpx still fails the order with `Timeout`, within about the
+    deadline."""
+    transport = SlowBodyTransport(("/orders",))
+    orders = [make_order(14, 0, 0, 0, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, transport=transport, http_timeout_s=0.2)
+    started = time.monotonic()
+    await pb.start(seed=0, from_day=14, to_day=14, speed=100.0, run_id="slow-answer")
+    # the deadline is real time (asyncio.timeout), so the loop mixes
+    # real sleeps with the fake clock's advances
+    for _ in range(300):
+        await asyncio.sleep(0.02)
+        await clock.advance(clock.now() + 0.05)
+        await settle()
+        if pb.state in {"done", "stopped", "failed"}:
+            break
+    assert pb.state in {"done", "stopped", "failed"}
+    # the answer never finished: one POST, failed inside about 0.2 s
+    assert len(transport.requests) == 1
+    assert time.monotonic() - started < 1.0
+    line = next(line for line in run_log_lines(tmp_path, pb) if line["kind"] == "order")
+    assert line["error"] == "Timeout"
+    assert "http_status" not in line
+    assert pb.status()["orders_failed"] == 1
+
+
+async def test_a_slow_answer_is_retried_and_then_failed(tmp_path: Path) -> None:
+    """Review round 5, item 3's other half: an outer deadline expiry on
+    a kitchen call is retryable, like an httpx timeout - the region may
+    still have committed it - so it enters the retry path with the same
+    no-body POST, keeps the reasons in earlier_failures, and fails
+    after its last attempt."""
+    transport = SlowBodyTransport(("/restock",))
+    orders = [make_order(14, 0, 0, 0, "1001")]
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        transport=transport,
+        http_timeout_s=0.2,
+        kitchen_attempts=3,
+        restock_every=1,
+        warm_up_days=14,
+        restock_vendors=("v001",),
+    )
+    await pb.start(seed=0, from_day=14, to_day=15, speed=1000.0, run_id="slow-restock")
+    # fast fake spin until the restock is on the wire (reaching day 15
+    # takes 86400 simulated seconds)
+    for _ in range(20000):
+        await clock.advance(clock.now() + 0.05)
+        await settle()
+        if pb.status()["restocks_sent"] == 1:
+            break
+    # real time for the outer deadline (asyncio.timeout) and the
+    # retries' expiry, fake advances for the backoffs between them
+    for _ in range(500):
+        await asyncio.sleep(0.02)
+        await clock.advance(clock.now() + 0.05)
+        await settle()
+        if pb.state in {"done", "stopped", "failed"}:
+            break
+    assert pb.state in {"done", "stopped", "failed"}
+    status = pb.status()
+    assert status["restocks_sent"] == 1
+    assert status["restocks_acked"] == 0
+    line = next(line for line in run_log_lines(tmp_path, pb) if line["kind"] == "restock")
+    assert line["attempts"] == 3
+    assert line["error"] == "Timeout"
+    assert line["earlier_failures"] == ["Timeout", "Timeout"]
+    # every attempt reached the wire: three POSTs, all slow
+    assert len([url for url in transport.requests if url.endswith("/restock")]) == 3
+
+
 async def test_a_non_string_region_id_is_failed_the_same_way(tmp_path: Path) -> None:
     """Review round 3, item 2: a region_id that is not even a string
     (a bad answer put a list there) is the same unknown region: the

@@ -923,9 +923,11 @@ class Playback:
                     # started (review round 2, item 3): on a slow target
                     # the bounded drain below would otherwise cut the
                     # tail off a *completed* run and count it cancelled.
-                    # Each send is still bounded by the HTTP timeout once
-                    # it holds a slot; only a stop (or a failure) falls
-                    # through to the drain.
+                    # Each send is bounded by one wall-clock deadline
+                    # once it holds a slot: the outer asyncio.timeout
+                    # around the POST covers the whole answer, not just
+                    # one HTTP operation; only a stop (or a failure)
+                    # falls through to the drain.
                     while True:
                         outstanding = {task for task in self._send_tasks if not task.done()}
                         if not outstanding:
@@ -1246,12 +1248,25 @@ class Playback:
             async with self._slots:
                 record["wall_sent_at"] = round(self._wall.now(), 3)
                 try:
-                    response = await self._client.post(
-                        self._orders_url, json=request.model_dump(mode="json")
-                    )
+                    # One wall-clock deadline over the whole answer
+                    # (review round 5, item 3): httpx's timeout bounds
+                    # each operation - connect, write, each read - so a
+                    # server that keeps a byte coming now and then never
+                    # trips it, and a single POST could last far past
+                    # http_timeout_s. This deadline covers the call,
+                    # which reads the full body.
+                    async with asyncio.timeout(self._http_timeout_s):
+                        response = await self._client.post(
+                            self._orders_url, json=request.model_dump(mode="json")
+                        )
                     record["http_status"] = response.status_code
                     record.update(_response_fields(response))
                     self._count(response)
+                except TimeoutError:
+                    # the outer wall-clock deadline expired: the order
+                    # is failed, exactly like an httpx timeout
+                    record["error"] = "Timeout"
+                    self._failed += 1
                 except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
                     # httpx errors, bad URLs, anything: the line is still
                     # written and the failure still counted, or the
@@ -1311,7 +1326,12 @@ class Playback:
         A timeout, a connection error or a 5xx is retried, up to
         `kitchen_attempts` attempts in total, backing off in wall time
         between attempts without holding a slot (review round 3,
-        item 1). The edge does not cancel a call that missed its
+        item 1). Every attempt is also bounded by one wall-clock
+        deadline over the whole answer (review round 5, item 3):
+        httpx's timeout bounds each operation - connect, write, each
+        read - so a server that keeps a byte coming now and then never
+        trips it, while this deadline expires and is retried like a
+        timeout. The edge does not cancel a call that missed its
         deadline, so the first attempt may have committed: every
         attempt sends the same body - for an event, the same event_id,
         which the region's processed_events answers duplicate, and a
@@ -1395,7 +1415,15 @@ class Playback:
                             record["error"] = "id not url-safe"
                             break
                         record["wall_sent_at"] = round(self._wall.now(), 3)
-                        response = await self._client.post(base + path, json=body)
+                        # One wall-clock deadline over the whole answer
+                        # (review round 5, item 3): httpx's timeout
+                        # bounds each operation - connect, write, each
+                        # read - so a server that keeps a byte coming
+                        # now and then never trips it. This deadline
+                        # covers the call, which reads the full body,
+                        # and an expiry is retryable, like a timeout.
+                        async with asyncio.timeout(self._http_timeout_s):
+                            response = await self._client.post(base + path, json=body)
                         record["http_status"] = response.status_code
                         record["attempts"] = attempt
                         if response.status_code < 500:
@@ -1403,6 +1431,13 @@ class Playback:
                             # 404, 409 or 422
                             break
                         failure = f"http {response.status_code}"
+                    except TimeoutError:
+                        # the outer wall-clock deadline expired: the
+                        # region may still commit the call, so it is
+                        # retryable like an httpx timeout - every
+                        # attempt sends the same body
+                        record["attempts"] = attempt
+                        failure = "Timeout"
                     except httpx.TransportError as error:
                         # a timeout or a connection error: the call may
                         # still have committed at the region
