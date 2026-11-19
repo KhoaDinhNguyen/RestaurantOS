@@ -86,7 +86,13 @@ def warm_up_stock(
     # factor x multiplier from it (factor is the recipe amount for an
     # ingredient counter, 1 for a dish counter). A counter whose floor
     # sits below that need can never sell the product, so it becomes
-    # the counter's own floor.
+    # the counter's own floor. A product's need from a counter is always
+    # a single term, never a sum over several dishes or ingredients:
+    # product_dish has PRIMARY KEY (vendor_id, product_id), so a
+    # product links to exactly one dish, and dish_ingredients has
+    # PRIMARY KEY (dish_id, ingredient_id), so a dish lists each
+    # ingredient once - the max over products is therefore already the
+    # whole need.
     one_unit_need: dict[tuple[str, str, str], float] = {}
     for vendor_id, product_id in sorted(vendor_products):
         for dish_id, multiplier in links.get((vendor_id, product_id), ()):

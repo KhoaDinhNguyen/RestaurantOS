@@ -602,11 +602,14 @@ def test_config_decides_the_region_routing(tmp_path, monkeypatch, capsys, fresh_
     assert captured["start_kwargs"]["meta_extra"]["cluster"]["config"] == str(cluster_file)
 
 
-def test_vendors_csv_is_read_once_for_the_whole_rest_of_the_run(tmp_path, monkeypatch):
-    """Review round 3, item 11: the vendor list, the cell counts and
-    the region map all come from one checked read of vendors.csv - the
-    file is opened exactly once, and the map still equals bootstrap's
-    own derivation."""
+def test_vendors_csv_is_read_once_by_a_playback_start(
+    tmp_path, monkeypatch, capsys, fresh_settings
+):
+    """Review round 3, item 11, now measured through the CLI itself
+    (review round 5, item 6): the cache is built first, then the open
+    counter, then a playback start with the fake server and engine -
+    and vendors.csv is opened exactly once during the start. The map
+    still equals bootstrap's own derivation."""
     orders = [["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"]]
     data = _make_data_with_vendors(
         tmp_path,
@@ -614,10 +617,13 @@ def test_vendors_csv_is_read_once_for_the_whole_rest_of_the_run(tmp_path, monkey
         [["1", "p1", 1]],
         "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\nv2,,w21z7,x\nv3,,w21z6,y\n",
     )
-    from restaurantos.common.cluster import Cluster
-    from restaurantos.sim.playback_cli import restock_vendors, vendor_region_map
-    from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_counts
+    captured: dict = {}
+    _install_fake_start(monkeypatch, captured)
+    monkeypatch.setenv("ROS_DATA_DIR", str(data))
+    monkeypatch.chdir(tmp_path)
 
+    # the counter goes on after the cache is built: only the start's
+    # own reads are counted
     opens: list[str] = []
     real_open = Path.open
 
@@ -627,12 +633,32 @@ def test_vendors_csv_is_read_once_for_the_whole_rest_of_the_run(tmp_path, monkey
         return real_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", counting_open)
-    pairs = restock_vendors(data)  # the one checked read
+    rc = app(
+        [
+            "playback",
+            "start",
+            "--from-day",
+            "14",
+            "--to-day",
+            "14",
+            "--kitchen-target",
+            "http://127.0.0.1:8900/api/v1",
+            "--port",
+            "1",
+        ]
+    )
+    assert rc == 0
+    assert len(opens) == 1
+
+    # and the map still equals bootstrap's own derivation
+    from restaurantos.common.cluster import Cluster
+    from restaurantos.sim.playback_cli import restock_vendors, vendor_region_map
+    from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_counts
+
+    pairs = restock_vendors(data)
     counts = counts_by_cell(pairs)
     cluster = Cluster(regions=2)
     regions = vendor_region_map(pairs, counts, cluster)
-    assert len(opens) == 1
-    # and the map still equals bootstrap's own derivation
     cell_region = dict(assign_shards(vendor_counts(data), cluster.region_ids))
     assert regions == {vendor: cell_region[geohash] for vendor, geohash in pairs}
 
