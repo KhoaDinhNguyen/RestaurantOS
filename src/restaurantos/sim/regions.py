@@ -8,33 +8,26 @@ both derive the split from one reviewed place instead of duplicating it.
 
 Both answers are derived, never typed by hand. The region split is
 recomputed from the data files with the exact functions bootstrap used
-to write ``shard_directory`` (``shard.vendor_counts`` +
-``shard.assign_shards``): reading the directory back from HQ would make
+to write ``shard_directory`` (``shard.assign_shards`` over the
+vendors-per-cell counts): reading the directory back from HQ would make
 playback depend on a database and on the cluster being healthy, and the
 recomputation cannot disagree with the cluster because bootstrap wrote
-its rows from the same two functions over the same files. The edge URL
+its rows from the same functions over the same files. The edge URL
 comes from ``common.cluster`` plus the ``/api/v1`` prefix the gateway
-serves (architecture Section 6.1). The edge API is the same code in
-edge mode and is specified to serve those routes on that same prefix
-(architecture Section 6); note that the gateway on current main
-registers the ``/api/v1`` router only in gateway mode, so an edge
-process 404s ``POST /api/v1/orders`` until WP2 registers the routes in
-edge mode — the URL this module derives is the one the architecture
-specifies, not one a working edge deployment answers today. ``rosctl``
-always runs on the Docker host (Section 4), so the address is the host
-one.
+serves (architecture Section 6.1); the edge app registers the same
+routes on that same prefix in edge mode (architecture Section 6).
+``rosctl`` always runs on the Docker host (Section 4), so the address is
+the host one.
 """
 
 from __future__ import annotations
 
-import csv
-from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from restaurantos.common.cluster import HOST_ADDRESS, Cluster, service_port
 from restaurantos.sim.replaydata import iter_orders
-from restaurantos.sim.shard import assign_shards, vendor_counts
+from restaurantos.sim.shard import assign_shards
 
 API_PREFIX = "/api/v1"
 
@@ -55,26 +48,23 @@ class RegionShare:
     unknown_example: str | None
 
 
-def vendor_region_map(data_dir: Path, regions: Sequence[str]) -> dict[str, str]:
-    """vendor_id -> region_id, from the split bootstrap itself writes.
+def vendor_region_map(
+    pairs: list[tuple[str, str]], counts: dict[str, int], cluster: Cluster
+) -> dict[str, str]:
+    """vendor -> its region, built exactly the way bootstrap shards it.
 
-    Raises ValueError when a vendor's cell has no region: the split and
-    vendors.csv are read from the same directory in one call, so that
-    only happens if the files changed underneath the run, and it must
-    be loud rather than quietly dropping or double-counting a vendor.
+    The same ``assign_shards`` walk over ``cluster.region_ids``, then each
+    vendor's geohash looked up in the result. ``pairs`` are the
+    vendor/geohash rows (``playback_cli.restock_vendors`` reads
+    vendors.csv and checks it against the manifest, and stays the only
+    reader of that file), and ``counts`` is the vendors-per-cell count of
+    those same pairs (``shard.counts_by_cell``), so the map cannot drift
+    from bootstrap's sharding. Deterministic, and no HQ call at run
+    start.
     """
-    cell_region = dict(assign_shards(vendor_counts(data_dir), regions))
-    out: dict[str, str] = {}
-    with (data_dir / "vendors.csv").open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            cell = row["geohash"]
-            if cell not in cell_region:
-                raise ValueError(
-                    f"vendor {row['vendor_id']} is in cell {cell}, which the shard split "
-                    "did not assign: vendors.csv and the split disagree"
-                )
-            out[row["vendor_id"]] = cell_region[cell]
-    return out
+
+    cell_region = dict(assign_shards(counts, cluster.region_ids))
+    return {vendor: cell_region[geohash] for vendor, geohash in pairs}
 
 
 def region_order_counts(

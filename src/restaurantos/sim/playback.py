@@ -314,6 +314,7 @@ class Playback:
         kitchen_url: str | None = None,
         kitchen_urls: Mapping[str, str] | None = None,
         vendor_regions: Mapping[str, str] | None = None,
+        run_meta: Mapping[str, Any] | None = None,
         sequential: bool = False,
     ) -> None:
         self._orders_fn = orders_fn
@@ -371,6 +372,14 @@ class Playback:
         # single-URL fallback - only an omitted map falls back
         self._kitchen_urls = dict(kitchen_urls) if kitchen_urls is not None else None
         self._vendor_regions = dict(vendor_regions) if vendor_regions else None
+        # Facts that hold for every run on this engine (the CLI's region
+        # mode: which region, the cache, the cluster file, the sequential
+        # flag) go into every run's meta.json, not just the first - a run
+        # started through the control API sends with the same filter and
+        # target, so its log must carry the same mode. Per-run facts
+        # (argv, the first run's window counts) stay in the caller's
+        # `meta_extra`.
+        self._run_meta = dict(run_meta) if run_meta else None
         # Sequential mode: wait for each order's response before the
         # next send. It is the one mode that breaks the backlog seam
         # deliberately: a run that reaches the end of the stream must
@@ -566,6 +575,9 @@ class Playback:
                 if self._kitchen_urls is not None
                 else {"mode": "target"}
             ),
+            # engine-wide facts first, per-run extras last: a key both
+            # carry belongs to this run, not the engine
+            **(self._run_meta or {}),
             **(meta_extra or {}),
         }
         try:

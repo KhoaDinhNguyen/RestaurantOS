@@ -31,9 +31,10 @@ from restaurantos.common.config import get_settings
 from restaurantos.sim import playback_cli
 from restaurantos.sim.cli import app, build_parser
 from restaurantos.sim.loading import REFERENCE_COLUMNS, REFERENCE_ORDER
+from restaurantos.sim.playback_cli import restock_vendors
 from restaurantos.sim.regions import edge_target_url, region_order_counts, vendor_region_map
 from restaurantos.sim.replaydata import build_cache, count_orders, iter_orders
-from restaurantos.sim.shard import assign_shards, vendor_counts
+from restaurantos.sim.shard import assign_shards, counts_by_cell
 from restaurantos.sim.stub import make_stub_app
 
 MINI = Path("tests/fixtures/mini")
@@ -102,37 +103,47 @@ def free_port() -> int:
 # --- the resolver -----------------------------------------------------------
 
 
-def test_resolver_matches_the_bootstrap_split_on_the_mini_fixture() -> None:
+def test_resolver_matches_the_bootstrap_split_on_the_mini_fixture(tmp_path: Path) -> None:
     # Hand-checked greedy cut for cells w21z6(1), w21z7(2), w21zt(1) cut
-    # in two: w21z6 and w21z7 fall to r1, w21zt to r2.
-    got = vendor_region_map(MINI, ["r1", "r2"])
+    # in two: w21z6 and w21z7 fall to r1, w21zt to r2. The pairs are the
+    # same rows `restock_vendors` yields in production, read straight
+    # from vendors.csv here because the mini fixture ships no
+    # MANIFEST.csv to check against.
+    with (MINI / "vendors.csv").open(newline="", encoding="utf-8") as f:
+        pairs = sorted((row["vendor_id"], row["geohash"]) for row in csv.DictReader(f))
+    counts = counts_by_cell(pairs)
+    cluster = load_cluster(two_region_cluster_file(tmp_path))
+    got = vendor_region_map(pairs, counts, cluster)
     assert got == {"v001": "r1", "v002": "r1", "v003": "r1", "v004": "r2"}
     # one region: every cell falls to it
-    assert set(vendor_region_map(MINI, ["r1"]).values()) == {"r1"}
+    one_file = tmp_path / "one.toml"
+    one_file.write_text("[cluster]\nregions = 1\nstandbys = false\n", encoding="utf-8")
+    single = load_cluster(one_file)
+    assert set(vendor_region_map(pairs, counts, single).values()) == {"r1"}
+    # the map is the assign_shards walk, no more and no less
+    cell_region = dict(assign_shards(counts, cluster.region_ids))
+    assert {v: cell_region[g] for v, g in pairs} == got
 
 
 def test_resolver_covers_every_vendor_exactly_once(tmp_path: Path) -> None:
     """A synthetic multi-region vendor set: 5 cells x 100 vendors, 3
     regions. Every vendor lands in exactly one region, every region is
-    used, and each vendor's region is the one its cell was assigned."""
-    data = tmp_path / "data"
-    data.mkdir()
-    rows = ["vendor_id,chain_id,geohash,primary_cuisine"]
-    for i in range(500):
-        rows.append(f"v{i:04d},,c{i % 5:04d},x")
-    (data / "vendors.csv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    used, and each vendor's region is the one its cell was assigned.
+    The pairs are built in memory - the resolver never reads a file."""
+    pairs = [(f"v{i:04d}", f"c{i % 5:04d}") for i in range(500)]
+    counts = counts_by_cell(pairs)
+    cluster_file = tmp_path / "cluster.toml"
+    cluster_file.write_text("[cluster]\nregions = 3\nstandbys = false\n", encoding="utf-8")
+    cluster = load_cluster(cluster_file)
 
-    regions = ["r1", "r2", "r3"]
-    got = vendor_region_map(data, regions)
+    got = vendor_region_map(pairs, counts, cluster)
     assert len(got) == 500  # every vendor, once
-    assert set(got.values()) == set(regions)  # no empty region
+    assert set(got.values()) == set(cluster.region_ids)  # no empty region
 
-    cell_region = dict(assign_shards(vendor_counts(data), regions))
-    with (data / "vendors.csv").open(newline="", encoding="utf-8") as f:
-        for row in csv.DictReader(f):
-            assert got[row["vendor_id"]] == cell_region[row["geohash"]]
+    cell_region = dict(assign_shards(counts, cluster.region_ids))
+    assert {v: cell_region[g] for v, g in pairs} == got
 
-    per_region = [sum(1 for r in got.values() if r == rid) for rid in regions]
+    per_region = [sum(1 for r in got.values() if r == rid) for rid in cluster.region_ids]
     # hand-checked greedy cut: shares at 500/3 and 1000/3, so r1 takes
     # c0000+c0001 (200), r2 takes c0002+c0003 (200), r3 takes c0004 (100)
     assert per_region == [200, 200, 100]
@@ -147,7 +158,10 @@ def test_region_filter_keeps_replay_order_and_count_is_the_share(
     data = make_region_data_dir(tmp_path)
     build_cache(data, warm_up_days=14, quiet=True)
     cache = data / "cached" / "orders-sorted.jsonl"
-    vendor_region = vendor_region_map(data, ["r1", "r2"])
+    pairs = restock_vendors(data)
+    vendor_region = vendor_region_map(
+        pairs, counts_by_cell(pairs), load_cluster(two_region_cluster_file(tmp_path))
+    )
 
     def r1(order: dict) -> bool:
         return vendor_region.get(order["vendor_id"]) == "r1"
@@ -173,9 +187,12 @@ def test_orders_with_a_vendor_outside_the_map_are_counted_not_dropped(
 ) -> None:
     data = make_region_data_dir(tmp_path, rogue=True)
     build_cache(data, warm_up_days=14, quiet=True)
+    pairs = restock_vendors(data)
     share = region_order_counts(
         data / "cached" / "orders-sorted.jsonl",
-        vendor_region_map(data, ["r1", "r2"]),
+        vendor_region_map(
+            pairs, counts_by_cell(pairs), load_cluster(two_region_cluster_file(tmp_path))
+        ),
         "r1",
         from_day=14,
         to_day=16,
@@ -360,6 +377,51 @@ def test_start_sequential_refuses_a_wider_inflight(region_env, capsys) -> None:
     assert "one order at a time" in capsys.readouterr().err
 
 
+def test_start_reports_a_missing_cluster_file_not_a_traceback(region_env, capsys) -> None:
+    """Review round 4, item 2: `load_cluster` runs at the top of the
+    start, outside the big handler, so a missing cluster file used to be
+    a traceback. Now it is one line and rc 1, like every other refusal."""
+    region_env()
+    missing = Path("no-such-cluster.toml")
+    rc = app(
+        [
+            "playback",
+            "start",
+            "--region",
+            "r1",
+            "--config",
+            str(missing),
+            "--port",
+            "1",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert err.startswith("rosctl playback start: ")
+    assert "no-such-cluster.toml" in err
+    assert "Traceback" not in err
+
+
+def test_target_edge_without_region_exits_before_the_cache_is_built(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """Review round 4, item 2: the flag checks run before `ensure_cache`,
+    so a bad combination must not pay for a cache first. Proved with a
+    data dir that has no cache: the refusal leaves no `cached/` behind."""
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setenv("ROS_DATA_DIR", str(data))
+    monkeypatch.chdir(tmp_path)
+    get_settings.cache_clear()
+    try:
+        rc = app(["playback", "start", "--target", "edge", "--port", "1"])
+    finally:
+        get_settings.cache_clear()
+    assert rc == 1
+    assert "--target edge needs --region" in capsys.readouterr().err
+    assert not (data / "cached").exists()
+
+
 class RecordingTransport(httpx.AsyncBaseTransport):
     """Answers 201 and records every request, so the CLI tests assert
     what the run actually sent: the URL, the body, the order, and the
@@ -516,27 +578,21 @@ async def test_start_exits_1_when_every_answer_is_a_404(region_env, capsys) -> N
     assert order_lines and all(line["http_status"] == 404 for line in order_lines)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="WP2: edge mode does not register /api/v1 yet; "
-    "playback --target edge needs POST /api/v1/orders",
-)
 def test_edge_mode_app_serves_the_orders_route_playback_targets(monkeypatch) -> None:
     """Playback's --target edge POSTs to /api/v1/orders on the region's
-    edge app. This pins the contract from playback's side: strict xfail,
-    so the day WP2 registers the route the test starts failing and the
-    marker has to be removed deliberately - the contract cannot drift
-    silently in either direction."""
+    edge app, and edge mode registers that route (PR #18). This pins the
+    contract from playback's side. The route is resolved through the
+    app's OpenAPI spec, not `app.routes`: FastAPI includes sub-routers
+    lazily, so at creation time `app.routes` holds only an
+    `_IncludedRouter` marker and the route is not visible there."""
     from restaurantos.common.config import Settings
     from restaurantos.gateway.app import create_app
 
     edge_settings = Settings(mode="edge", region_id="r1", network="host")
     monkeypatch.setattr("restaurantos.gateway.app.get_settings", lambda: edge_settings)
     app = create_app()
-    orders_routes = [
-        route for route in app.routes if getattr(route, "path", None) == "/api/v1/orders"
-    ]
-    assert orders_routes and "POST" in getattr(orders_routes[0], "methods", frozenset())
+    orders = app.openapi()["paths"].get("/api/v1/orders", {})
+    assert "post" in orders
 
 
 async def test_control_start_racing_the_cli_start_loses_cleanly(
@@ -589,12 +645,17 @@ async def test_control_start_racing_the_cli_start_loses_cleanly(
     err = capsys.readouterr().err
     assert "a run was started through the control API before this one" in err
 
-    # the control-started run: one run dir, no CLI meta (that is the
-    # point of the race), ended stopped with its log on disk and closed
+    # the control-started run: one run dir, no CLI-only extras (that is
+    # the point of the race), ended stopped with its log on disk and
+    # closed. The engine-wide facts travel with the engine (round 4,
+    # item 4), so this run carries the mode too - just not `argv`.
     run_dirs = list((Path("runs")).iterdir())
     assert len(run_dirs) == 1
     meta = json.loads((run_dirs[0] / "meta.json").read_text())
-    assert "region" not in meta and "argv" not in meta
+    assert "argv" not in meta
+    assert "region_window_orders" not in meta
+    assert meta["region"] == "r1"
+    assert meta["sequential"] is True
     status = captured["playback"].status()
     assert status["state"] == "stopped"
     # paused before any dispatch: an empty log, created and closed
@@ -602,6 +663,85 @@ async def test_control_start_racing_the_cli_start_loses_cleanly(
     assert log_file.exists()
     lines = log_file.read_text().splitlines()
     assert all(json.loads(line) for line in lines)
+
+
+async def test_a_control_api_start_keeps_the_runs_mode_in_meta(
+    region_env, monkeypatch, capsys, tmp_path
+) -> None:
+    """Review round 4, item 4: a run started through the control API's
+    start action on a region engine sends with the same filter, target
+    and sequential flag, so its meta.json must carry the same mode:
+    `region`, `sequential`, `region_cached_orders` - engine-wide, via
+    `run_meta` - while `argv` and the first run's `region_window_orders`
+    stay CLI-only and must not appear."""
+    from restaurantos.sim import control
+
+    region_env()
+    real_make_control_app = control.make_control_app
+    captured: dict = {}
+
+    def capturing_make_control_app(playback):
+        captured["playback"] = playback
+        return real_make_control_app(playback)
+
+    monkeypatch.setattr(control, "make_control_app", capturing_make_control_app)
+    args = build_parser().parse_args(
+        [
+            "playback",
+            "start",
+            "--region",
+            "r1",
+            "--target",
+            "edge",
+            "--sequential",
+            "--speed",
+            "1000000",
+            "--port",
+            str(free_port()),
+        ]
+    )
+    rc = await playback_cli.start_command(args, transport=RecordingTransport())
+    assert rc == 0
+
+    first_dir = next((Path("runs")).iterdir())
+    first = json.loads((first_dir / "meta.json").read_text())
+    # the CLI run: engine-wide facts and the CLI-only extras both present
+    assert first["region"] == "r1"
+    assert first["sequential"] is True
+    assert first["region_cached_orders"] == 3
+    assert first["region_window_orders"] == 3
+    assert first["argv"]
+
+    # the second run, started through the control app's start action on
+    # the same engine; the app is driven in this loop, so the run's
+    # tasks live on it (no portal thread that stops mid-run)
+    playback = captured["playback"]
+    control_app = real_make_control_app(playback)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=control_app), base_url="http://control"
+    ) as client:
+        response = await client.post(
+            "/sim/playback",
+            json={
+                "action": "start",
+                "from_day": 14,
+                "to_day": 14,
+                "seed": 0,
+                "run_id": "control-start-mode-meta",
+            },
+        )
+    assert response.status_code == 200
+    await playback.wait_done()
+
+    second = json.loads((Path("runs") / "control-start-mode-meta" / "meta.json").read_text())
+    assert second["region"] == "r1"
+    assert second["sequential"] is True
+    assert second["region_cached_orders"] == 3
+    assert second["cache"]["cached_orders"] == 6
+    assert second["cluster"]["config"]
+    # CLI-only facts describe the first run, not the engine
+    assert "argv" not in second
+    assert "region_window_orders" not in second
 
 
 async def test_orders_with_an_unknown_vendor_refuse_the_run(region_env, capsys) -> None:

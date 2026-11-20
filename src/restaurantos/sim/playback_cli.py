@@ -32,7 +32,11 @@ from restaurantos.common.config import get_settings
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.config import SimSettings, get_sim_settings
 from restaurantos.sim.playback import Playback, StateError, restock_days
-from restaurantos.sim.regions import edge_target_url, region_order_counts
+from restaurantos.sim.regions import (
+    edge_target_url,
+    region_order_counts,
+    vendor_region_map,
+)
 from restaurantos.sim.replaydata import (
     CacheMeta,
     ensure_cache,
@@ -41,7 +45,7 @@ from restaurantos.sim.replaydata import (
     require_window,
     to_order_request,
 )
-from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_pairs
+from restaurantos.sim.shard import counts_by_cell, vendor_pairs
 
 
 def _orders_fn(cache_file: Path, *, where: Callable[[dict], bool] | None = None):
@@ -70,19 +74,6 @@ def restock_vendors(data_dir: Path) -> list[tuple[str, str]]:
     the same errors."""
     pairs = vendor_pairs(manifest_rows(data_dir, "vendors.csv"))
     return sorted(pairs)
-
-
-def vendor_region_map(
-    pairs: list[tuple[str, str]], counts: dict[str, int], cluster: Cluster
-) -> dict[str, str]:
-    """vendor -> its region, built exactly the way bootstrap shards it:
-    the same `assign_shards` walk over `cluster.region_ids`, then each
-    vendor's geohash looked up in the result. `counts` is the
-    vendors-per-cell count of these same pairs (`shard.counts_by_cell`),
-    so the map cannot drift from bootstrap's sharding. Deterministic,
-    and no HQ call at run start."""
-    cell_region = dict(assign_shards(counts, cluster.region_ids))
-    return {vendor: cell_region[geohash] for vendor, geohash in pairs}
 
 
 def kitchen_urls(cluster: Cluster, edge_host: str) -> dict[str, str]:
@@ -129,6 +120,45 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
         )
         return 1
     common = get_settings()
+
+    # --- single-region mode: --region, --target edge, --sequential -----
+    # All of it before the cache is built (review round 4, item 2): a
+    # bad flag combination or cluster file must not pay for a cache
+    # first, and must not crash - `load_cluster` raises on a missing
+    # file or bad TOML, so it is handled here like every other start
+    # error, with one line and rc 1.
+    region = args.region
+    sequential = args.sequential
+    cluster: Cluster | None = None
+    if args.target == "edge" and region is None:
+        print(
+            "rosctl playback start: --target edge needs --region: "
+            "which region's edge API should the orders go to?",
+            file=sys.stderr,
+        )
+        return 1
+    if region is not None:
+        try:
+            cluster = load_cluster(args.config or common.cluster_file)
+        except (OSError, ValueError) as error:
+            print(f"rosctl playback start: {error}", file=sys.stderr)
+            return 1
+        if region not in cluster.region_ids:
+            print(
+                f"rosctl playback start: no region {region!r} in "
+                f"{args.config or common.cluster_file}; this cluster has "
+                f"{', '.join(cluster.region_ids)}",
+                file=sys.stderr,
+            )
+            return 1
+    if sequential and args.inflight not in (None, 1):
+        print(
+            "rosctl playback start: --sequential sends one order at a time; "
+            "drop --inflight, or pass 1",
+            file=sys.stderr,
+        )
+        return 1
+
     sim = get_sim_settings()
     data_dir = common.data_dir
     meta: CacheMeta = ensure_cache(data_dir)
@@ -150,39 +180,11 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
         )
 
     speed = args.speed or sim.playback_speed
-    # --- single-region mode: --region, --target edge, --sequential -----
-    region = args.region
-    sequential = args.sequential
-    cluster: Cluster | None = None
-    if args.target == "edge" and region is None:
-        print(
-            "rosctl playback start: --target edge needs --region: "
-            "which region's edge API should the orders go to?",
-            file=sys.stderr,
-        )
-        return 1
-    if region is not None:
-        cluster = load_cluster(args.config or common.cluster_file)
-        if region not in cluster.region_ids:
-            print(
-                f"rosctl playback start: no region {region!r} in "
-                f"{args.config or common.cluster_file}; this cluster has "
-                f"{', '.join(cluster.region_ids)}",
-                file=sys.stderr,
-            )
-            return 1
     if args.target == "edge":
         assert cluster is not None
         target = edge_target_url(cluster, region)
     else:
         target = args.target or sim.playback_target_url
-    if sequential and args.inflight not in (None, 1):
-        print(
-            "rosctl playback start: --sequential sends one order at a time; "
-            "drop --inflight, or pass 1",
-            file=sys.stderr,
-        )
-        return 1
     inflight = 1 if sequential else (args.inflight or sim.playback_inflight)
     events_on = sim.playback_status_events if args.events is None else args.events
     event_rate = (
@@ -267,6 +269,28 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
             f"({region_window_orders} in days {from_day}-{window.to_day})",
             file=sys.stderr,
         )
+    # --- the engine: every run on it shares the mode's facts -----------
+    # `run_meta` carries what holds for every run on this engine,
+    # including one started through the control API mid-process: the
+    # cache, the cluster file, and - in region mode - the region, its
+    # cached share and the sequential flag. What describes only the
+    # first CLI run (argv, its window count) stays in `meta_extra`.
+    run_meta: dict[str, Any] = {
+        "cache": {
+            "orders_sha256": meta.orders_sha256,
+            "warm_up_days": meta.warm_up_days,
+            "cached_orders": meta.orders,
+        },
+    }
+    if cluster_file is not None:
+        # routing per region: which cluster file decided the edges
+        run_meta["cluster"] = {"config": str(cluster_file)}
+    if region is not None:
+        run_meta["region"] = region
+        run_meta["region_cached_orders"] = region_cached_orders
+    if sequential:
+        run_meta["sequential"] = True
+
     playback = Playback(
         _orders_fn(cache_file, where=where),
         target_url=target,
@@ -297,6 +321,7 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
         kitchen_url=kitchen_override,
         kitchen_urls=None if kitchen_override is not None else edges,
         vendor_regions=vendor_regions,
+        run_meta=run_meta,
         sequential=sequential,
     )
 
@@ -327,28 +352,17 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
         return 1
 
     try:
-        # the original to_day goes to the engine: it records it as
+        # The original to_day goes to the engine: it records it as
         # to_day_requested in meta.json and its window check does the
-        # same shortening this command already reported
-        meta_extra: dict[str, Any] = {
-            "cache": {
-                "orders_sha256": meta.orders_sha256,
-                "warm_up_days": meta.warm_up_days,
-                "cached_orders": meta.orders,
-            },
-            "argv": sys.argv[1:],
-        }
-        if cluster_file is not None:
-            # routing per region: which cluster file decided the edges
-            meta_extra["cluster"] = {"config": str(cluster_file)}
+        # same shortening this command already reported. `cache`,
+        # `cluster`, `region` and `sequential` travel through the
+        # engine's `run_meta` (see above); this dict carries what
+        # describes the first CLI run only.
+        meta_extra: dict[str, Any] = {"argv": sys.argv[1:]}
         if region is not None:
-            # the run's meta records the mode, so a run log can be told
-            # apart from a full replay without reading argv back
-            meta_extra["region"] = region
-            meta_extra["region_cached_orders"] = region_cached_orders
+            # the first run's window count: a control-API start has its
+            # own window, so it cannot be an engine-wide fact
             meta_extra["region_window_orders"] = region_window_orders
-        if sequential:
-            meta_extra["sequential"] = True
         try:
             await playback.start(
                 seed=args.seed,

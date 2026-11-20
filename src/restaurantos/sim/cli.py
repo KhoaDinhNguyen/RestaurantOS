@@ -96,8 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="API base to POST orders to, or 'edge' for the chosen region's own "
-        "edge API (needs --region; the edge API does not serve POST /orders "
-        "until WP2 registers its routes) (default ROS_SIM_PLAYBACK_TARGET_URL)",
+        "edge API (needs --region) (default ROS_SIM_PLAYBACK_TARGET_URL)",
     )
     pstart.add_argument(
         "--sequential",
