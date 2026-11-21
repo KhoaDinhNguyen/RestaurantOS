@@ -22,7 +22,9 @@ NOT_BUILT = {
 }
 
 
-def app(argv: Sequence[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The `rosctl` parser, built separately from `app` so tests drive
+    the same parser the CLI uses (public surface, not internals)."""
     parser = argparse.ArgumentParser(
         prog="rosctl",
         description="Build, run and break the RestaurantOS cluster (WP6a).",
@@ -58,9 +60,10 @@ def app(argv: Sequence[str] | None = None) -> int:
     pstart.add_argument(
         "--config",
         type=Path,
-        default=Path("infra/cluster.toml"),
+        default=None,
         help="cluster description to route kitchen calls with - use the "
-        "file bootstrap ran with (default: infra/cluster.toml)",
+        "file bootstrap ran with (default: ROS_CLUSTER_FILE setting, "
+        "infra/cluster.toml)",
     )
     pstart.add_argument(
         "--speed",
@@ -83,10 +86,22 @@ def app(argv: Sequence[str] | None = None) -> int:
     pstart.add_argument("--seed", type=int, default=0, help="run seed (default 0)")
     pstart.add_argument("--run-id", type=str, default=None, help="runs/<run_id>/ to write")
     pstart.add_argument(
+        "--region",
+        type=str,
+        default=None,
+        help="only send this region's orders (the vendor-to-region split bootstrap uses)",
+    )
+    pstart.add_argument(
         "--target",
         type=str,
         default=None,
-        help="API base to POST orders to (default ROS_SIM_PLAYBACK_TARGET_URL)",
+        help="API base to POST orders to, or 'edge' for the chosen region's own "
+        "edge API (needs --region) (default ROS_SIM_PLAYBACK_TARGET_URL)",
+    )
+    pstart.add_argument(
+        "--sequential",
+        action="store_true",
+        help="one order at a time: wait for each response before the next (inflight 1)",
     )
     pstart.add_argument(
         "--kitchen-target",
@@ -172,7 +187,11 @@ def app(argv: Sequence[str] | None = None) -> int:
     for name, helptext in NOT_BUILT.items():
         sub.add_parser(name, help=helptext)
 
-    args = parser.parse_args(argv)
+    return parser
+
+
+def app(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
     if args.command == "bootstrap":
         from restaurantos.sim.bootstrap import BootstrapError, bootstrap
         from restaurantos.sim.datacheck import DataCheckError

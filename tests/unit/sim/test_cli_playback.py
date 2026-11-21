@@ -282,7 +282,7 @@ def test_vendor_regions_match_bootstraps_shards():
     from restaurantos.sim.bootstrap import _vendors_by_cell
     from restaurantos.sim.loading import REFERENCE_COLUMNS, read_rows
     from restaurantos.sim.mini import mini_dir
-    from restaurantos.sim.playback_cli import vendor_region_map
+    from restaurantos.sim.regions import vendor_region_map
     from restaurantos.sim.shard import assign_shards, counts_by_cell, vendor_counts
 
     data = mini_dir()
@@ -599,7 +599,11 @@ def test_config_decides_the_region_routing(tmp_path, monkeypatch, capsys, fresh_
     assert set(expected.values()) == {"r1", "r2"}
     assert captured["vendor_regions"] == expected
     assert set(captured["kitchen_urls"]) == {"r1", "r2"}
-    assert captured["start_kwargs"]["meta_extra"]["cluster"]["config"] == str(cluster_file)
+    # review round 4 (PR #7): the cluster file now travels with the
+    # engine (`run_meta`), so every run's meta - including one started
+    # through the control API - records it, and `meta_extra` does not
+    assert captured["run_meta"]["cluster"]["config"] == str(cluster_file)
+    assert "cluster" not in captured["start_kwargs"]["meta_extra"]
 
 
 def test_vendors_csv_is_read_once_by_a_playback_start(

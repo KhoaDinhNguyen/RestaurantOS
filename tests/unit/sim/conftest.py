@@ -156,6 +156,7 @@ def make_playback(
     kitchen_url: str | None = None,
     kitchen_urls: Mapping[str, str] | None = None,
     vendor_regions: Mapping[str, str] | None = None,
+    sequential: bool = False,
 ) -> Playback:
     """An engine over a fixed order list, posting to an in-process stub."""
     if transport is None:
@@ -181,6 +182,7 @@ def make_playback(
         kitchen_url=kitchen_url,
         kitchen_urls=kitchen_urls,
         vendor_regions=vendor_regions,
+        sequential=sequential,
     )
 
 

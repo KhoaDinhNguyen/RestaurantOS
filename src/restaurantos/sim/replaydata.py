@@ -32,7 +32,7 @@ import json
 import os
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import time as dt_time
 from pathlib import Path
@@ -403,8 +403,14 @@ def iter_orders(
     *,
     from_day: int | None = None,
     to_day: int | None = None,
+    where: Callable[[dict], bool] | None = None,
 ) -> Iterator[dict]:
-    """Yield cached orders as plain dicts, in replay order, streamed."""
+    """Yield cached orders as plain dicts, in replay order, streamed.
+
+    `where` drops orders that do not belong (the single-region mode
+    filters on the vendor's region); a dropped order is skipped, not
+    returned for, so the replay order of what remains is unchanged.
+    """
     with cache_file.open(encoding="utf-8") as f:
         for line in f:
             order = json.loads(line)
@@ -413,7 +419,22 @@ def iter_orders(
                 continue
             if to_day is not None and day > to_day:
                 return
+            if where is not None and not where(order):
+                continue
             yield order
+
+
+def count_orders(cache_file: Path, *, where: Callable[[dict], bool] | None = None) -> int:
+    """Orders in the cache that pass `where`, in one streaming pass.
+
+    The single-region mode prints this next to the cache's total order
+    count before sending anything, so a wrong region split is visible in
+    the share, not only in the run's outcome.
+    """
+    total = 0
+    for _order in iter_orders(cache_file, where=where):
+        total += 1
+    return total
 
 
 def to_order_request(order: dict) -> OrderRequest:
