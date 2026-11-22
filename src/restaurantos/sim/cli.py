@@ -166,6 +166,72 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="warm-up window W (default ROS_SIM_STOCK_WARM_UP_DAYS)",
     )
+    # --- oracle ---------------------------------------------------------
+    oracle = sub.add_parser(
+        "oracle",
+        help="the counting oracle: replay the stock rules with no database",
+    )
+    osub = oracle.add_subparsers(dest="oracle_command", required=True)
+    orun = osub.add_parser(
+        "run",
+        help="replay a window with the same rules place_order applies",
+    )
+    orun.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="cluster description to resolve the region with - use the "
+        "file bootstrap ran with (default ROS_CLUSTER_FILE setting, "
+        "infra/cluster.toml); needed with --region",
+    )
+    orun.add_argument(
+        "--region",
+        type=str,
+        default=None,
+        help="only replay this region's orders, the way a sequential run does",
+    )
+    orun.add_argument(
+        "--from-day",
+        type=int,
+        default=None,
+        help="first replay day (default: the first day after the warm-up window)",
+    )
+    orun.add_argument(
+        "--to-day",
+        type=int,
+        default=None,
+        help="last replay day (default: the last day in the cache)",
+    )
+    orun.add_argument(
+        "--restock-days",
+        type=int,
+        default=None,
+        help="restock every R days, as the run being checked did "
+        "(default ROS_SIM_STOCK_RESTOCK_DAYS)",
+    )
+    orun.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="runs/<run_id>/ to write report.jsonl, stock.csv and summary.json into "
+        "(default: oracle-<timestamp>)",
+    )
+    ocmp = osub.add_parser(
+        "compare",
+        help="check an oracle report against a sequential run's log and its region",
+    )
+    ocmp.add_argument(
+        "--run-id",
+        type=str,
+        required=True,
+        help="the playback run to compare against (runs/<run_id>/)",
+    )
+    ocmp.add_argument(
+        "--report-id",
+        type=str,
+        default=None,
+        help="the oracle report to check (default: the newest runs/oracle-*)",
+    )
     # --- baseline -------------------------------------------------------
     base = sub.add_parser(
         "baseline",
@@ -217,6 +283,16 @@ def app(argv: Sequence[str] | None = None) -> int:
             # a bad window or a bad cache: the user should see the
             # message, not a traceback.
             print(f"rosctl playback {args.play_command}: {error}", file=sys.stderr)
+            return 1
+    if args.command == "oracle":
+        from restaurantos.sim.oracle_cli import run as run_oracle
+
+        try:
+            return run_oracle(args)
+        except ValueError as error:
+            # a bad window, a bad cache or a broken report: the message,
+            # not a traceback. Genuine bugs keep their exception.
+            print(f"rosctl oracle {args.oracle_command}: {error}", file=sys.stderr)
             return 1
     if args.command == "baseline" and args.baseline_command == "sync":
         from restaurantos.common.cluster import load_cluster
