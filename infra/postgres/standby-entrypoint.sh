@@ -6,7 +6,7 @@
 # Needs: ROS_PRIMARY_HOST, ROS_PRIMARY_PORT, ROS_REPL_PASSWORD, ROS_SLOT_NAME.
 set -euo pipefail
 
-primary="host=${ROS_PRIMARY_HOST} port=${ROS_PRIMARY_PORT} user=replicator password=${ROS_REPL_PASSWORD}"
+primary="host=${ROS_PRIMARY_HOST} port=${ROS_PRIMARY_PORT} user=replicator password=${ROS_REPL_PASSWORD} application_name=${ROS_SLOT_NAME}"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
     echo "standby: waiting for primary at ${ROS_PRIMARY_HOST}:${ROS_PRIMARY_PORT}"

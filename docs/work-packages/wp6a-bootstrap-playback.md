@@ -137,3 +137,12 @@ What each line needs is marked in front of it (the marks are explained in `READM
 - 2 million orders and 4 million order lines: stream the files, do not build Python objects for all of them up front.
 - At 1,000x the sender itself can become the bottleneck. Measure how many orders per second playback can emit against a stub before trusting any throughput number.
 - Never commit anything from `data/`, `runs/` or `infra/generated/`.
+
+## Synchronous generated clusters
+
+With `synchronous = true` and `standbys = true`, the generator configures
+HQ and regional synchronous replication with matched standby application
+names. Initialization enables the policy after schema setup, in a reloadable
+configuration file. Baseline remains asynchronous. Coordinator fallback can
+downgrade after standby loss; healing never silently re-enables sync. See
+`infra/postgres/README.md` for recovery and acceptance commands.

@@ -13,10 +13,11 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from restaurantos.common.cluster import HQ_PRIMARY, Cluster, service_port
+from restaurantos.common.cluster import Cluster, service_port
 from restaurantos.common.config import Settings
 from restaurantos.common.db import make_pool, node_conninfo, probe_node, run_on
 from restaurantos.common.errors import RegionUnreachableError
+from restaurantos.common.hq import HQPool
 from restaurantos.common.localnode import NodeView
 from restaurantos.common.locks import CLUSTER_EVENTS_LOCK_KEY
 from restaurantos.common.sqlfiles import load_query
@@ -54,6 +55,7 @@ class Coordinator:
             node: make_pool(node_conninfo(cluster, node, settings=self.settings), self.settings)
             for node in cluster.nodes
         }
+        self.hq_pool = HQPool(cluster, self.settings, pools=self.pools)
         self.health = {
             node: NodeHealth(
                 NodeStatus(
@@ -85,6 +87,7 @@ class Coordinator:
     async def _reconcile_regions(self) -> None:
         # step() always rereads/locks the directory row; cached figures never
         # authorize a promotion. Reconciliation also runs on the first cycle.
+        await self.replication.step_hq()
         for region_id in self.cluster.region_ids:
             await self.failover.step(region_id)
             await self.replication.step(region_id)
@@ -121,11 +124,6 @@ class Coordinator:
                 and body.get("node_id") == node
                 and isinstance(body.get("reachable"), bool)
             ):
-                # The current shared gateway probe queries node_state,
-                # which only regions have. A negative HQ reply is ambiguous
-                # until WP0/WP2 adds an HQ-aware probe.
-                if node.startswith("hq-") and not body["reachable"]:
-                    return None
                 return body["reachable"]
         except httpx.HTTPError, ValueError:
             logger.warning("Gateway could not confirm health of %s", node)
@@ -177,9 +175,7 @@ class Coordinator:
                 return await cursor.fetchall()
 
         try:
-            rows = await run_on(
-                self.pools[HQ_PRIMARY], read, region_id="hq", settings=self.settings
-            )
+            rows = await run_on(self.hq_pool, read, region_id="hq", settings=self.settings)
         except RegionUnreachableError:
             return
         current = {}
@@ -226,6 +222,7 @@ class Coordinator:
         batch = list(self.pending_events)
 
         async def write(conn: AsyncConnection) -> None:
+            await conn.execute(load_query("coordinator/local_epoch_commit"))
             await conn.execute(
                 load_query("coordinator/lock_events"), {"lock_key": CLUSTER_EVENTS_LOCK_KEY}
             )
@@ -233,7 +230,7 @@ class Coordinator:
                 await conn.execute(load_query("coordinator/record_event"), event)
 
         try:
-            await run_on(self.pools[HQ_PRIMARY], write, region_id="hq", settings=self.settings)
+            await run_on(self.hq_pool, write, region_id="hq", settings=self.settings)
         except RegionUnreachableError:
             return
         del self.pending_events[: len(batch)]
@@ -258,7 +255,7 @@ class Coordinator:
                 await cursor.execute(load_query(name), {"since": since, "page_size": limit})
                 return await cursor.fetchall()
 
-        return await run_on(self.pools[HQ_PRIMARY], read, region_id="hq", settings=self.settings)
+        return await run_on(self.hq_pool, read, region_id="hq", settings=self.settings)
 
     async def events(self, since: int | None, limit: int) -> list[ClusterEvent]:
         return [ClusterEvent(**row) for row in await self._page("events", since, limit)]

@@ -5,10 +5,11 @@ import logging
 
 from psycopg_pool import AsyncConnectionPool
 
-from restaurantos.common.cluster import HQ_PRIMARY, Cluster
+from restaurantos.common.cluster import Cluster
 from restaurantos.common.config import Settings
 from restaurantos.common.db import find_local_primary, make_pool, node_conninfo
 from restaurantos.common.errors import RegionUnreachableError, StaleEpochError
+from restaurantos.common.hq import HQPool
 from restaurantos.relay.config import RelaySettings
 from restaurantos.relay.hq_apply import apply_batch
 from restaurantos.relay.outbox import mark_relayed, read_epoch, read_pending
@@ -17,7 +18,12 @@ logger = logging.getLogger(__name__)
 
 
 async def run_region_relay(
-    cluster: Cluster, region_id: str, settings: Settings, relay: RelaySettings
+    cluster: Cluster,
+    region_id: str,
+    settings: Settings,
+    relay: RelaySettings,
+    *,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
     loop = asyncio.get_running_loop()
     current = None
@@ -42,10 +48,9 @@ async def run_region_relay(
             region_pool = make_pool(conninfo, settings)
             await region_pool.open()
 
-    hq_conninfo = node_conninfo(cluster, HQ_PRIMARY, settings=settings)
     try:
-        async with make_pool(hq_conninfo, settings) as hq_pool:
-            while True:
+        async with HQPool(cluster, settings) as hq_pool:
+            while stop_event is None or not stop_event.is_set():
                 await refresh_primary()
                 pool = region_pool
                 if pool is not None and loop.time() >= next_poll:

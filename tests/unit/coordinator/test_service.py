@@ -123,14 +123,14 @@ def test_invalid_heartbeat_settings(field, value):
         CoordinatorSettings(_env_file=None, **{field: value})
 
 
-async def test_negative_hq_gateway_probe_is_unconfirmed(runtime):
+async def test_negative_hq_gateway_probe_is_confirmed(runtime):
     await runtime.http.aclose()
     runtime.http = httpx.AsyncClient(
         transport=httpx.MockTransport(
             lambda request: httpx.Response(200, json={"node_id": "hq-primary", "reachable": False})
         )
     )
-    assert await runtime._gateway_probe("hq-primary") is None
+    assert await runtime._gateway_probe("hq-primary") is False
 
 
 async def test_order_rate_uses_sample_difference_and_resets_after_stats_reset(runtime, monkeypatch):

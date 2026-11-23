@@ -1,7 +1,7 @@
 """FastAPI application for the RestaurantOS gateway and edge API."""
 
 import asyncio
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -9,14 +9,15 @@ from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from restaurantos.common.cluster import HQ_PRIMARY, load_cluster
+from restaurantos.common.cluster import load_cluster
 from restaurantos.common.config import get_settings
-from restaurantos.common.db import make_pool, node_conninfo, probe_node
+from restaurantos.common.db import node_conninfo, probe_node
 from restaurantos.common.errors import (
     RegionUnreachableError,
     StaleEpochError,
     UnknownVendorError,
 )
+from restaurantos.common.hq import HQPool
 from restaurantos.common.models import (
     OrderRequest,
     OrderResponse,
@@ -70,10 +71,14 @@ async def refresh_directory_periodically(
     directory: DirectoryCache,
     hq_pool,
     interval_s: float,
+    *,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
     """Refresh the Gateway shard directory on its configured interval."""
-    while True:
+    while stop_event is None or not stop_event.is_set():
         await asyncio.sleep(interval_s)
+        if stop_event is not None and stop_event.is_set():
+            break
 
         try:
             await directory.refresh(hq_pool)
@@ -84,10 +89,14 @@ async def refresh_directory_periodically(
 async def refresh_edge_primary_periodically(
     primary: EdgePrimary,
     interval_s: float,
+    *,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
     """Refresh the edge API's local primary on its configured interval."""
-    while True:
+    while stop_event is None or not stop_event.is_set():
         await asyncio.sleep(interval_s)
+        if stop_event is not None and stop_event.is_set():
+            break
         await primary.refresh()
 
 
@@ -136,6 +145,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        refresh_stop = asyncio.Event()
         region_pools = RegionPools(
             cluster,
             settings,
@@ -144,10 +154,7 @@ def create_app() -> FastAPI:
         app.state.region_pools = region_pools
 
         if settings.mode == "gateway":
-            hq_pool = make_pool(
-                node_conninfo(cluster, HQ_PRIMARY, settings=settings),
-                settings,
-            )
+            hq_pool = HQPool(cluster, settings)
             await hq_pool.open()
             app.state.hq_pool = hq_pool
 
@@ -164,6 +171,7 @@ def create_app() -> FastAPI:
                     directory,
                     hq_pool,
                     gateway_settings.directory_refresh_s,
+                    stop_event=refresh_stop,
                 )
             )
         else:
@@ -182,24 +190,20 @@ def create_app() -> FastAPI:
                 refresh_edge_primary_periodically(
                     edge_primary,
                     gateway_settings.local_check_s,
+                    stop_event=refresh_stop,
                 )
             )
 
         try:
             yield
         finally:
+            refresh_stop.set()
             if settings.mode == "gateway":
-                directory_refresh_task.cancel()
-
-                with suppress(asyncio.CancelledError):
-                    await directory_refresh_task
+                await directory_refresh_task
 
                 await app.state.hq_pool.close()
             else:
-                edge_primary_task.cancel()
-
-                with suppress(asyncio.CancelledError):
-                    await edge_primary_task
+                await edge_primary_task
 
             await region_pools.close()
 

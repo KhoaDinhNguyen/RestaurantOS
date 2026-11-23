@@ -8,10 +8,11 @@ from contextlib import AsyncExitStack
 from psycopg import AsyncConnection
 from psycopg_pool import AsyncConnectionPool
 
-from restaurantos.common.cluster import HQ_PRIMARY, Cluster
+from restaurantos.common.cluster import Cluster
 from restaurantos.common.config import Settings
 from restaurantos.common.db import make_pool, node_conninfo, run_on
 from restaurantos.common.errors import RegionUnreachableError, StaleEpochError
+from restaurantos.common.hq import HQPool
 from restaurantos.common.models import OrderRequest, OrderResult
 from restaurantos.common.sqlfiles import load_query
 from restaurantos.relay.config import RelaySettings
@@ -91,13 +92,14 @@ async def run_hq_worker(
     relay: RelaySettings,
     place_order: PlaceOrder,
     apply_menu_version: ApplyMenuVersion,
+    *,
+    stop_event: asyncio.Event | None = None,
 ) -> None:
     """Drain orders and publish menus independently for every region."""
 
     async def drain_region(region_id: str) -> None:
-        conninfo = node_conninfo(cluster, HQ_PRIMARY, direct=True, settings=settings)
-        async with make_pool(conninfo, settings) as hq_pool:
-            while True:
+        async with HQPool(cluster, settings, direct=True) as hq_pool:
+            while stop_event is None or not stop_event.is_set():
                 try:
                     await publish_menu(hq_pool, cluster, region_id, settings, apply_menu_version)
                 except (RegionUnreachableError, StaleEpochError) as exc:

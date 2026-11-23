@@ -38,6 +38,17 @@ async def outbox():
 
 
 @pytest.fixture
-async def hq():
+async def hq(monkeypatch):
+    from restaurantos.relay import holding, worker
+
     async with relay_schema("hq") as db:
+        # These tests isolate schemas on a single PostgreSQL server. Keep
+        # HQ selection inside this fixture instead of reaching a real cluster;
+        # the cluster acceptance test covers selection across physical nodes.
+        @asynccontextmanager
+        async def headquarters_pool(*args, **kwargs):
+            yield db[1]
+
+        monkeypatch.setattr(holding, "HQPool", headquarters_pool)
+        monkeypatch.setattr(worker, "HQPool", headquarters_pool)
         yield db

@@ -272,6 +272,17 @@ The edge API and the relay talk to their own region's primary on the local netwo
 
 The rule itself is `common.localnode.pick_local_primary`, a function with no I/O, so both processes apply exactly the same one. Two things follow from it. Writes that reach the old primary between the promotion and the next look are lost with that node; the window is one timer interval. And a promotion must write the new epoch to the promoted node straight after `pg_promote()`, because that write is what moves the local processes.
 
+**HQ client selection after D10.** HQ promotion is manual and physically
+fences the old primary. HQ has no regional epoch. Gateway, coordinator,
+regional relays and the HQ worker use `common.hq.HQPool` to choose exactly one
+reachable writable HQ node on each transaction. If both are writable, or
+neither is writable, requests fail unavailable rather than choosing one.
+Existing per-node proxies retain their targets and names; the HQ worker's
+connections remain local and direct. The selector does not retry business
+writes. `rosctl hq rejoin` recovers the fenced old primary as a standby using
+system identity, timeline and role checks, with rewind or rebuild. Rejoin
+does not switch roles back or re-enable synchronous mode.
+
 ### How vendors are assigned to regions
 
 Static, and decided once at bootstrap. A vendor belongs to its geohash cell (`vendors.geohash`), and each cell belongs to one region (`shard_directory`). There is no per-vendor placement and nothing moves while the system runs. The number of regions comes from `infra/cluster.toml`, so the ranges are computed, not hard-coded. The only dynamic case is the stretch goal: move one hot cell to another region, flip its directory row and bump the epoch.

@@ -16,7 +16,6 @@ from psycopg import AsyncConnection
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from restaurantos.common.cluster import HQ_PRIMARY
 from restaurantos.common.db import node_conninfo, probe_node, run_on
 from restaurantos.common.errors import RegionUnreachableError
 from restaurantos.common.localnode import NodeView, local_nodes
@@ -81,6 +80,7 @@ class Failover:
         deadline = time.monotonic() + runtime.config.failover_timeout_s
 
         async def reconcile(conn):
+            await conn.execute(load_query("coordinator/local_epoch_commit"))
             await conn.execute(
                 load_query("coordinator/promotion_limits"),
                 {"timeout_ms": str(int(runtime.config.failover_timeout_s * 1000))},
@@ -216,9 +216,7 @@ class Failover:
                 )
 
         # A 200 result leaves this method only after HQ commits its swap/event.
-        return await run_on(
-            runtime.pools[HQ_PRIMARY], reconcile, region_id="hq", settings=self.settings
-        )
+        return await run_on(runtime.hq_pool, reconcile, region_id="hq", settings=self.settings)
 
     async def node_call(self, node: str, query: str, params: dict) -> tuple | None:
         async def execute(conn):

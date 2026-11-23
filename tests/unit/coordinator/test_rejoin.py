@@ -67,7 +67,7 @@ def db(monkeypatch, plan):
     cursor.fetchone.return_value = (plan.region_id, plan.epoch, plan.source, plan.target)
     conn.execute.return_value = cursor
     pool = SimpleNamespace(open=AsyncMock(), close=AsyncMock())
-    monkeypatch.setattr(rejoin, "make_pool", lambda *args: pool)
+    monkeypatch.setattr(rejoin, "HQPool", lambda *args: pool)
 
     async def run(pool, work, **kwargs):
         return await work(conn)

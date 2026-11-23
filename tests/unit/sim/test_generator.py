@@ -136,12 +136,18 @@ def test_toxiproxy_publishes_the_api_and_every_proxy_port():
             assert f'- "127.0.0.1:{port}:{port}"' in block, (regions, port)
 
 
-def test_synchronous_replication_is_refused_not_faked():
-    # nothing sets it today and the regions=1 output must match the
-    # committed (asynchronous) baseline; refuse loudly instead of writing
-    # a file that does not do what the cluster description says
-    with pytest.raises(NotImplementedError, match="synchronous"):
-        compose_text(Cluster(regions=1, synchronous=True))
+def test_synchronous_replication_uses_reloadable_matched_names():
+    generated = compose_text(Cluster(regions=2, synchronous=True))
+    for scope in ("hq", "r1", "r2"):
+        block = service_block(generated, f"{scope}-primary")
+        assert f"ROS_SYNC_STANDBY: {scope}_standby" in block
+        assert "synchronous_standby_names" not in block
+    assert "ROS_SYNC_STANDBY" not in service_block(generated, BASELINE)
+
+
+def test_synchronous_replication_requires_standbys():
+    with pytest.raises(ValueError, match="requires standbys"):
+        compose_text(Cluster(standbys=False, synchronous=True))
 
 
 def test_generate_writes_both_files(tmp_path):

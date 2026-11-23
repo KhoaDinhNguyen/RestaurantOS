@@ -87,7 +87,7 @@ def operation(monkeypatch, layout):
         promoted=0,
     )
     cursor = AsyncMock()
-    conn = SimpleNamespace(execute=AsyncMock())
+    conn = SimpleNamespace(execute=AsyncMock(), set_autocommit=AsyncMock())
     calls = []
 
     async def execute(sql, params=None):
@@ -101,6 +101,8 @@ def operation(monkeypatch, layout):
             state.promoted += 1
             state.recovery = False
             row = (True,)
+        elif "current_setting('synchronous_standby_names')" in sql:
+            row = ("",)
         elif "AS event_id" in sql:
             row = (state.event,)
         else:
@@ -153,9 +155,9 @@ async def test_fence_then_promote_and_committed_event(operation):
         "primary_node": HQ_STANDBY,
         "old_primary_stopped": True,
         "event_id": 9,
-        "client_switch_required": True,
+        "client_switch_required": False,
     }
-    assert state.promoted == 1 and state.committed == 2
+    assert state.promoted == 1 and state.committed == 4
     payload = next(c for c in hq.command.await_args_list if c.args[0][1] == "update")
     assert payload.args[0] == ["docker", "update", "--restart=no", "hq-primary-id"]
     assert any("INSERT INTO cluster_events" in sql for sql in calls)
@@ -226,11 +228,11 @@ def test_rosctl_requires_authorization_before_docker(monkeypatch, capsys):
 
 
 def test_rosctl_outputs_database_scope_and_handoff_warning(monkeypatch, capsys):
-    monkeypatch.setattr(hq, "promote", AsyncMock(return_value={"client_switch_required": True}))
+    monkeypatch.setattr(hq, "promote", AsyncMock(return_value={"client_switch_required": False}))
     assert app(["hq", "promote", "--compose-file", "scratch.yaml", "--yes"]) == 0
     output = capsys.readouterr()
-    assert json.loads(output.out)["client_switch_required"] is True
-    assert "Services still target hq-primary" in output.err
+    assert json.loads(output.out)["client_switch_required"] is False
+    assert not output.err
 
 
 def test_rosctl_failure_is_actionable_without_traceback(monkeypatch, capsys):

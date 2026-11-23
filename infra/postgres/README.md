@@ -188,67 +188,92 @@ competing coordinator instances, the committed event ID, epoch fencing, local
 primary selection, and rejection of an unsafe repeat. Recreate that disposable
 cluster after the run.
 
-## HQ database promotion (D10)
-
-This is the database promotion step. It does **not** restore all HQ service
-traffic: gateway, coordinator and relay code currently select `hq-primary`.
-The team must agree on HQ target selection before those services can move to
-the promoted node. The command neither rewrites proxies nor changes shared
-settings. The HQ worker also uses a direct connection to `hq-primary`.
-
-Run from the Docker host, using the Compose file of the running cluster:
+## HQ promotion, client switching and rejoin (D10)
 
 ```bash
-# Dev cluster; use infra/generated/compose.yaml for a bootstrapped cluster.
+# Select the running cluster explicitly; use infra/generated/compose.yaml
+# and the matching --config for a bootstrapped cluster.
 uv run rosctl hq promote --compose-file infra/compose.yaml --yes
+uv run rosctl hq rejoin --compose-file infra/compose.yaml --yes
 ```
 
-Pass `--config <file>` if bootstrap used a nondefault cluster description.
-The command requires an explicit Compose file and `--yes`: it stops the old
-HQ primary and asynchronous replication may have lost unreplicated writes.
-The command is one-way, from `hq-primary` to `hq-standby`. HQ has no regional
-epoch or `region_state` row of its own; no such row is invented.
+Promotion validates the containers' project, separate named data volumes,
+PostgreSQL image, HQ schema and physical database identity. It disables the
+old primary's restart policy, stops it and verifies the fence before
+`pg_promote(false)`. Only then does it commit a deduplicated failover event.
+A retry can finish a partially completed promotion. HQ has no regional epoch
+or directory row; none is invented. Promotion leaves HQ asynchronous until
+an operator explicitly enables synchronous replication again.
 
-Before promotion, the command checks the containers' Compose project, actual
-named data volumes, PostgreSQL image, HQ schema and database system identifier.
-It reads the old primary's identifier from a read-only, network-isolated
-`pg_controldata` helper using the already installed image, including after a
-crash. A candidate-side advisory lock serializes competing promotion commands.
-The standby is reached through the existing coordinator proxy. If that path
-is unavailable, no fence or promotion is attempted.
+Gateway, coordinator, regional relays and the HQ worker use `common.hq.HQPool`.
+Each transaction probes both HQ nodes and chooses the sole writable node.
+Two writable nodes, or no writable node, produce an unavailable result; no
+client promotes a node. Gateway/coordinator/relay probes use their unchanged
+Toxiproxy proxies; the HQ worker keeps its documented direct local access.
+The selector never replays business writes: the caller's existing inbox/
+outbox idempotency remains responsible for retries after uncertain outcomes.
+Success from promotion reports `client_switch_required: false`. Services
+already running discover the new primary on their next transaction, without
+configuration edits, renamed proxies or process restarts.
 
-The command disables the old container's automatic restart policy, stops it,
-and verifies the fence **before** issuing `pg_promote(false)`. It confirms the
-new writable role, then commits a `failover` event at the promoted HQ with
-`region_id: null` and `detail.scope: "hq"`. Event inserts use the existing
-commit-order lock; retries use the database identity and WAL timeline to avoid
-duplicate events. The control event flushes locally even if synchronous
-settings remain from the old configuration.
+HQ rejoin requires the old primary to remain stopped with automatic restart
+disabled, plus a committed promotion event on the new primary. It shares the
+candidate operation lock with promotion. The existing offline recovery script
+uses `pg_rewind`, or rebuilds with `pg_basebackup` if rewind prerequisites or
+WAL are missing. For HQ it validates system identity, timeline and recovery
+role instead of a regional epoch. Only the old node's volume can be replaced.
+It then follows the promoted node through `hq-primary__hq-standby` and is
+reported ready only after it is in recovery and streaming. Rejoin does not
+switch the primary back or automatically re-enable synchronous replication.
+Keep lifecycle commands from running concurrently with promotion/rejoin.
+Do not manually restart an unrejoined old primary.
 
-Success prints JSON with `primary_node`, `old_primary_stopped`, `event_id`, and
-`client_switch_required: true`, plus a routing warning on stderr. Exit zero
-means database promotion and its event committed; it does not mean the
-gateway or relay has switched. An error returns nonzero and asks the operator
-to inspect HQ before retrying. A retry can finish event recording after the
-database was promoted, without another promotion. The role-confirmation
-window uses `ROS_COORDINATOR_FAILOVER_TIMEOUT_S` (default 15 seconds); each
-Docker subprocess has a ten-second deadline and database calls use the
-shared noncancelling deadline helper.
+Asynchronous promotion can lose unreplicated writes, including HQ holding-
+queue or relay acknowledgements. The selector cannot repair those losses.
+The acceptance test re-enables synchronous replication before promotions to
+check that acknowledged work survives. Full-data experiments still need to
+report asynchronous failover losses separately.
 
-Keep the old primary stopped. Do not restart it, run `compose up` over it, or
-reset its restart policy before a coordinated HQ rebuild/rejoin. The existing
-regional rejoin command intentionally refuses HQ; HQ rejoin and HQ client
-selection remain follow-ups. Lifecycle commands and promotion must not run
-concurrently against the same containers.
+## Synchronous bootstrap and fallback
 
-The real PostgreSQL test resets only an explicitly selected scratch project
-whose name begins with `restaurantos-hq-`. It promotes once from a healthy
-primary and once after a real crash, tests lock conflicts and unreachable
-standby rejection, interrupts before event recording, and verifies a retry
-and repeated invocation produce one event. **It deletes that scratch
-project's volumes**; never point it at a populated topology:
+Set `synchronous = true` together with `standbys = true` in the cluster TOML,
+then bootstrap an empty generated cluster. The generator sets internal
+`ROS_SYNC_STANDBY` values for HQ and each region; baseline stays asynchronous.
+`init-primary.sh` writes the policy to `postgresql.auto.conf` after schema
+initialization, and the final server restart enables it. Initial schema
+transactions therefore cannot wait on a standby which has not cloned yet.
+The standby connects with an `application_name` matching its slot name.
+The policy is reloadable, not a PostgreSQL command-line override, so fallback
+can change it with `ALTER SYSTEM` and a reload.
+
+Region fallback keeps its existing HQ intent/completion journal. HQ fallback
+journals its own intent locally, changes its policy on a later cycle, verifies
+the actual setting, and commits its completion event. It can resume that work
+after a coordinator restart. Coordinator control transactions flush WAL
+locally: waiting for a missing HQ standby while holding the event-feed lock
+would otherwise prevent HQ's fallback journal from being written. Business
+transactions retain their configured synchronous commit policy.
+Fallback is sticky after a link heals. To repeat a synchronous experiment,
+explicitly restore the policy with the current standby's application name
+or bootstrap a new disposable cluster; do not assume names still match their
+bootstrap roles after promotion.
+
+## Acceptance with live orders
+
+`tests/cluster/test_wp5_acceptance.py` starts real gateway/edge applications,
+coordinator loops and both relay roles against a generated synchronous
+one-region cluster, using only the public mini reference fixture. It runs
+concurrent orders through sync standby loss, regional T1, real-crash T1b,
+T2, two-second T5 latency, HQ promotion and rejoin, and menu publishing. It
+checks acknowledged IDs
+against regional orders and HQ analytics after queues drain.
 
 ```bash
-ROS_HQ_TEST_COMPOSE=/path/to/scratch/compose.yaml ROS_NETWORK=host \
-uv run pytest tests/cluster/test_hq_promotion.py -q
+ROS_WP5_ACCEPTANCE_COMPOSE=/path/to/scratch/compose.yaml ROS_NETWORK=host \
+uv run pytest tests/cluster/test_wp5_acceptance.py -q -s
 ```
+
+The Compose project must begin with `restaurantos-wp5-`. This test deletes
+that project's volumes. Never use a populated cluster. It is functional
+acceptance under concurrent requests, not a throughput benchmark or the
+restricted full-dataset performance experiment.
