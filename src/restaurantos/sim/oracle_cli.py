@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import shlex
 import sys
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -412,11 +413,16 @@ def _newest_report_id(runs_dir: Path) -> str | None:
 
 def _rerun_hint(run_id: str, run_meta: dict[str, Any], region: str) -> str:
     """The `oracle run` that writes a report for exactly this run's scope:
-    its region, cluster file, window and restock interval."""
-    parts = ["rosctl oracle run", f"--region {region}"]
+    its region, cluster file, window and restock interval.
+
+    The values read from meta.json are shell-quoted, so a cluster file
+    path with a space still pastes as one argument. `<new id>` stays a
+    bare placeholder for the operator to replace.
+    """
+    parts = ["rosctl oracle run", f"--region {shlex.quote(region)}"]
     cluster_file = (run_meta.get("cluster") or {}).get("config")
     if cluster_file:
-        parts.append(f"--config {cluster_file}")
+        parts.append(f"--config {shlex.quote(str(cluster_file))}")
     parts.append(f"--from-day {run_meta.get('from_day')} --to-day {run_meta.get('to_day')}")
     every = (run_meta.get("restock") or {}).get("every")
     if every is not None:

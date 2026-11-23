@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import os
+import shlex
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -836,3 +837,23 @@ def test_run_writes_the_summary_whole_and_leaves_no_temporary_file(
     run_dir = tmp_path / "runs" / "o-atomic"
     assert json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))["orders"] > 0
     assert not (run_dir / "summary.json.tmp").exists()
+
+
+def test_the_hint_quotes_a_cluster_file_with_a_space(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """The printed command must paste into a shell as written."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    meta_file = tmp_path / "runs" / "run1" / "meta.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    meta["cluster"]["config"] = "infra/my cluster.toml"
+    meta_file.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")], region_cached_orders=9)
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    command = capsys.readouterr().err.split("`rosctl oracle run")[1].split("`")[0]
+    assert "--config 'infra/my cluster.toml'" in command
+    assert shlex.split(f"rosctl oracle run{command}")[5:7] == ["--config", "infra/my cluster.toml"]
