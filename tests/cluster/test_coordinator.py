@@ -10,6 +10,7 @@ import socket
 import sys
 import tempfile
 from datetime import UTC, datetime
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import httpx
@@ -39,7 +40,10 @@ async def eventually(check):
 
 
 @pytest.fixture
-async def live():
+async def live(monkeypatch):
+    # These tests isolate health/admin behavior. Real, irreversible promotion
+    # runs on a disposable cluster in test_coordinator_failover.py.
+    monkeypatch.setattr(service.Failover, "step", AsyncMock())
     cluster = load_cluster()
     settings = Settings(
         _env_file=None,

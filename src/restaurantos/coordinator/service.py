@@ -21,6 +21,7 @@ from restaurantos.common.localnode import NodeView
 from restaurantos.common.locks import CLUSTER_EVENTS_LOCK_KEY
 from restaurantos.common.sqlfiles import load_query
 from restaurantos.coordinator.config import CoordinatorSettings
+from restaurantos.coordinator.failover import Failover
 from restaurantos.coordinator.health import NodeHealth
 from restaurantos.coordinator.models import (
     ClusterEvent,
@@ -67,6 +68,7 @@ class Coordinator:
         self.pending_events: list[dict] = []
         self.stop = asyncio.Event()
         self.tasks: list[asyncio.Task] = []
+        self.failover = Failover(self)
 
     async def start(self) -> None:
         for pool in self.pools.values():
@@ -76,6 +78,13 @@ class Coordinator:
             for node in self.cluster.nodes
         ]
         self.tasks.append(asyncio.create_task(self._repeat(self._sample_figures)))
+        self.tasks.append(asyncio.create_task(self._repeat(self._reconcile_regions)))
+
+    async def _reconcile_regions(self) -> None:
+        # step() always rereads/locks the directory row; cached figures never
+        # authorize a promotion. Reconciliation also runs on the first cycle.
+        for region_id in self.cluster.region_ids:
+            await self.failover.step(region_id)
 
     async def close(self) -> None:
         self.stop.set()
