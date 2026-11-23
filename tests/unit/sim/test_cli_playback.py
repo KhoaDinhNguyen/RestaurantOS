@@ -314,6 +314,46 @@ def test_start_refuses_a_sample_rate_outside_zero_to_one(capsys):
         assert "must be a number in [0, 1]" in capsys.readouterr().err, bad
 
 
+def test_start_refuses_a_duplicate_rate_outside_zero_to_one(capsys):
+    """The duplicates PR: the same discipline as the sample rate - the
+    CLI override skips pydantic, so a bad rate refuses here, before the
+    cache is built or anything starts."""
+    for bad in ("1.5", "-0.1", "nan", "inf"):
+        rc = app(["playback", "start", "--duplicate-rate", bad, "--port", "1"])
+        assert rc == 1, bad
+        assert "must be a number in [0, 1]" in capsys.readouterr().err, bad
+
+
+def test_start_refuses_a_negative_duplicate_offset(capsys):
+    # "-inf" would read as an option flag, so the = form; -1 and nan are
+    # plain values
+    for bad in ("-1", "nan"):
+        rc = app(["playback", "start", "--duplicate-offset-s", bad, "--port", "1"])
+        assert rc == 1, bad
+        assert "must be a number >= 0" in capsys.readouterr().err, bad
+    rc = app(["playback", "start", "--duplicate-offset-s=-inf", "--port", "1"])
+    assert rc == 1
+    assert "must be a number >= 0" in capsys.readouterr().err
+
+
+def test_start_refuses_a_shuffle_window_below_one(capsys):
+    rc = app(["playback", "start", "--shuffle-window", "0", "--port", "1"])
+    assert rc == 1
+    assert "must be at least 1" in capsys.readouterr().err
+
+
+def test_start_refuses_shuffle_with_sequential(capsys):
+    """Sequential mode's whole point is in-order, one-at-a-time
+    delivery the oracle can match; shuffle would quietly break it.
+    The engine refuses the combination too - this is the CLI saying it
+    before anything is built."""
+    rc = app(["playback", "start", "--from-day", "14", "--shuffle", "--sequential", "--port", "1"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "--shuffle cannot run with --sequential" in err
+    assert "duplicates are allowed in any mode" in err
+
+
 def test_start_refuses_a_window_inside_the_warmup(tmp_path, monkeypatch, capsys, fresh_settings):
     # a tiny valid data directory whose cache starts at day 14
     import hashlib
@@ -471,6 +511,7 @@ def _install_fake_start(monkeypatch, captured: dict) -> None:
                 "orders_parked": 0,
                 "orders_refused": 0,
                 "orders_failed": 0,
+                "orders_resent": 0,
                 "events_sent": 0,
                 "events_acked": 0,
                 "events_duplicate": 0,

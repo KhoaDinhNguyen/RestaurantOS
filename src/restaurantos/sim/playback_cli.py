@@ -119,6 +119,38 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
             file=sys.stderr,
         )
         return 1
+    # The duplicates/shuffle flags are checked before anything is built
+    # (the same discipline as the sample rate): a NaN or a share outside
+    # [0, 1] would silently drop or keep every resend. The settings-side
+    # values are pydantic-validated; only the CLI overrides need this.
+    duplicate_rate_arg = args.duplicate_rate
+    if duplicate_rate_arg is not None and not (
+        math.isfinite(duplicate_rate_arg) and 0.0 <= duplicate_rate_arg <= 1.0
+    ):
+        print(
+            f"rosctl playback start: --duplicate-rate {duplicate_rate_arg} "
+            "must be a number in [0, 1]",
+            file=sys.stderr,
+        )
+        return 1
+    duplicate_offset_arg = args.duplicate_offset_s
+    if duplicate_offset_arg is not None and not (
+        math.isfinite(duplicate_offset_arg) and duplicate_offset_arg >= 0.0
+    ):
+        print(
+            f"rosctl playback start: --duplicate-offset-s {duplicate_offset_arg} "
+            "must be a number >= 0",
+            file=sys.stderr,
+        )
+        return 1
+    shuffle_window_arg = args.shuffle_window
+    if shuffle_window_arg is not None and shuffle_window_arg < 1:
+        print(
+            f"rosctl playback start: --shuffle-window {shuffle_window_arg} "
+            "must be at least 1 (1 means no reorder)",
+            file=sys.stderr,
+        )
+        return 1
     common = get_settings()
 
     # --- single-region mode: --region, --target edge, --sequential -----
@@ -160,6 +192,30 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
         return 1
 
     sim = get_sim_settings()
+    # resolve the duplicates/shuffle knobs (flag over setting) and refuse
+    # the one combination that quietly breaks a mode: shuffle reorders
+    # delivery, sequential mode's whole point is in-order one-at-a-time
+    # delivery the oracle can match. The engine refuses it too; the CLI
+    # says it here, before the cache is built or anything starts.
+    duplicate_rate = (
+        args.duplicate_rate if args.duplicate_rate is not None else sim.playback_duplicate_rate
+    )
+    duplicate_offset_s = (
+        args.duplicate_offset_s
+        if args.duplicate_offset_s is not None
+        else sim.playback_duplicate_offset_s
+    )
+    shuffle_on = args.shuffle if args.shuffle is not None else sim.playback_shuffle
+    shuffle_window = args.shuffle_window if args.shuffle_window is not None else sim.shuffle_window
+    if shuffle_on and sequential:
+        print(
+            "rosctl playback start: --shuffle cannot run with --sequential: "
+            "sequential mode delivers one order at a time in stream order so "
+            "the oracle can match it; run shuffle without --sequential "
+            "(duplicates are allowed in any mode)",
+            file=sys.stderr,
+        )
+        return 1
     data_dir = common.data_dir
     meta: CacheMeta = ensure_cache(data_dir)
     from_day = (
@@ -324,6 +380,12 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
         vendor_regions=vendor_regions,
         run_meta=run_meta,
         sequential=sequential,
+        # duplicates/shuffle engine facts: the resend offset bound and
+        # the shuffle window hold for every run on this engine; the rate
+        # and the switch themselves are per-run start parameters, like
+        # the seed
+        duplicate_offset_s=duplicate_offset_s,
+        shuffle_window=shuffle_window,
     )
 
     from restaurantos.sim.control import make_control_app
@@ -371,6 +433,8 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
                 to_day=to_day,
                 speed=speed,
                 run_id=args.run_id,
+                duplicate_rate=duplicate_rate,
+                shuffle=shuffle_on,
                 meta_extra=meta_extra,
             )
         except StateError:
@@ -388,12 +452,18 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
         if events_on and event_rate < 1.0:
             events_note += f" (sample rate {event_rate})"
         region_note = f", region {region}" if region is not None else ""
+        duplicates_note = (
+            f", duplicates {duplicate_rate} (offset <= {duplicate_offset_s} s)"
+            if duplicate_rate > 0
+            else ""
+        )
+        shuffle_note = f", shuffle (window {shuffle_window})" if shuffle_on else ""
         print(
             f"run {playback.status()['run_id']} started: {from_day} -> "
             f"{window.to_day}{region_note}, speed {speed}x, "
-            f"{inflight} in flight, events {events_note}, restock on "
-            f"{len(banner_days)} day(s) x {len(vendors)} vendors, control on {sim.control_host}:"
-            f"{args.port or sim.control_port}",
+            f"{inflight} in flight, events {events_note}{duplicates_note}{shuffle_note}, "
+            f"restock on {len(banner_days)} day(s) x {len(vendors)} vendors, control on "
+            f"{sim.control_host}:{args.port or sim.control_port}",
             file=sys.stderr,
         )
 
@@ -418,7 +488,8 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
     status = playback.status()
     print(
         "run {run_id} {state}: {orders_sent} sent, {orders_acked} acked, "
-        "{orders_parked} parked, {orders_refused} refused, {orders_failed} failed; "
+        "{orders_parked} parked, {orders_refused} refused, {orders_failed} failed, "
+        "{orders_resent} resent; "
         "log: runs/{run_id}/orders.jsonl".format(**status)
     )
     # the kitchen results too (review round 3, item 6): the operator
