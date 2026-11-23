@@ -225,3 +225,43 @@ def test_proxy_ports_must_stay_below_the_highest_tcp_port():
 
 def test_the_default_base_port_fits_many_regions():
     assert Cluster(regions=1000, proxy_base_port=21000).regions == 1000
+
+
+# ---- cluster file shape --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("cluster = 3", "cluster"),
+        ("toxiproxy = 5", "toxiproxy"),
+        ('[cluster]\nregions = "3"', "regions"),
+        ("[cluster]\nregions = true", "regions"),  # bool before int: True is an int
+        ('[toxiproxy]\nbase_port = "21000"', "base_port"),
+        ("[toxiproxy]\nbase_port = false", "base_port"),
+        ("[cluster]\nstandbys = 1", "standbys"),
+        ('[cluster]\nsynchronous = "no"', "synchronous"),
+    ],
+)
+def test_load_cluster_names_the_key_a_wrong_shape_is_found_under(tmp_path, text, key):
+    # a wrong value in the cluster file is a ValueError naming its
+    # key (which the CLI handlers catch), not a TypeError traceback
+    # from Cluster's own checks
+    path = tmp_path / "cluster.toml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match=key):
+        load_cluster(path)
+
+
+def test_load_cluster_still_takes_the_committed_shape(tmp_path):
+    path = tmp_path / "cluster.toml"
+    path.write_text(
+        "[cluster]\nregions = 3\nstandbys = false\nsynchronous = true\n"
+        "[toxiproxy]\nbase_port = 21000\n",
+        encoding="utf-8",
+    )
+    cluster = load_cluster(path)
+    assert cluster.regions == 3
+    assert cluster.standbys is False
+    assert cluster.synchronous is True
+    assert cluster.proxy_base_port == 21000

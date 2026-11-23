@@ -81,14 +81,37 @@ class Cluster:
 
 
 def load_cluster(path: Path | str = "infra/cluster.toml") -> Cluster:
+    """Load the cluster description. The file's SHAPE is checked here,
+    naming the offending key in a ValueError (which the CLI handlers
+    already catch), so a wrong value is a message - not a TypeError
+    traceback from Cluster's own checks."""
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
     section = raw.get("cluster", {})
+    toxiproxy = raw.get("toxiproxy", {})
+    if not isinstance(section, dict):
+        raise ValueError(f"cluster file: [cluster] must be a table, got {section!r}")
+    if not isinstance(toxiproxy, dict):
+        raise ValueError(f"cluster file: [toxiproxy] must be a table, got {toxiproxy!r}")
+    regions = section.get("regions", 1)
+    # bool before int: True is an int, so the int check alone would let
+    # regions = true through
+    if isinstance(regions, bool) or not isinstance(regions, int):
+        raise ValueError(f"cluster file: regions must be an int, got {regions!r}")
+    base_port = toxiproxy.get("base_port", 21000)
+    if isinstance(base_port, bool) or not isinstance(base_port, int):
+        raise ValueError(f"cluster file: base_port must be an int, got {base_port!r}")
+    standbys = section.get("standbys", True)
+    if not isinstance(standbys, bool):
+        raise ValueError(f"cluster file: standbys must be a bool, got {standbys!r}")
+    synchronous = section.get("synchronous", False)
+    if not isinstance(synchronous, bool):
+        raise ValueError(f"cluster file: synchronous must be a bool, got {synchronous!r}")
     return Cluster(
-        regions=section.get("regions", 1),
-        standbys=section.get("standbys", True),
-        synchronous=section.get("synchronous", False),
-        proxy_base_port=raw.get("toxiproxy", {}).get("base_port", 21000),
+        regions=regions,
+        standbys=standbys,
+        synchronous=synchronous,
+        proxy_base_port=base_port,
     )
 
 

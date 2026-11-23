@@ -58,7 +58,7 @@ dependency); no psutil.
 
 from __future__ import annotations
 
-import fcntl
+import contextlib
 import os
 import re
 import select
@@ -67,10 +67,11 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import httpx
 
@@ -171,14 +172,16 @@ class ServiceSpec:
 @dataclass
 class Step:
     """What `up` or `down` did to one service. The command layer prints
-    these; the tests assert them. `pid` is set wherever a process was
-    spawned, so a test can prove the child is gone after a failure
-    even though the pid file has been cleaned up."""
+    these; the tests assert them. `pid` and `start_ticks` are set
+    wherever a process was spawned: together they name the launch, so
+    a later cleanup can act only on THAT launch even after the pid
+    file has been cleaned up or replaced."""
 
     name: str
     outcome: str
     detail: str
     pid: int | None = None
+    start_ticks: int | None = None
 
 
 def _region_of(name: str) -> str | None:
@@ -304,16 +307,24 @@ def log_path(runs_dir: Path, name: str) -> Path:
 
 def read_pid_record(runs_dir: Path, name: str) -> tuple[int, int] | str | None:
     """What the pid file for `name` says: `(pid, start_ticks)` when it
-    is well-formed, a REASON string when it is malformed (left in place
-    for a person to look at - see `stop_service`), or None when there
-    is no pid file. The bytes are decoded here because a binary pid
-    file raises UnicodeDecodeError (a ValueError, not an OSError) on
+    is well-formed, a REASON string when it is malformed or cannot be
+    read, or None when there is no pid file. Missing is NOT the same
+    as unreadable: a permission problem or a directory at the path is
+    a reason string (down reports it; up replaces it, because up owns
+    its records). The bytes are decoded here because a binary pid file
+    raises UnicodeDecodeError (a ValueError, not an OSError) on
     read_text - which once ended a whole `down` sweep with a traceback
-    instead of reporting one bad file."""
+    instead of reporting one bad file. The values are checked too: a
+    pid outside pid_t's range (Linux pid_t is a signed 32-bit int) or
+    negative start ticks are impossible - pid 0 in particular makes
+    os.kill(0, 0) check the caller's own process group, so it would
+    look alive."""
     try:
         raw = pid_path(runs_dir, name).read_bytes()
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as error:
+        return f"unreadable ({error})"
     try:
         text = raw.decode("utf-8").strip()
     except UnicodeDecodeError as error:
@@ -321,9 +332,13 @@ def read_pid_record(runs_dir: Path, name: str) -> tuple[int, int] | str | None:
     parts = text.split()
     if len(parts) == 2:
         try:
-            return int(parts[0]), int(parts[1])
+            pid, ticks = int(parts[0]), int(parts[1])
         except ValueError:
             pass
+        else:
+            if 1 <= pid <= 2**31 - 1 and ticks >= 0:
+                return pid, ticks
+            return f"impossible values (pid {parts[0]}, start_ticks {parts[1]})"
     return f"expected 'pid start_ticks', found {text!r}"
 
 
@@ -353,12 +368,15 @@ def running_names(runs_dir: Path) -> list[str]:
 
 
 def log_tail(runs_dir: Path, name: str, max_lines: int = LOG_TAIL_LINES) -> str:
-    """The last lines of a service's log, for failure messages."""
+    """The last lines of a service's log, for failure messages. The
+    bytes are decoded with replacement characters, because a failure
+    message must never end the up sweep with a UnicodeDecodeError of
+    its own."""
     try:
-        lines = log_path(runs_dir, name).read_text(encoding="utf-8").splitlines()
+        text = log_path(runs_dir, name).read_bytes().decode("utf-8", errors="replace")
     except OSError:
         return "(no log)"
-    return "\n".join(lines[-max_lines:])
+    return "\n".join(text.splitlines()[-max_lines:])
 
 
 # --- process identity ---------------------------------------------------
@@ -391,26 +409,40 @@ def _proc_fields(pid: int) -> tuple[list[str], dict[str, str]] | None:
     return args, env
 
 
-def is_service(pid: int, start_ticks: int, spec: ServiceSpec) -> bool:
-    """True if `pid` is the exact process the pid file recorded for
-    `spec`. Three proofs, in order of what they catch: the start ticks
-    match (a pid handed out again to a different process fails here,
+def identity(
+    pid: int, start_ticks: int, spec: ServiceSpec
+) -> Literal["match", "mismatch", "unknown"]:
+    """Whether `pid` is the exact process the pid file recorded for
+    `spec` - three answers, because "cannot tell" must not be read as
+    "not ours". Three proofs, in order of what they catch: the start
+    ticks (a pid handed out again to a different process fails here,
     even one with the same argv and environment from a second checkout
-    of the repo), the interpreter arguments match, and every identity
-    variable has the table's value (two relay children share argv, so
-    the environment is what tells them apart)."""
+    of the repo), the interpreter arguments, and every identity
+    variable (two relay children share argv, so the environment is
+    what tells them apart). A tick mismatch is a `mismatch`; an
+    unreadable /proc is an `unknown`. When the ticks match but argv or
+    environment is empty or unreadable, the process can simply be
+    mid-execve or just starting: retry every 50 ms for up to 1 s, then
+    answer `unknown` - never `mismatch` on missing evidence."""
     try:
         if _start_ticks(pid) != start_ticks:
-            return False
+            return "mismatch"
     except OSError, IndexError, ValueError:
-        return False
-    fields = _proc_fields(pid)
-    if fields is None:
-        return False
-    args, env = fields
-    if len(args) < len(spec.args) or args[-len(spec.args) :] != list(spec.args):
-        return False
-    return all(env.get(key) == value for key, value in spec.env.items())
+        return "unknown"
+    deadline = time.monotonic() + 1.0
+    while True:
+        fields = _proc_fields(pid)
+        if fields is not None:
+            args, env = fields
+            if args and env:
+                if len(args) < len(spec.args) or args[-len(spec.args) :] != list(spec.args):
+                    return "mismatch"
+                if not all(env.get(key) == value for key, value in spec.env.items()):
+                    return "mismatch"
+                return "match"
+        if time.monotonic() >= deadline:
+            return "unknown"
+        time.sleep(0.05)
 
 
 def _alive(pid: int) -> bool:
@@ -592,6 +624,35 @@ def dotenv_identity_warnings(env_path: Path = Path(".env")) -> list[str]:
     return out
 
 
+@contextlib.contextmanager
+def _service_lock(runs_dir: Path, name: str) -> Iterator[None]:
+    """The per-service lock, held by every code path that reads a pid
+    record and then changes it: `start_service`, the whole of
+    `stop_service` (the SIGINT and SIGKILL waits included - at most
+    STOP_TIMEOUT_S + KILL_TIMEOUT_S, 15 s, which merely delays a
+    concurrent `up` for that name; it then finds no record and starts
+    a fresh child), and the cleanup in `_start_failure`. With no other
+    writer during a stop, every unlink in `stop_service` can only
+    remove the record it read. flock locks belong to the open file, so
+    a second `_service_lock` for the SAME name inside the same process
+    would wait for itself forever: never call one locked function from
+    inside another - today `_ready_step` calls `stop_service` only
+    after `start_service` has returned, which keeps the two apart.
+    fcntl is imported here, not at module top: native Windows has no
+    fcntl, and the module must import there so rosctl can print its
+    Linux/WSL2 message instead of an ImportError traceback."""
+    import fcntl
+
+    lock_path = runs_dir / "services" / f"{name}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
 def start_service(
     spec: ServiceSpec,
     *,
@@ -599,32 +660,55 @@ def start_service(
     cluster_file: Path | None = None,
 ) -> Step:
     """Start one service as a detached child and record its pid. The
-    start of one name is serialized by a lock file, so two `up`s at
-    once cannot both spawn the same service - the second waits and
-    sees `already-running`. An already-running service is reported, not
-    duplicated (idempotent `up`); a port someone else holds is
-    reported, not fought over. An I/O failure (log folder, log file,
-    the run itself, the pid file) is a `launch-failed` step that names
-    the path - never an exception that ends the whole sweep; a child
-    whose pid file could not be written is killed and reaped, because
-    it must not outlive the record of it."""
+    start of one name is serialized by the per-service lock, so two
+    `up`s at once cannot both spawn the same service - the second
+    waits and sees `already-running`, or `still-starting` when the
+    first launch is too young for /proc to prove anything about. An
+    already-running service is reported, not duplicated (idempotent
+    `up`); a port someone else holds is reported, not fought over. Up
+    owns its pid files: a malformed or unreadable record is replaced
+    (when even that fails, `launch-failed` and nothing is spawned - a
+    service must never run without its record). An I/O failure (log
+    folder, log file, the run itself, the pid file) is a
+    `launch-failed` step that names the path - never an exception that
+    ends the whole sweep; a child whose pid file could not be written
+    is killed and reaped, because it must not outlive the record of
+    it."""
     services = runs_dir / "services"
     try:
         services.mkdir(parents=True, exist_ok=True)
-        lock_fd = os.open(services / f"{spec.name}.lock", os.O_CREAT | os.O_RDWR, 0o644)
     except OSError as error:
-        return Step(spec.name, "launch-failed", f"could not prepare the lock file: {error}")
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return Step(spec.name, "launch-failed", f"could not prepare {services}: {error}")
+    with _service_lock(runs_dir, spec.name):
         record = read_pid_record(runs_dir, spec.name)
         if isinstance(record, str):
-            # up owns its own pid file: a malformed one is replaced, not
-            # obeyed (down leaves it for a person; up overwrites it)
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            # up owns its own pid file: a malformed or unreadable one
+            # is replaced, not obeyed (down leaves it for a person)
+            try:
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            except OSError as error:
+                return Step(
+                    spec.name,
+                    "launch-failed",
+                    f"could not replace the record {pid_path(runs_dir, spec.name)}: {error}",
+                )
         elif record is not None:
             pid, ticks = record
-            if _alive(pid) and is_service(pid, ticks, spec):
-                return Step(spec.name, "already-running", f"pid {pid}, not started again")
+            who = identity(pid, ticks, spec)
+            if who == "match":
+                return Step(
+                    spec.name,
+                    "already-running",
+                    f"pid {pid}, not started again",
+                    pid=pid,
+                    start_ticks=ticks,
+                )
+            if who == "unknown":
+                return Step(
+                    spec.name,
+                    "still-starting",
+                    "another launch is still coming up - not started again",
+                )
             pid_path(runs_dir, spec.name).unlink(missing_ok=True)
         if spec.port is not None and port_in_use(spec.port):
             return Step(
@@ -637,9 +721,11 @@ def start_service(
             with open(log_path(runs_dir, spec.name), "ab") as log:
                 # one header line per start, so an appended log stays readable
                 started = datetime.now(UTC).isoformat(timespec="seconds")
-                identity = " ".join(f"{key}={value}" for key, value in sorted(spec.env.items()))
+                identity_line = " ".join(
+                    f"{key}={value}" for key, value in sorted(spec.env.items())
+                )
                 command = " ".join([sys.executable, *spec.args])
-                log.write(f"# {started} start {spec.name}: {command} ({identity})\n".encode())
+                log.write(f"# {started} start {spec.name}: {command} ({identity_line})\n".encode())
                 log.flush()
                 try:
                     process = subprocess.Popen(
@@ -673,19 +759,37 @@ def start_service(
                 f"could not write {pid_path(runs_dir, spec.name)}: {error}",
                 pid=process.pid,
             )
-        return Step(spec.name, "started", f"pid {process.pid}", pid=process.pid)
-    finally:
-        os.close(lock_fd)  # also releases the flock
+        return Step(
+            spec.name,
+            "started",
+            f"pid {process.pid}",
+            pid=process.pid,
+            start_ticks=ticks,
+        )
 
 
 def _start_failure(
-    spec: ServiceSpec, runs_dir: Path, outcome: str, reason: str = "", *, pid: int | None = None
+    spec: ServiceSpec,
+    runs_dir: Path,
+    outcome: str,
+    reason: str = "",
+    *,
+    pid: int | None = None,
+    start_ticks: int | None = None,
 ) -> Step:
-    """The failure step for a service that died before becoming ready:
-    the pid file is cleaned (the process is gone), the message carries
-    the log tail (the cause is usually the last exception in it) and
-    says the other services keep running."""
-    pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+    """The failure step for a service that died before becoming ready.
+    The pid file is cleaned only when it still names THIS launch
+    (pid and start ticks): a record that was replaced meanwhile belongs
+    to another launch and is left for it. The message carries the log
+    tail (the cause is usually the last exception in it) and says the
+    other services keep running."""
+    with _service_lock(runs_dir, spec.name):
+        record = read_pid_record(runs_dir, spec.name)
+        if pid is not None and start_ticks is not None:
+            if record == (pid, start_ticks):
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+        elif record is not None:
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
     detail = f"{reason} - see {log_path(runs_dir, spec.name)}".lstrip(" -")
     return Step(
         spec.name,
@@ -694,6 +798,7 @@ def _start_failure(
         f"(the other services keep running - a second 'rosctl up' skips "
         f"what is already up)",
         pid=pid,
+        start_ticks=start_ticks,
     )
 
 
@@ -702,6 +807,7 @@ def _ready_step(
     *,
     runs_dir: Path,
     pid: int,
+    start_ticks: int,
     ready_timeout_s: float,
     grace_s: float,
 ) -> Step:
@@ -712,42 +818,62 @@ def _ready_step(
     grace period, because their configuration errors exit within a
     second. A service that never becomes ready is STOPPED, not
     orphaned: it holds its port, and `down` could not find it behind a
-    removed pid file. The pid file is removed only if the stop
-    succeeded; if it did not, the message says so and the file stays."""
+    removed pid file. The cleanup acts only on the launch it started
+    (`expect`): a pid file that was replaced meanwhile names another
+    launch and is left alone. The probe stays inside the deadline (its
+    timeout is the time remaining, never a fixed 1 s) and never reads
+    the body - the status line is the readiness answer, and a 200
+    after a slow answer is still ready, not a reason to stop a healthy
+    service."""
     if spec.port is None:
         deadline = time.monotonic() + grace_s
         while time.monotonic() < deadline and _alive(pid):
             time.sleep(0.1)
         if not _alive(pid):
-            return _start_failure(spec, runs_dir, "exited-immediately", pid=pid)
+            return _start_failure(
+                spec, runs_dir, "exited-immediately", pid=pid, start_ticks=start_ticks
+            )
         return Step(
             spec.name,
             "started",
             f"pid {pid} alive after {grace_s}s (no HTTP port), log {log_path(runs_dir, spec.name)}",
             pid=pid,
+            start_ticks=start_ticks,
         )
     url = f"http://{HOST_ADDRESS}:{spec.port}{spec.ready}"
     deadline = time.monotonic() + ready_timeout_s
-    while time.monotonic() < deadline:
-        if not _alive(pid):
-            return _start_failure(spec, runs_dir, "exited-immediately", pid=pid)
-        try:
-            # trust_env=False: a machine with HTTP_PROXY set must not
-            # have its loopback readiness probe routed through the proxy
-            if httpx.get(url, timeout=1.0, trust_env=False).status_code == 200:
-                return Step(
-                    spec.name,
-                    "started",
-                    f"pid {pid} ready on port {spec.port}, log {log_path(runs_dir, spec.name)}",
-                    pid=pid,
+    # trust_env=False: a machine with HTTP_PROXY set must not have its
+    # loopback readiness probe routed through the proxy
+    with httpx.Client(trust_env=False) as client:
+        while True:
+            if not _alive(pid):
+                return _start_failure(
+                    spec, runs_dir, "exited-immediately", pid=pid, start_ticks=start_ticks
                 )
-        except httpx.HTTPError:
-            pass
-        time.sleep(0.25)
-    stop = stop_service(spec, runs_dir=runs_dir)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            timeout = httpx.Timeout(min(1.0, remaining))
+            try:
+                with client.stream("GET", url, timeout=timeout) as response:
+                    if response.status_code == 200:
+                        return Step(
+                            spec.name,
+                            "started",
+                            f"pid {pid} ready on port {spec.port}, "
+                            f"log {log_path(runs_dir, spec.name)}",
+                            pid=pid,
+                            start_ticks=start_ticks,
+                        )
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.25)
+    stop = stop_service(spec, runs_dir=runs_dir, expect=(pid, start_ticks))
     base = f"still not answering {spec.ready} on port {spec.port} within {ready_timeout_s}s"
-    if stop.outcome in ("stopped", "killed", "not-running"):
+    if stop.outcome in ("stopped", "killed"):
         tail = f"{base} - the service was stopped ({stop.outcome}), pid file removed"
+    elif stop.outcome in ("not-running", "replaced"):
+        tail = f"{base} - nothing to clean ({stop.outcome}: {stop.detail})"
     else:
         tail = f"{base} - could not stop it ({stop.outcome}: {stop.detail}); pid file kept"
     return Step(
@@ -757,6 +883,7 @@ def _ready_step(
         f"(the other services keep running - a second 'rosctl up' skips "
         f"what is already up)",
         pid=pid,
+        start_ticks=start_ticks,
     )
 
 
@@ -782,81 +909,103 @@ def stop_service(
     runs_dir: Path,
     stop_timeout_s: float = STOP_TIMEOUT_S,
     kill_timeout_s: float = KILL_TIMEOUT_S,
+    expect: tuple[int, int] | None = None,
 ) -> Step:
     """Stop one service: SIGINT first (uvicorn and the relay's
     asyncio.run both shut down cleanly on it), then SIGKILL after the
     timeout, all through a pidfd opened for the exact pid that passed
     the identity proof - never by bare pid number, so a pid reused
-    between the check and the signal cannot be hit. A missing, dead or
-    foreign pid is reported and its file cleaned up; a malformed pid
-    file is reported and left in place for a person to look at. A
-    process that vanishes mid-stop was the goal all along: stopped. A
-    platform without pidfds (kernels older than 5.3; WSL2 is 5.15 or
-    newer) reports `cannot-signal` and never falls back to os.kill -
-    signalling a number that was only just proven is the one thing this
-    design exists to prevent. The control plane on 8002 has no pid file
-    here, so `down` can never touch it."""
-    record = read_pid_record(runs_dir, spec.name)
-    if isinstance(record, str):
-        return Step(
-            spec.name,
-            "malformed-pid-file",
-            f"{record} - pid file left in place so it can be inspected",
-        )
-    if record is None:
-        return Step(spec.name, "not-running", "no pid file")
-    pid, ticks = record
-    if not _alive(pid):
-        pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-        return Step(spec.name, "not-running", f"pid {pid} was not running, pid file removed")
-    try:
-        fd = os.pidfd_open(pid)
-    except ProcessLookupError:
-        # vanished between the alive check and the open: gone is the goal
-        pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-        return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
-    except OSError as error:
-        return Step(
-            spec.name,
-            "cannot-signal",
-            f"pid {pid}: could not open a pidfd ({error}) - pid file left in place",
-        )
-    try:
-        if not is_service(pid, ticks, spec):
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+    between the check and the signal cannot be hit. The per-service
+    lock is held for the whole stop (see `_service_lock`), so nothing
+    else can write a new record mid-stop. `expect`, when given, is the
+    launch the CALLER started: a record that is missing or names
+    another launch is `replaced` - signalled and unlinked nothing. A
+    missing, dead or foreign pid is reported and its file cleaned up; a
+    malformed or unreadable pid file is reported and left in place for
+    a person to look at; an identity that cannot be decided (mid-exec,
+    unreadable /proc) is `identity-unknown`, kept and signalled
+    nothing. A process that vanishes mid-stop was the goal all along:
+    stopped. A platform without pidfds (kernels older than 5.3; WSL2 is
+    5.15 or newer) reports `cannot-signal` and never falls back to
+    os.kill - signalling a number that was only just proven is the one
+    thing this design exists to prevent. The control plane on 8002 has
+    no pid file here, so `down` can never touch it."""
+    with _service_lock(runs_dir, spec.name):
+        record = read_pid_record(runs_dir, spec.name)
+        if expect is not None and record != expect:
             return Step(
                 spec.name,
-                "stale-pid",
-                f"pid {pid} is not {spec.name} (exited and the pid was reused, or "
-                f"the file is wrong) - pid file removed, process left alone",
+                "replaced",
+                "the pid file now names another launch - left alone",
             )
-        try:
-            signal.pidfd_send_signal(fd, signal.SIGINT)
-        except ProcessLookupError:
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-            return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
-        if _wait_pidfd(fd, stop_timeout_s):
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-            return Step(spec.name, "stopped", f"pid {pid}")
-        try:
-            signal.pidfd_send_signal(fd, signal.SIGKILL)
-        except ProcessLookupError:
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-            return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
-        if _wait_pidfd(fd, kill_timeout_s):
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+        if isinstance(record, str):
             return Step(
                 spec.name,
-                "killed",
-                f"pid {pid} did not answer SIGINT within {stop_timeout_s}s, killed",
+                "malformed-pid-file",
+                f"{record} - pid file left in place so it can be inspected",
             )
-        return Step(
-            spec.name,
-            "unkillable",
-            f"pid {pid} did not exit after SIGKILL, pid file left in place",
-        )
-    finally:
-        os.close(fd)
+        if record is None:
+            return Step(spec.name, "not-running", "no pid file")
+        pid, ticks = record
+        if not _alive(pid):
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            return Step(spec.name, "not-running", f"pid {pid} was not running, pid file removed")
+        try:
+            fd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            # vanished between the alive check and the open: gone is the goal
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+        except OSError as error:
+            return Step(
+                spec.name,
+                "cannot-signal",
+                f"pid {pid}: could not open a pidfd ({error}) - pid file left in place",
+            )
+        try:
+            who = identity(pid, ticks, spec)
+            if who == "unknown":
+                return Step(
+                    spec.name,
+                    "identity-unknown",
+                    f"pid {pid}: could not prove it is {spec.name} (still starting, "
+                    f"or /proc could not be read) - record kept, nothing signalled",
+                )
+            if who == "mismatch":
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+                return Step(
+                    spec.name,
+                    "stale-pid",
+                    f"pid {pid} is not {spec.name} (exited and the pid was reused, or "
+                    f"the file is wrong) - pid file removed, process left alone",
+                )
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGINT)
+            except ProcessLookupError:
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+                return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+            if _wait_pidfd(fd, stop_timeout_s):
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+                return Step(spec.name, "stopped", f"pid {pid}")
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+                return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+            if _wait_pidfd(fd, kill_timeout_s):
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+                return Step(
+                    spec.name,
+                    "killed",
+                    f"pid {pid} did not answer SIGINT within {stop_timeout_s}s, killed",
+                )
+            return Step(
+                spec.name,
+                "unkillable",
+                f"pid {pid} did not exit after SIGKILL, pid file left in place",
+            )
+        finally:
+            os.close(fd)
 
 
 def up_services(
@@ -890,11 +1039,12 @@ def up_services(
         steps.append(step)
         if step.outcome != "started":
             continue
-        assert step.pid is not None  # set by start_service on the spawn
+        assert step.pid is not None and step.start_ticks is not None  # set on the spawn
         steps[-1] = _ready_step(
             spec,
             runs_dir=runs_dir,
             pid=step.pid,
+            start_ticks=step.start_ticks,
             ready_timeout_s=ready_timeout_s,
             grace_s=grace_s,
         )
@@ -967,6 +1117,9 @@ def up_exit_code(steps: Sequence[Step]) -> int:
 
 
 def down_exit_code(steps: Sequence[Step]) -> int:
-    """`down` fails when a process survived SIGKILL, or could not be
-    signalled at all (no pidfd: `cannot-signal`)."""
-    return 1 if any(step.outcome in ("unkillable", "cannot-signal") for step in steps) else 0
+    """`down` fails when a process survived SIGKILL, could not be
+    signalled at all (no pidfd: `cannot-signal`), or could not be
+    identified (`identity-unknown`: something that may be running was
+    not stopped)."""
+    bad = ("unkillable", "cannot-signal", "identity-unknown")
+    return 1 if any(step.outcome in bad for step in steps) else 0

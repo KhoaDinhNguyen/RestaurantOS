@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
 import os
 import signal
 import socket
@@ -639,29 +640,230 @@ def test_a_malformed_pid_file_is_reported_and_the_sweep_continues(
 ) -> None:
     # a binary pid file once crashed the whole down sweep with a
     # UnicodeDecodeError; now it is one reported step, the file stays
-    # for a person to look at, and the later services still stop. Both
-    # files carry patterned names (the sweep rebuilds specs from the
-    # names; a non-pattern name is the separate `unknown` outcome) and
-    # the started one runs the canonical argv via the shadow package
+    # for a person to look at, and the later services still stop. The
+    # malformed record (relay-r1) comes BEFORE the live one (relay-r2)
+    # in down order, so the step order proves the sweep carried on
     runs = tmp_path / "runs"
     steps = up_services(
         CLUSTER,
         runs_dir=runs,
         precheck=False,
         grace_s=0.0,
-        specs=[services.spec_for_name("relay-r1")],
+        specs=[services.spec_for_name("relay-r2")],
     )
     _track(steps)
-    bad = services.pid_path(runs, "relay-r2")
+    bad = services.pid_path(runs, "relay-r1")
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_bytes(b"\xff\xfe not a pid file")
     steps = down_services(runs_dir=runs)
-    outcomes = {step.name: step.outcome for step in steps}
-    assert outcomes["relay-r2"] == "malformed-pid-file"
-    assert "left in place" in [s for s in steps if s.name == "relay-r2"][0].detail
+    assert [step.name for step in steps] == ["relay-r1", "relay-r2"]
+    assert [step.outcome for step in steps] == ["malformed-pid-file", "stopped"]
+    assert "left in place" in steps[0].detail
     assert bad.exists()  # not ours to clean
-    assert outcomes["relay-r1"] == "stopped"
     assert services.down_exit_code(steps) == 0
+
+
+@requires_proc
+def test_an_unreadable_record_is_malformed_in_down_and_launch_failed_in_up(
+    tmp_path: Path,
+) -> None:
+    # a directory at the pid-file path (not chmod 000, which root
+    # ignores in CI): down reports it and keeps it; up owns its records
+    # and tries to replace it, and when even that fails nothing is
+    # spawned - a service must never run without its record
+    runs = tmp_path / "runs"
+    services.pid_path(runs, "relay-r1").parent.mkdir(parents=True)
+    services.pid_path(runs, "relay-r1").mkdir()
+    steps = down_services(runs_dir=runs)
+    assert steps[0].name == "relay-r1"
+    assert steps[0].outcome == "malformed-pid-file"
+    assert "unreadable" in steps[0].detail
+    assert services.pid_path(runs, "relay-r1").is_dir()  # left in place
+    steps = up_services(
+        CLUSTER,
+        runs_dir=runs,
+        precheck=False,
+        grace_s=0.0,
+        specs=[
+            fake("relay-r1", ROS_RELAY_ROLE="region", ROS_CLIENT="relay-r1", ROS_REGION_ID="r1")
+        ],
+    )
+    assert steps[0].outcome == "launch-failed"
+    assert "could not replace the record" in steps[0].detail
+    assert services.up_exit_code(steps) == 1
+
+
+@requires_proc
+def test_impossible_pid_values_are_malformed_and_left_alone(tmp_path: Path) -> None:
+    # Linux pid_t is a signed 32-bit int: pid 0 (kill(0, 0) checks the
+    # caller's own process group and so looks alive), a negative pid, a
+    # pid above 2**31-1 and negative start ticks are all impossible -
+    # reported, kept, nothing signalled
+    runs = tmp_path / "runs"
+    services_dir = runs / "services"
+    services_dir.mkdir(parents=True)
+    for name, text in (
+        ("relay-r1", "0 1"),
+        ("relay-r2", "-1 1"),
+        ("relay-r3", "2147483648 1"),
+        ("relay-r4", "5 -1"),
+    ):
+        (services_dir / f"{name}.pid").write_text(text + "\n", encoding="utf-8")
+    steps = down_services(runs_dir=runs)
+    assert [step.outcome for step in steps] == ["malformed-pid-file"] * 4
+    for name in ("relay-r1", "relay-r2", "relay-r3", "relay-r4"):
+        assert (services_dir / f"{name}.pid").exists()
+    assert services.down_exit_code(steps) == 0
+
+
+@requires_proc
+def test_an_undecidable_identity_is_reported_by_up_and_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a live record whose argv and environment cannot be read is
+    # neither ours nor not-ours: up says still-starting (not a
+    # failure), down says identity-unknown and keeps the record - and
+    # THAT is a failure, because something that may be running was
+    # not stopped
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    start = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(start)
+    assert start[0].outcome == "started"
+    monkeypatch.setattr(services, "_proc_fields", lambda pid: ([], {}))
+    second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    assert second[0].outcome == "still-starting"
+    assert services.up_exit_code(second) == 0
+    assert isinstance(services.read_pid_record(runs, "sleeper"), tuple)  # kept
+    stopped = down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
+    assert stopped[0].outcome == "identity-unknown"
+    assert services.down_exit_code(stopped) == 1
+
+
+@requires_proc
+def test_a_record_replaced_during_the_readiness_wait_is_left_alone(
+    tmp_path: Path,
+) -> None:
+    # the readiness cleanup acts only on the launch it started: when
+    # the pid file names another launch by the time the wait gives up,
+    # nothing is signalled and nothing is unlinked
+    runs = tmp_path / "runs"
+    spec, _port = _http_fake("slow", health="/health", delay_s=10.0)
+    start = services.start_service(spec, runs_dir=runs)
+    _track([start])
+    assert start.outcome == "started"
+    assert start.pid is not None and start.start_ticks is not None
+    other = _spawn_raw("import time; time.sleep(300)")
+    other_ticks = services._start_ticks(other)
+
+    def replace() -> None:
+        time.sleep(0.2)  # while the readiness wait is running
+        services._write_pid_file(services.pid_path(runs, "slow"), other, other_ticks)
+
+    rewriter = threading.Thread(target=replace)
+    rewriter.start()
+    step = services._ready_step(
+        spec,
+        runs_dir=runs,
+        pid=start.pid,
+        start_ticks=start.start_ticks,
+        ready_timeout_s=1.0,
+        grace_s=0.0,
+    )
+    rewriter.join()
+    assert step.outcome == "not-ready"
+    assert "replaced" in step.detail
+    assert services.read_pid_record(runs, "slow") == (other, other_ticks)  # not unlinked
+    assert not _gone(start.pid)  # and not signalled
+
+
+@requires_proc
+def test_a_concurrent_start_waits_for_the_stop_to_release_the_lock(
+    tmp_path: Path,
+) -> None:
+    # the stop holds the per-service lock for its whole run; a start of
+    # the same name meanwhile must WAIT for it, then find no record and
+    # start a fresh child. Without the lock it would read the live
+    # record mid-stop and say already-running
+    runs = tmp_path / "runs"
+    spec = fake("stubborn", code=IGNORER)
+    start = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(start)
+    assert start[0].outcome == "started"
+    outcomes: list[str] = []
+
+    def starter() -> None:
+        outcomes.append(services.start_service(spec, runs_dir=runs).outcome)
+
+    stopper = threading.Thread(
+        target=lambda: down_services(
+            CLUSTER, runs_dir=runs, names=["stubborn"], specs=[spec], stop_timeout_s=1.0
+        )
+    )
+    stopper.start()
+    time.sleep(0.2)  # inside the stop's SIGINT wait, the lock is held
+    starter_thread = threading.Thread(target=starter)
+    starter_thread.start()
+    stopper.join()
+    starter_thread.join()
+    assert outcomes == ["started"]
+    down_services(CLUSTER, runs_dir=runs, names=["stubborn"], specs=[spec])
+
+
+@requires_proc
+def test_the_readiness_wait_gives_up_at_the_deadline_not_the_server_s(
+    tmp_path: Path,
+) -> None:
+    # a server that sleeps 5 s before answering, with a 0.5 s
+    # readiness budget: the probe's timeout is the time REMAINING, so
+    # up gives up within about a second - not after the server's 5
+    runs = tmp_path / "runs"
+    spec, _port = _http_fake("slow", health="/health", delay_s=5.0)
+    t0 = time.monotonic()
+    steps = up_services(
+        CLUSTER,
+        runs_dir=runs,
+        precheck=False,
+        grace_s=0.0,
+        ready_timeout_s=0.5,
+        specs=[spec],
+    )
+    elapsed = time.monotonic() - t0
+    assert steps[0].outcome == "not-ready"
+    assert "the service was stopped" in steps[0].detail
+    assert elapsed < 2.5
+    assert steps[0].pid is not None and _gone(steps[0].pid)
+
+
+def test_log_tail_survives_bytes_that_are_not_utf8(tmp_path: Path) -> None:
+    # a failure message must never end the up sweep with a
+    # UnicodeDecodeError of its own
+    log = services.log_path(tmp_path, "crasher")
+    log.parent.mkdir(parents=True)
+    log.write_bytes(b"traceback\n\xff\xfe not utf-8\n")
+    tail = services.log_tail(tmp_path, "crasher")
+    assert "traceback" in tail
+    assert "\ufffd" in tail  # replacement characters, not an exception
+
+
+def test_services_imports_where_fcntl_does_not_exist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # native Windows has no fcntl: the module must still import there
+    # (fcntl is imported inside _service_lock, not at module top), so
+    # rosctl prints its Linux/WSL2 message instead of an ImportError
+    # traceback
+    monkeypatch.setitem(sys.modules, "fcntl", None)
+    importlib.reload(services)
+    try:
+        monkeypatch.setattr(services, "_has_proc", lambda: False)
+        with pytest.raises(services.PlatformError, match="Linux or WSL2"):
+            services.up_services(
+                CLUSTER, runs_dir=tmp_path / "runs", precheck=False, specs=[fake("sleeper")]
+            )
+    finally:
+        monkeypatch.undo()
+        importlib.reload(services)
 
 
 @requires_proc

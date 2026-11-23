@@ -10,8 +10,6 @@ check patched to pass, so the suite also runs where there is no
 
 from __future__ import annotations
 
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -67,21 +65,36 @@ def test_a_plain_down_needs_no_cluster_file(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # no cluster.toml, no .env, nothing: the pid files alone name the
-    # work, so a broken cluster file must not stop down from cleaning up
+    # no cluster.toml, no .env, no real process either: a fixed record
+    # that is simply not running. The pid files alone name the work, so
+    # a broken cluster file must not stop down from cleaning up
     _host_like(tmp_path, monkeypatch)
-    dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    ticks = services._start_ticks(dead.pid)
-    dead.wait()
     services_dir = tmp_path / "runs" / "services"
     services_dir.mkdir(parents=True)
     # a patterned name, so the sweep can rebuild its spec from the
     # name alone - that is the whole point of the pid-file-driven down
-    services._write_pid_file(services_dir / "relay-r1.pid", dead.pid, ticks)
+    services._write_pid_file(services_dir / "relay-r1.pid", 4194000, 12345)
+    monkeypatch.setattr(services, "_alive", lambda pid: False)
     assert app(["down"]) == 0
     out = capsys.readouterr().out
     assert "relay-r1: not-running" in out
     assert not (services_dir / "relay-r1.pid").exists()
+
+
+def test_a_badly_shaped_cluster_file_is_a_message_not_a_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # load_cluster names the offending key in a ValueError, and the CLI
+    # handler turns it into a one-line message with exit 1
+    _host_like(tmp_path, monkeypatch)
+    bad = tmp_path / "bad.toml"
+    bad.write_text('[cluster]\nregions = "3"\n', encoding="utf-8")
+    code = app(["up", "--config", str(bad), "--no-precheck"])
+    assert code == 1
+    assert "rosctl up: cluster file: regions must be an int" in capsys.readouterr().err
+    assert not (tmp_path / "runs").exists()
 
 
 def test_control_is_still_not_built(capsys: pytest.CaptureFixture[str]) -> None:
