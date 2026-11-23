@@ -1,6 +1,7 @@
-"""The CLI wiring for up/down: the parser shape and the error paths
-that must not spawn anything. The spawning behaviour itself is covered
-by test_service_lifecycle.py against fake targets."""
+"""The CLI wiring for up/down: the parser shape (positional names, as
+the briefs spell them) and the error paths that must not spawn
+anything. The spawning behaviour itself is covered by
+test_service_lifecycle.py against fake targets."""
 
 from __future__ import annotations
 
@@ -14,10 +15,14 @@ def test_up_and_down_left_the_not_built_list() -> None:
     assert "control" in NOT_BUILT  # WP6b keeps its placeholder
 
 
-def test_parser_accepts_up_and_down() -> None:
+def test_parser_takes_positional_service_names() -> None:
     parser = build_parser()
-    assert parser.parse_args(["up"]).command == "up"
-    assert parser.parse_args(["down"]).command == "down"
+    up = parser.parse_args(["up", "gateway", "relay-r1"])
+    assert up.command == "up" and up.names == ["gateway", "relay-r1"]
+    down = parser.parse_args(["down", "edge-r1"])
+    assert down.command == "down" and down.names == ["edge-r1"]
+    assert parser.parse_args(["up"]).names == []
+    assert parser.parse_args(["down"]).names == []
 
 
 def test_unknown_service_name_is_an_error_that_spawns_nothing(
@@ -25,7 +30,7 @@ def test_unknown_service_name_is_an_error_that_spawns_nothing(
 ) -> None:
     # no chdir: the error must come from the name check, after
     # load_cluster succeeded on the repo's own infra/cluster.toml
-    code = app(["up", "--name", "nope", "--no-precheck"])
+    code = app(["up", "nope", "--no-precheck"])
     err = capsys.readouterr().err
     assert code == 1
     assert "no service nope" in err

@@ -288,11 +288,10 @@ def build_parser() -> argparse.ArgumentParser:
         "logs in runs/services/<name>.log",
     )
     up.add_argument(
-        "--name",
-        type=str,
-        default=None,
-        help="start only this service (e.g. run the gateway under a debugger "
-        "while the rest are up)",
+        "names",
+        nargs="*",
+        help="start only these services (e.g. 'rosctl up gateway' runs one "
+        "under a debugger while the rest are up); default: all of them",
     )
     up.add_argument(
         "--config",
@@ -310,13 +309,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     down = sub.add_parser(
         "down",
-        help="stop the services started by up (SIGTERM, then SIGKILL)",
+        help="stop the services started by up (SIGINT, then SIGKILL)",
     )
     down.add_argument(
-        "--name",
-        type=str,
-        default=None,
-        help="stop only this service",
+        "names",
+        nargs="*",
+        help="stop only these services; default: everything with a pid file "
+        "(whatever cluster file up was given)",
     )
     down.add_argument(
         "--config",
@@ -418,7 +417,9 @@ def app(argv: Sequence[str] | None = None) -> int:
         from restaurantos.common.config import get_settings
         from restaurantos.sim.services import (
             RUNS_DIR,
+            PlatformError,
             PrecheckError,
+            dotenv_identity_warnings,
             down_exit_code,
             down_services,
             up_exit_code,
@@ -426,7 +427,17 @@ def app(argv: Sequence[str] | None = None) -> int:
         )
 
         config = args.config or get_settings().cluster_file
-        names = [args.name] if args.name else None
+        names = list(args.names) or None
+        if args.command == "up":
+            # a .env key the table does not set falls through to the
+            # child (it reads .env too); name the lines so nobody has
+            # to hunt for why edge-r1 calls itself coordinator
+            for line in dotenv_identity_warnings():
+                print(
+                    f"warning: .env sets {line}; rosctl up overrides these "
+                    f"only where the service table gives a value",
+                    file=sys.stderr,
+                )
         try:
             cluster = load_cluster(config)
             if args.command == "up":
@@ -439,9 +450,10 @@ def app(argv: Sequence[str] | None = None) -> int:
                 )
             else:
                 steps = down_services(cluster, runs_dir=RUNS_DIR, names=names)
-        except (PrecheckError, ValueError, OSError) as error:
-            # a silent cluster, an unknown --name, a bad cluster file:
-            # the user should see the message, not a traceback
+        except (PrecheckError, PlatformError, ValueError, OSError) as error:
+            # a silent cluster, a platform without /proc, an unknown
+            # name, a bad cluster file: the user should see the
+            # message, not a traceback
             print(f"rosctl {args.command}: {error}", file=sys.stderr)
             return 1
         for step in steps:

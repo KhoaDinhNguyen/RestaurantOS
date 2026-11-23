@@ -113,7 +113,7 @@ uv run rosctl up                              # gateway, coordinator, HQ worker,
 cd frontend && npm run dev
 ```
 
-`README.md` in this folder ("Running things") and `docs/setup.md` have the ports and what must be free. Until `rosctl up` exists, each backend brief shows the one command that starts its service.
+`README.md` in this folder ("Running things") and `docs/setup.md` have the ports and what must be free. `rosctl up` starts every backend service at once; each backend brief also shows the one command that starts its service alone.
 
 ## Done when
 
