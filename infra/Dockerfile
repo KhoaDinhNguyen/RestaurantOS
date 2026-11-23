@@ -48,9 +48,6 @@ RUN apt-get update \
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /app/src /app/src
 COPY --from=builder /app/db /app/db
-# Read at runtime by coordinator.rejoin (ROOT = parents[3] = /app) and
-# mounted into the recovery Compose run from there.
-COPY infra/postgres/rejoin-node.sh /app/infra/postgres/rejoin-node.sh
 
 WORKDIR /app
 ENV PATH="/app/.venv/bin:$PATH" \

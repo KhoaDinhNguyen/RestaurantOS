@@ -6,9 +6,6 @@
 !LICENSE
 !src/
 !db/
-# The coordinator rejoin (src/restaurantos/coordinator/rejoin.py) reads this
-# script at runtime and mounts it into the recovery Compose run.
-!infra/postgres/rejoin-node.sh
 # Re-included folders still must not bring junk in.
 **/__pycache__
 **/*.pyc
