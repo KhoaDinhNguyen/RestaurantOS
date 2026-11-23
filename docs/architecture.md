@@ -744,7 +744,7 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
 | --- | --- | --- |
 | `GET /sim/clock` | current simulated day and time, speed, state | built (WP6a) |
 | `GET /sim/playback` | the run's state and counters | built (WP6a) |
-| `POST /sim/playback` | `{action: start\|pause\|resume\|stop, from_day, to_day, speed, seed, run_id}` | built (WP6a) |
+| `POST /sim/playback` | `{action: start\|pause\|resume\|stop, from_day, to_day, speed, seed, run_id, duplicate_rate, shuffle}` | built (WP6a) |
 | `PATCH /sim/playback` | `{speed}`: change speed on the fly (UI slider) | built (WP6a) |
 | `GET /sim/links` | link groups and the faults on them | required |
 | `POST /sim/faults` | break a link group | required |
@@ -770,7 +770,7 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
 }
 ```
 
-- `start` needs `from_day`; `to_day`, `speed`, `seed` and `run_id` are optional. `duplicate_rate` and `shuffle` (Section 7.2) will join the body when they are built. Status events and restocks are switched on when the playback process starts, not per run.
+- `start` needs `from_day`; `to_day`, `speed`, `seed` and `run_id` are optional. `duplicate_rate` (a share in [0, 1], default 0) and `shuffle` (default off, Section 7.2) are part of the start body: they are per-run facts, derived from the seed like every other random value, and recorded in the run's `meta.json` next to the seed. A rate outside [0, 1] answers `422`, and so does `shuffle` together with `--sequential`. Status events and restocks are switched on when the playback process starts, not per run.
 - A `to_day` past the last day that has orders is shortened to that day. The answer's `to_day` shows the day used, and a warning names it. A `from_day` past the data, or inside the warm-up window, is refused.
 - How a status event's final answer is counted:
   - `events_acked`: the region applied it.
@@ -867,6 +867,13 @@ Playback also sends status events for each order, triggers restocks every R simu
 - The batch waits for every earlier send to finish, because an order still in flight from before midnight must land first: the oracle applies it first.
 - That day's orders wait for the whole batch.
 - A restock that still fails after its attempts is counted and reported, and the run goes on.
+
+**Duplicates and shuffle.** A configurable share of orders (`duplicate_rate`, default 0) is sent twice, and delivery can be reordered (`shuffle`, default off). Both are per-run start facts, recorded in `meta.json`, and both derive every random value from the hash of (`seed`, `order_id`, purpose) - never a shared generator.
+
+- **Duplicates:** an order is resent when `stable_float(seed, order_id, "duplicate")` is below the rate - a hash decision, so the resent share over a stream is exactly the rate, and the same seed always resends the same orders. The resend is the same request body (the same `external_order_id`), so the region's inbox answers `duplicate`: the point is exercising the services' idempotency. It is scheduled like an event, at the order's own simulated instant plus a hash-drawn offset in `[0, ROS_SIM_PLAYBACK_DUPLICATE_OFFSET_S)` simulated seconds, so it never depends on when the first answer came back. It takes an in-flight slot like any send. Its log line carries the same `kind=order` plus `resend: true`, and the run's counters keep it separate (`orders_resent`).
+- **Shuffle:** delivery is reordered in batches: the next `ROS_SIM_SHUFFLE_WINDOW` stream items are held as one batch and delivered in shuffle-key order - the smallest `stable_float(seed, order_id, "shuffle")` first - before the next batch is pulled. The window is the reorder's whole reach: an item moves at most window-1 places, and a window of 1 is no shuffle at all. Delivery order changes; line content does not.
+- **Sequential mode:** shuffle is refused with `--sequential` (sequential's in-order, one-at-a-time delivery is exactly what the oracle matches); duplicates are allowed in any mode.
+- **The oracle and the checker:** `rosctl oracle compare` refuses a run whose `meta.json` records a `duplicate_rate` above 0 or shuffle on - its input contract is one order line per order, in stream order. The faulted-run comparison belongs to the checker (WP6b).
 
 **Repeatability.** Random values are never drawn from one shared generator in send order. Each is computed from a hash of (`seed`, `order_id`, purpose), for example the jitter of the "ready" event or whether an order is resent. The same seed then gives the same run whatever the concurrency, speed changes, pauses or snapshot restores.
 

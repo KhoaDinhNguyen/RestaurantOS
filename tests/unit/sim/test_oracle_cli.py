@@ -320,6 +320,7 @@ def _write_run(
     cache: str = "sha-abc",
     items_cache: str | None = "sha-items",
     region_cached_orders: int | None = 5,
+    meta_extra: dict | None = None,
 ) -> None:
     run_dir = tmp_path / "runs" / run_id
     run_dir.mkdir(parents=True)
@@ -334,6 +335,8 @@ def _write_run(
         "cluster": {"config": "cluster.toml"},
         "region_cached_orders": region_cached_orders,
     }
+    if meta_extra:
+        meta.update(meta_extra)
     (run_dir / "meta.json").write_text(json.dumps(meta) + "\n", encoding="utf-8")
     (run_dir / "orders.jsonl").write_text(
         "".join(json.dumps(line) + "\n" for line in order_lines), encoding="utf-8"
@@ -512,6 +515,60 @@ def test_compare_refuses_a_non_sequential_run(tmp_path, runs_cwd, monkeypatch, c
         == 1
     )
     assert "not sequential" in capsys.readouterr().err
+
+
+def test_compare_refuses_a_run_that_resent_orders(tmp_path, runs_cwd, monkeypatch, capsys) -> None:
+    """The duplicates PR's guard: compare's input contract is one order
+    line per order in stream order; a run that resent orders breaks it.
+    Refuse before any report or region is read."""
+    _write_run(
+        tmp_path,
+        "run-dup",
+        [_order_line(0, "o1", "accepted")],
+        meta_extra={"duplicate_rate": 0.05, "shuffle": False},
+    )
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")])
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(
+            _parse(["oracle", "compare", "--run-id", "run-dup", "--report-id", "oracle-1"])
+        )
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "resent orders" in err and "duplicate_rate 0.05" in err
+    assert "not sequential" not in err  # it was sequential; the refusal names the resends
+
+
+def test_compare_refuses_a_shuffled_run(tmp_path, runs_cwd, monkeypatch, capsys) -> None:
+    _write_run(
+        tmp_path,
+        "run-shuffled",
+        [_order_line(0, "o1", "accepted")],
+        meta_extra={"duplicate_rate": 0.0, "shuffle": True},
+    )
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")])
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(
+            _parse(["oracle", "compare", "--run-id", "run-shuffled", "--report-id", "oracle-1"])
+        )
+        == 1
+    )
+    assert "shuffled delivery" in capsys.readouterr().err
+
+
+def test_compare_takes_a_run_logged_before_the_duplicate_facts_as_clean(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """A run whose meta.json predates duplicate_rate/shuffle (no keys at
+    all) passes the guard: it reads as clean, and the refusal that
+    follows is the ordinary missing-report one, not the guard."""
+    _write_run(tmp_path, "run-old", [_order_line(0, "o1", "accepted")])  # no meta_extra
+    assert oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run-old"])) == 1
+    err = capsys.readouterr().err
+    assert "resent orders" not in err and "shuffled delivery" not in err
+    assert "no oracle report" in err  # the guard let it past, to the report lookup
 
 
 def _age(report_dir: Path, seconds: int) -> None:

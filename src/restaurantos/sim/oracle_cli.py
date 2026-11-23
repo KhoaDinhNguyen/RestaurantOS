@@ -465,6 +465,30 @@ def compare_command(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # The comparison's input contract is one order line per order, in
+    # stream order (architecture 7.2): a run that resent orders or
+    # shuffled delivery breaks both halves - extra order lines, and a
+    # send order the oracle does not predict. Refuse, do not adapt: the
+    # checker (WP6b) owns the faulted-run comparison. Runs logged before
+    # playback recorded these facts read as clean (None / absent).
+    run_duplicate_rate = run_meta.get("duplicate_rate")
+    if run_duplicate_rate is not None and run_duplicate_rate > 0:
+        print(
+            f"rosctl oracle compare: run {args.run_id!r} resent orders "
+            f"(duplicate_rate {run_duplicate_rate}); compare expects exactly one "
+            "order line per order - replay a clean window (no --duplicate-rate, "
+            "no --shuffle) and compare that run",
+            file=sys.stderr,
+        )
+        return 1
+    if run_meta.get("shuffle"):
+        print(
+            f"rosctl oracle compare: run {args.run_id!r} shuffled delivery; compare "
+            "expects the run's order lines in stream order - replay a clean window "
+            "(no --duplicate-rate, no --shuffle) and compare that run",
+            file=sys.stderr,
+        )
+        return 1
     report_id = args.report_id or _newest_report_id(runs_dir)
     if report_id is None:
         print(
