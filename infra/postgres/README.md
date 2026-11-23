@@ -187,3 +187,68 @@ It checks actual HTTP responses, standby rejection, a healthy-primary promotion,
 competing coordinator instances, the committed event ID, epoch fencing, local
 primary selection, and rejection of an unsafe repeat. Recreate that disposable
 cluster after the run.
+
+## HQ database promotion (D10)
+
+This is the database promotion step. It does **not** restore all HQ service
+traffic: gateway, coordinator and relay code currently select `hq-primary`.
+The team must agree on HQ target selection before those services can move to
+the promoted node. The command neither rewrites proxies nor changes shared
+settings. The HQ worker also uses a direct connection to `hq-primary`.
+
+Run from the Docker host, using the Compose file of the running cluster:
+
+```bash
+# Dev cluster; use infra/generated/compose.yaml for a bootstrapped cluster.
+uv run rosctl hq promote --compose-file infra/compose.yaml --yes
+```
+
+Pass `--config <file>` if bootstrap used a nondefault cluster description.
+The command requires an explicit Compose file and `--yes`: it stops the old
+HQ primary and asynchronous replication may have lost unreplicated writes.
+The command is one-way, from `hq-primary` to `hq-standby`. HQ has no regional
+epoch or `region_state` row of its own; no such row is invented.
+
+Before promotion, the command checks the containers' Compose project, actual
+named data volumes, PostgreSQL image, HQ schema and database system identifier.
+It reads the old primary's identifier from a read-only, network-isolated
+`pg_controldata` helper using the already installed image, including after a
+crash. A candidate-side advisory lock serializes competing promotion commands.
+The standby is reached through the existing coordinator proxy. If that path
+is unavailable, no fence or promotion is attempted.
+
+The command disables the old container's automatic restart policy, stops it,
+and verifies the fence **before** issuing `pg_promote(false)`. It confirms the
+new writable role, then commits a `failover` event at the promoted HQ with
+`region_id: null` and `detail.scope: "hq"`. Event inserts use the existing
+commit-order lock; retries use the database identity and WAL timeline to avoid
+duplicate events. The control event flushes locally even if synchronous
+settings remain from the old configuration.
+
+Success prints JSON with `primary_node`, `old_primary_stopped`, `event_id`, and
+`client_switch_required: true`, plus a routing warning on stderr. Exit zero
+means database promotion and its event committed; it does not mean the
+gateway or relay has switched. An error returns nonzero and asks the operator
+to inspect HQ before retrying. A retry can finish event recording after the
+database was promoted, without another promotion. The role-confirmation
+window uses `ROS_COORDINATOR_FAILOVER_TIMEOUT_S` (default 15 seconds); each
+Docker subprocess has a ten-second deadline and database calls use the
+shared noncancelling deadline helper.
+
+Keep the old primary stopped. Do not restart it, run `compose up` over it, or
+reset its restart policy before a coordinated HQ rebuild/rejoin. The existing
+regional rejoin command intentionally refuses HQ; HQ rejoin and HQ client
+selection remain follow-ups. Lifecycle commands and promotion must not run
+concurrently against the same containers.
+
+The real PostgreSQL test resets only an explicitly selected scratch project
+whose name begins with `restaurantos-hq-`. It promotes once from a healthy
+primary and once after a real crash, tests lock conflicts and unreachable
+standby rejection, interrupts before event recording, and verifies a retry
+and repeated invocation produce one event. **It deletes that scratch
+project's volumes**; never point it at a populated topology:
+
+```bash
+ROS_HQ_TEST_COMPOSE=/path/to/scratch/compose.yaml ROS_NETWORK=host \
+uv run pytest tests/cluster/test_hq_promotion.py -q
+```
