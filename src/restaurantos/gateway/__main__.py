@@ -19,7 +19,12 @@ def main() -> None:
 
     uvicorn.run(
         "restaurantos.gateway.app:app",
-        host="0.0.0.0",
+        # on the host, loopback only: 0.0.0.0 would put the gateway and
+        # every edge API on whatever network the laptop is on (the same
+        # reason the architecture publishes every Docker port on
+        # 127.0.0.1, Section 4 / decision D16); inside compose, 0.0.0.0
+        # so the published port reaches the container
+        host="127.0.0.1" if settings.network == "host" else "0.0.0.0",
         port=service_port(cluster, service),
     )
 
