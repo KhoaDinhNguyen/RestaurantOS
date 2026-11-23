@@ -235,6 +235,7 @@ def run_command(args: argparse.Namespace) -> int:
         "floor": sim.stock_floor,
         "cache": {
             "orders_sha256": meta.orders_sha256,
+            "order_items_sha256": meta.order_items_sha256,
             "warm_up_days": meta.warm_up_days,
             "cached_orders": meta.orders,
         },
@@ -383,14 +384,23 @@ def _read_stock_csv(path: Path) -> dict[StockKey, tuple[int, int]]:
 
 
 def _newest_report_id(runs_dir: Path) -> str | None:
-    """The newest `oracle-*` report, or None. Ids start with the
-    default's timestamp, so the names sort by age."""
-    ids = sorted(
-        entry.name
+    """The newest complete `oracle-*` report, or None.
+
+    Age is the write time of `summary.json`, the file `oracle run`
+    writes last, not the name: a `--run-id oracle-...` the user chose
+    does not sort by age. The name only breaks a tie.
+    """
+    candidates = [
+        entry
         for entry in runs_dir.glob("oracle-*")
         if entry.is_dir() and (entry / "summary.json").is_file()
+    ]
+    if not candidates:
+        return None
+    newest = max(
+        candidates, key=lambda entry: ((entry / "summary.json").stat().st_mtime_ns, entry.name)
     )
-    return ids[-1] if ids else None
+    return newest.name
 
 
 def compare_command(args: argparse.Namespace) -> int:
@@ -448,10 +458,29 @@ def compare_command(args: argparse.Namespace) -> int:
             f"the run covered days {run_meta.get('from_day')}-{run_meta.get('to_day')}, "
             f"the report says {summary.get('from_day')}-{summary.get('to_day')}"
         )
-    run_cache = (run_meta.get("cache") or {}).get("orders_sha256")
-    report_cache = (summary.get("cache") or {}).get("orders_sha256")
-    if run_cache != report_cache:
+    # The cache is bound to both source files (replaydata.meta_is_current):
+    # orders.csv and order_items.csv. A run logged before playback recorded
+    # the second digest gets a warning for it, not a failure.
+    run_cache = run_meta.get("cache") or {}
+    report_cache = summary.get("cache") or {}
+    if run_cache.get("orders_sha256") != report_cache.get("orders_sha256"):
         facts_wrong.append("the run and the report replayed different order caches")
+    elif report_cache.get("order_items_sha256") is None:
+        facts_wrong.append(
+            f"report {report_id!r} does not record order_items.csv's digest "
+            f"(written before compare checked it); rerun `rosctl oracle run`"
+        )
+    elif run_cache.get("order_items_sha256") is None:
+        print(
+            f"rosctl oracle compare: warning: run {args.run_id!r} does not record "
+            "order_items.csv's digest (logged before playback recorded it); only "
+            "orders.csv is checked",
+            file=sys.stderr,
+        )
+    elif run_cache["order_items_sha256"] != report_cache["order_items_sha256"]:
+        facts_wrong.append(
+            "the run and the report replayed different order caches (order_items.csv differs)"
+        )
     if (run_meta.get("restock") or {}).get("days") != summary.get("restock_days"):
         facts_wrong.append(
             "the run restocked on "
@@ -552,10 +581,29 @@ def compare_command(args: argparse.Namespace) -> int:
             f"reason divergences (expected, {EXPECTED_REASON_DIVERGENCE[0]} vs "
             f"{EXPECTED_REASON_DIVERGENCE[1]}): {comparison.reason_divergences}"
         )
+    # The report's own lines must add up to its summary, the numbers the
+    # region counts above are checked against. Only checked when every
+    # line agreed: a per-line mismatch already explains any difference.
+    report_wrong: list[str] = []
+    report_totals = (summary.get("accepted"), summary.get("refused"))
+    if (
+        not comparison.mismatch_count
+        and (
+            comparison.both_accepted,
+            comparison.both_refused,
+        )
+        != report_totals
+    ):
+        report_wrong.append(
+            f"report {report_id!r}: its lines hold {comparison.both_accepted} accepted and "
+            f"{comparison.both_refused} refused, its summary says {report_totals[0]} and "
+            f"{report_totals[1]}; the report is damaged, rerun `rosctl oracle run`"
+        )
     failed = bool(
         comparison.mismatch_count
         or stock_mismatch_count
         or counts_wrong
+        or report_wrong
         or comparison.log_orders != comparison.report_orders
     )
     for line in comparison.mismatch_lines:
@@ -575,6 +623,8 @@ def compare_command(args: argparse.Namespace) -> int:
         )
     for line in counts_wrong:
         print(f"count mismatch: {line}", file=sys.stderr)
+    for line in report_wrong:
+        print(f"report mismatch: {line}", file=sys.stderr)
     if counts_wrong:
         # The counts are every row on the region, not this run's rows: a
         # region that took any other order since bootstrap cannot match.

@@ -18,6 +18,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -151,6 +152,8 @@ def test_run_replays_the_mini_fixture_end_to_end(
     assert summary["restock_days"] == []  # W=14, R=7: the first restock is day 21
     assert summary["region"] is None
     assert summary["region_cached_orders"] is None
+    # the cache is bound to both source files, and the report says so
+    assert set(summary["cache"]) >= {"orders_sha256", "order_items_sha256"}
     assert summary["cluster"] is None
     assert summary["counters_ever_zero"] >= 1
 
@@ -271,6 +274,15 @@ def runs_cwd(tmp_path: Path, monkeypatch) -> Path:
 STOCK_ROWS = [("v001", "dish", "d013", 39, 40), ("v001", "ingredient", "beef", 48, 50)]
 
 
+def _cache(orders: str, items: str | None) -> dict:
+    """The cache facts both sides record; `items` None leaves the
+    order_items digest out, as files written before it was recorded do."""
+    cache = {"orders_sha256": orders}
+    if items is not None:
+        cache["order_items_sha256"] = items
+    return cache
+
+
 def _write_run(
     tmp_path: Path,
     run_id: str,
@@ -280,6 +292,7 @@ def _write_run(
     sequential: bool = True,
     restock: tuple[int, ...] = (),
     cache: str = "sha-abc",
+    items_cache: str | None = "sha-items",
     region_cached_orders: int | None = 5,
 ) -> None:
     run_dir = tmp_path / "runs" / run_id
@@ -290,7 +303,7 @@ def _write_run(
         "sequential": sequential,
         "from_day": 14,
         "to_day": 16,
-        "cache": {"orders_sha256": cache},
+        "cache": _cache(cache, items_cache),
         "restock": {"days": list(restock)},
         "cluster": {"config": "cluster.toml"},
         "region_cached_orders": region_cached_orders,
@@ -310,6 +323,7 @@ def _write_report(
     accepted: int | None = None,
     refused: int | None = None,
     cache: str = "sha-abc",
+    items_cache: str | None = "sha-items",
     restock: tuple[int, ...] = (),
     region_cached_orders: int | None = 5,
 ) -> Path:
@@ -335,7 +349,7 @@ def _write_report(
         "from_day": 14,
         "to_day": 16,
         "restock_days": list(restock),
-        "cache": {"orders_sha256": cache},
+        "cache": _cache(cache, items_cache),
         "accepted": accepted,
         "refused": refused,
         "stock_rows": len(stock_rows),
@@ -474,14 +488,38 @@ def test_compare_refuses_a_non_sequential_run(tmp_path, runs_cwd, monkeypatch, c
     assert "not sequential" in capsys.readouterr().err
 
 
+def _age(report_dir: Path, seconds: int) -> None:
+    """Set the report's age: the write time of its summary.json."""
+    os.utime(report_dir / "summary.json", ns=(seconds * 10**9, seconds * 10**9))
+
+
 def test_compare_defaults_to_the_newest_oracle_report(
     tmp_path, runs_cwd, monkeypatch, capsys
 ) -> None:
     _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
-    _write_report(
+    older = _write_report(
         tmp_path, "oracle-20260101-000000", [_report_line(0, "o1", "refused", "out_of_stock")]
     )
-    _write_report(tmp_path, "oracle-20260202-000000", [_report_line(0, "o1", "accepted")])
+    newer = _write_report(tmp_path, "oracle-20260202-000000", [_report_line(0, "o1", "accepted")])
+    _age(older, 1_000)
+    _age(newer, 2_000)
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1"])) == 0
+    assert "oracle-20260202-000000 vs run run1: MATCH" in capsys.readouterr().out
+
+
+def test_the_newest_report_is_the_newest_written_not_the_last_name(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """A chosen id (`--run-id oracle-zeta`) sorts after every timestamped
+    one by name; the age decides, not the name."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    named = _write_report(
+        tmp_path, "oracle-zeta", [_report_line(0, "o1", "refused", "out_of_stock")]
+    )
+    stamped = _write_report(tmp_path, "oracle-20260202-000000", [_report_line(0, "o1", "accepted")])
+    _age(named, 1_000)
+    _age(stamped, 2_000)
     _stub_region(monkeypatch, orders=1, refused=0)
     assert oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1"])) == 0
     assert "oracle-20260202-000000 vs run run1: MATCH" in capsys.readouterr().out
@@ -569,3 +607,70 @@ def test_compare_order_lines_counts_a_shorter_side() -> None:
     assert (comparison.log_orders, comparison.report_orders) == (2, 1)
     assert comparison.mismatch_count == 1
     assert "has no oracle line" in comparison.mismatch_lines[0]
+
+
+def test_compare_fails_a_report_over_other_order_items(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """The cache is built from both files; the same orders.csv with a
+    different order_items.csv is a different replay."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")], items_cache="sha-items")
+    _write_report(
+        tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")], items_cache="sha-other"
+    )
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    assert "order_items.csv differs" in capsys.readouterr().err
+
+
+def test_compare_warns_on_a_run_logged_without_the_items_digest(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """A run logged before playback recorded order_items.csv's digest still
+    compares, with a warning that only orders.csv was checked."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")], items_cache=None)
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")])
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "warning" in captured.err
+    assert "only orders.csv is checked" in captured.err
+    assert "MATCH" in captured.out
+
+
+def test_compare_asks_to_rerun_a_report_without_the_items_digest(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")], items_cache=None)
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    assert "does not record order_items.csv's digest" in capsys.readouterr().err
+
+
+def test_compare_fails_a_report_whose_lines_disagree_with_its_summary(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """Every line agrees with the log and the region agrees with the
+    summary, but the report's lines do not add up to its summary."""
+    lines = [_order_line(0, "o1", "accepted")]
+    _write_run(tmp_path, "run1", lines)
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")], accepted=2)
+    _stub_region(monkeypatch, orders=2, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    captured = capsys.readouterr()
+    assert "report mismatch" in captured.err
+    assert "the report is damaged" in captured.err
+    assert "count mismatch" not in captured.err
