@@ -1,9 +1,11 @@
 """The service table, pure: names, commands, identity environment,
-ports and readiness routes follow the "How each service starts" table
-in architecture Section 4, for 1 and 3 regions. No process is spawned
-here."""
+ports, readiness routes and dials follow the "How each service starts"
+table in architecture Section 4 and the services' own connection calls,
+for 1 and 3 regions. No process is spawned here."""
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +13,7 @@ from restaurantos.common.cluster import Cluster, service_port
 from restaurantos.sim.services import (
     _stop_key,
     dialed_ports,
+    dials,
     port_labels,
     running_names,
     service_specs,
@@ -144,7 +147,18 @@ def test_a_spec_can_be_built_from_a_pid_file_alone() -> None:
 
 
 def test_a_name_matching_no_pattern_is_an_error() -> None:
-    for bad in ("", "web", "relay-", "edge-", "coordinator-r1"):
+    for bad in (
+        "",
+        "web",
+        "relay-",
+        "edge-",
+        "coordinator-r1",
+        # region ids are canonical: no r0, no leading zero, no suffix
+        "relay-r0",
+        "relay-r01",
+        "edge-r1x",
+        "relay-not-a-region",
+    ):
         with pytest.raises(KeyError):
             spec_for_name(bad)
 
@@ -152,7 +166,8 @@ def test_a_name_matching_no_pattern_is_an_error() -> None:
 def test_a_patterned_name_builds_even_outside_the_cluster() -> None:
     # deliberate: down reads pid files, so relay-r9 of a 3-region run
     # must still be stoppable while reading a 1-region cluster file -
-    # the region id is taken from the name, not validated
+    # the region id is taken from the name, not validated against the
+    # cluster (only against the canonical id pattern)
     assert spec_for_name("relay-r9").env["ROS_REGION_ID"] == "r9"
     assert spec_for_name("edge-r12", Cluster(regions=1)).port is None
 
@@ -171,11 +186,11 @@ def test_stop_order_puts_the_coordinator_first_and_the_region_side_last() -> Non
     ]
 
 
-def test_running_names_lists_pid_files_in_down_order(tmp_path) -> None:
+def test_running_names_lists_pid_files_in_down_order(tmp_path: Path) -> None:
     services_dir = tmp_path / "runs" / "services"
     services_dir.mkdir(parents=True)
     for name in ("edge-r1", "gateway", "coordinator", "relay-r2", "relay-r1", "edge-r2"):
-        (services_dir / f"{name}.pid").write_text("1\n", encoding="utf-8")
+        (services_dir / f"{name}.pid").write_text("1 1\n", encoding="utf-8")
     assert running_names(tmp_path / "runs") == [
         "coordinator",
         "gateway",
@@ -189,13 +204,32 @@ def test_running_names_lists_pid_files_in_down_order(tmp_path) -> None:
 # --- reachability --------------------------------------------------------
 
 
+def test_dials_are_each_services_own_links() -> None:
+    # derived from the services' connection calls, not from the proxy
+    # list: the gateway and the coordinator go through their own
+    # proxies, the hq worker additionally dials HQ directly, the
+    # region relay goes through its HQ proxies and dials its own
+    # region's nodes directly, the edge dials its region directly
+    cluster = Cluster(regions=1)
+    by_name = {spec.name: spec for spec in service_specs(cluster)}
+    assert dials(by_name["gateway"], cluster) == [21000, 21004, 21010, 21014]
+    assert dials(by_name["coordinator"], cluster) == [21001, 21002, 21011, 21015]
+    assert dials(by_name["hq-worker"], cluster) == [21012, 21017, 5500]
+    assert dials(by_name["relay-r1"], cluster) == [21013, 21019, 5510, 5511]
+    assert dials(by_name["edge-r1"], cluster) == [5510, 5511]
+
+
 def test_dialed_ports_are_the_childrens_own_links() -> None:
     cluster = Cluster(regions=1)
     ports = dialed_ports(cluster)
-    # every proxy the request path uses, and every node's published port
-    # for the direct region links - but not the Toxiproxy API and not
-    # baseline, which no service dials
-    assert 21000 in ports and 21005 in ports
+    # every proxy a service dials, and every node's published port for
+    # the direct links - but not the replication proxies (a standby to
+    # its primary is postgres, not a service), not the Toxiproxy API
+    # and not baseline, which no service dials
+    assert 21000 in ports and 21010 in ports
+    assert 21005 not in ports  # hq-primary__hq-standby: replication
+    assert 21003 not in ports  # hq-standby__hq-primary: replication
+    assert 21016 not in ports  # r1-standby__r1-primary: replication
     assert 5500 in ports and 5511 in ports
     assert 8474 not in ports
     assert 5509 not in ports

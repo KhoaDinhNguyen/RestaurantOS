@@ -5,39 +5,51 @@ This module is the ONE place that knows what the services are (WP6a
 brief: keep the list in one place so host mode and the later container
 mode both read it). `spec_for_name` is the table: the names follow
 fixed patterns (`gateway`, `coordinator`, `hq-worker`, `relay-r<n>`,
-`edge-r<n>`) with the commands, identity environment and ports of
-architecture Section 4 - ports come from `common.cluster`, never typed -
-and `service_specs` builds a whole cluster's list from those same
-patterns. Container mode, when WP0's image exists, reads the same
-patterns into the Compose generator.
+`edge-r<n>` with canonical region ids) with the commands, identity
+environment and ports of architecture Section 4 - ports come from
+`common.cluster`, never typed - and `service_specs` builds a whole
+cluster's list from those same patterns. Container mode, when WP0's
+image exists, reads the same patterns into the Compose generator.
 
 Supervision model (settled with Mark, 2026-11-23): detached children,
 no supervisor parent. `up` spawns each service in its own session
-(`start_new_session`), writes `runs/services/<name>.pid`, and waits for
-each one to be READY before reporting success - the HTTP services
+(`start_new_session`), writes `runs/services/<name>.pid` as
+"<pid> <start_ticks>" (the kernel start time from /proc: the one fact
+about a pid that never changes across execve, so a pid file names one
+process, not one number the kernel might hand out again), and waits
+for each one to be READY before reporting success - the HTTP services
 answer their readiness route (/health, /admin/cluster), the relays and
-the HQ worker survive a grace period. `down` works from the pid files,
-not from a cluster file: what `up` started is what `down` stops, even
-when the cluster file has changed in between - which is why the specs
-are rebuilt from the names. A process is signalled only after it has
-been proved to be the service its pid file names: same interpreter
-arguments AND the identity environment (two relay children share their
-argv, so the environment is what tells them apart). A missing, dead or
-foreign pid is reported and its file cleaned up - never killed, which
-guards against a reused pid. Stop is SIGINT first (uvicorn and the
-relay's asyncio.run both shut down cleanly on it), escalating to SIGKILL
-after a timeout. The control plane on 8002 (WP6b) is never touched:
-`down` signals only processes whose pid file names them, and stops in
-down order - the coordinator before the services it probes, the region
-side last.
+the HQ worker survive a grace period. A service that never becomes
+ready is STOPPED, not orphaned: a still-running child behind a removed
+pid file would hold its port and `down` could not find it. Two `up`s
+racing on one name are serialized by a lock file, so the second sees
+`already-running`. `down` works from the pid files, not from a cluster
+file: what `up` started is what `down` stops, even when the cluster
+file has changed in between - which is why the specs are rebuilt from
+the names.
+
+A process is signalled only through a pidfd opened for the exact pid
+that passed the identity proof (start ticks, then interpreter
+arguments, then identity environment - two relay children share their
+argv, so the environment is what tells them apart), never by bare pid
+number: a reused pid cannot be signalled by mistake. A missing, dead
+or foreign pid is reported and its file cleaned up - never killed. A
+malformed pid file is reported and left in place for a person to look
+at. Stop is SIGINT first (uvicorn and the relay's asyncio.run both
+shut down cleanly on it), escalating to SIGKILL after a timeout; the
+wait for exit polls the pidfd, not the pid. The control plane on 8002
+(WP6b) is never touched: `down` signals only processes whose pid file
+names them, and stops in down order - the coordinator before the
+services it probes, the region side last.
 
 Before spawning, `up` checks the cluster is reachable: one TCP connect
-to each port the children themselves will dial - their Toxiproxy
-proxies (the request path goes through them) and the nodes' published
-ports (the edge APIs and region relays go direct to their own region).
-Five children dying on connection errors is the worst first-run
-experience; `--no-precheck` is the documented escape for deliberately
-starting a service with no cluster.
+to each port the SELECTED services themselves dial (see `dials`) -
+their Toxiproxy proxies (the request path goes through them) and the
+nodes' published ports (the edge APIs and region relays go direct to
+their own region). Replication proxies are dialed by postgres, not by
+a service, so they are not checked. Five children dying on connection
+errors is the worst first-run experience; `--no-precheck` is the
+documented escape for deliberately starting a service with no cluster.
 
 Linux or WSL2 only: the process checks read /proc, and `up`/`down`
 refuse at once anywhere else. Standard library plus httpx (already a
@@ -46,7 +58,10 @@ dependency); no psutil.
 
 from __future__ import annotations
 
+import fcntl
 import os
+import re
+import select
 import signal
 import socket
 import subprocess
@@ -61,11 +76,14 @@ import httpx
 
 from restaurantos.common.cluster import (
     HOST_ADDRESS,
+    HQ_PRIMARY,
     SERVICE_PORTS,
     Cluster,
     host_port,
+    primary_of,
     proxies,
     service_port,
+    standby_of,
 )
 
 RUNS_DIR = Path("runs")
@@ -80,8 +98,8 @@ KILL_TIMEOUT_S = 5.0
 
 READY_TIMEOUT_S = 20.0
 """How long `up` waits for an HTTP service to answer its readiness
-route. A service that binds later than this (or never) is reported
-not-ready instead of started."""
+route. A service that binds later than this (or never) is stopped and
+reported not-ready instead of started."""
 
 RELAY_GRACE_S = 3.0
 """How long `up` waits before calling a service without an HTTP port
@@ -96,11 +114,16 @@ different hole: every child also reads .env (pydantic-settings), and a
 key the table does not set falls back to it - a leftover
 ROS_CLIENT=coordinator in .env really would make edge-r1 introduce
 itself as coordinator. `up` warns when .env sets one of these (see
-`dotenv_identity_warnings`)."""
+`dotenv_identity_warnings`). ROS_NETWORK is not one of them: rosctl
+always sets it itself, and "Running things" tells everyone to put it
+in .env, so warning on it would flag every developer on every run."""
 
 LOG_TAIL_LINES = 20
 """Log lines shown in an up failure message, so the message names the
 cause instead of pointing at a file."""
+
+_REGION_ID = re.compile(r"r[1-9][0-9]*")
+"""A canonical region id: r1, r2, ... r10 - never r0, r01 or r1x."""
 
 
 class PrecheckError(Exception):
@@ -148,24 +171,38 @@ class ServiceSpec:
 @dataclass
 class Step:
     """What `up` or `down` did to one service. The command layer prints
-    these; the tests assert them."""
+    these; the tests assert them. `pid` is set wherever a process was
+    spawned, so a test can prove the child is gone after a failure
+    even though the pid file has been cleaned up."""
 
     name: str
     outcome: str
     detail: str
+    pid: int | None = None
+
+
+def _region_of(name: str) -> str | None:
+    """The canonical region id inside a relay-/edge- name, or None when
+    there is none (`relay-`, `relay-r0`, `edge-r01`, `relay-not-a-region`)."""
+    for prefix in ("relay-", "edge-"):
+        if name.startswith(prefix):
+            rid = name.removeprefix(prefix)
+            return rid if _REGION_ID.fullmatch(rid) else None
+    return None
 
 
 def spec_for_name(name: str, cluster: Cluster | None = None) -> ServiceSpec:
     """The service a NAME implies, from the fixed patterns: gateway,
-    coordinator, hq-worker, relay-r<n>, edge-r<n>. The region id of a
-    relay or edge is part of its name, so a spec can be built from a pid
-    file alone (`down` passes no cluster); the port is filled in only
-    when a cluster is given and the name has one. A name that matches no
-    pattern raises KeyError.
+    coordinator, hq-worker, relay-r<n>, edge-r<n> with canonical region
+    ids. The region id of a relay or edge is part of its name, so a
+    spec can be built from a pid file alone (`down` passes no cluster);
+    the port is filled in only when a cluster is given and the name has
+    one. A name that matches no pattern raises KeyError.
 
     This is the one table: `service_specs` builds every cluster's list
     from these same patterns, so host mode and the later container mode
     cannot drift apart."""
+    rid = _region_of(name)
     if name == "gateway":
         return ServiceSpec(
             name,
@@ -188,31 +225,27 @@ def spec_for_name(name: str, cluster: Cluster | None = None) -> ServiceSpec:
             ("-m", "restaurantos.relay"),
             {"ROS_RELAY_ROLE": "hq", "ROS_CLIENT": "hq"},
         )
-    if name.startswith("relay-"):
-        rid = name.removeprefix("relay-")
-        if rid:
-            return ServiceSpec(
-                name,
-                ("-m", "restaurantos.relay"),
-                {
-                    "ROS_RELAY_ROLE": "region",
-                    "ROS_CLIENT": name,
-                    "ROS_REGION_ID": rid,
-                },
-            )
-    if name.startswith("edge-"):
-        rid = name.removeprefix("edge-")
-        if rid:
-            port = None
-            if cluster is not None and rid in cluster.region_ids:
-                port = service_port(cluster, name)
-            return ServiceSpec(
-                name,
-                ("-m", "restaurantos.gateway"),
-                {"ROS_MODE": "edge", "ROS_REGION_ID": rid},
-                port=port,
-                ready="/health",
-            )
+    if name.startswith("relay-") and rid is not None:
+        return ServiceSpec(
+            name,
+            ("-m", "restaurantos.relay"),
+            {
+                "ROS_RELAY_ROLE": "region",
+                "ROS_CLIENT": name,
+                "ROS_REGION_ID": rid,
+            },
+        )
+    if name.startswith("edge-") and rid is not None:
+        port = None
+        if cluster is not None and rid in cluster.region_ids:
+            port = service_port(cluster, name)
+        return ServiceSpec(
+            name,
+            ("-m", "restaurantos.gateway"),
+            {"ROS_MODE": "edge", "ROS_REGION_ID": rid},
+            port=port,
+            ready="/health",
+        )
     raise KeyError(f"no service named {name!r}")
 
 
@@ -269,17 +302,42 @@ def log_path(runs_dir: Path, name: str) -> Path:
     return runs_dir / "services" / f"{name}.log"
 
 
-def read_pid(runs_dir: Path, name: str) -> int | None:
-    """The pid recorded for `name`, or None when there is no readable
-    pid file."""
+def read_pid_record(runs_dir: Path, name: str) -> tuple[int, int] | str | None:
+    """What the pid file for `name` says: `(pid, start_ticks)` when it
+    is well-formed, a REASON string when it is malformed (left in place
+    for a person to look at - see `stop_service`), or None when there
+    is no pid file. The bytes are decoded here because a binary pid
+    file raises UnicodeDecodeError (a ValueError, not an OSError) on
+    read_text - which once ended a whole `down` sweep with a traceback
+    instead of reporting one bad file."""
     try:
-        text = pid_path(runs_dir, name).read_text(encoding="utf-8").strip()
+        raw = pid_path(runs_dir, name).read_bytes()
     except OSError:
         return None
     try:
-        return int(text)
-    except ValueError:
-        return None
+        text = raw.decode("utf-8").strip()
+    except UnicodeDecodeError as error:
+        return f"not valid utf-8 ({error})"
+    parts = text.split()
+    if len(parts) == 2:
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            pass
+    return f"expected 'pid start_ticks', found {text!r}"
+
+
+def _write_pid_file(path: Path, pid: int, start_ticks: int) -> None:
+    """Atomically, so a concurrent reader never sees a half-written
+    file: a temp file beside it, then rename into place. A failed
+    rename removes the temp file, so nothing partial is left behind."""
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(f"{pid} {start_ticks}\n", encoding="utf-8")
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def running_names(runs_dir: Path) -> list[str]:
@@ -306,6 +364,16 @@ def log_tail(runs_dir: Path, name: str, max_lines: int = LOG_TAIL_LINES) -> str:
 # --- process identity ---------------------------------------------------
 
 
+def _start_ticks(pid: int) -> int:
+    """Field 22 of /proc/<pid>/stat: the kernel's start time for the
+    process, in clock ticks. Read right after Popen returns: it is set
+    when the process is created and never changes across execve, so it
+    is the one fact that distinguishes this process from a future
+    reuser of the same pid number."""
+    stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    return int(stat.rpartition(")")[2].split()[19])
+
+
 def _proc_fields(pid: int) -> tuple[list[str], dict[str, str]] | None:
     """argv and environment of `pid`, or None when /proc cannot be read
     (no such process, another user's, or a platform without /proc)."""
@@ -323,11 +391,19 @@ def _proc_fields(pid: int) -> tuple[list[str], dict[str, str]] | None:
     return args, env
 
 
-def is_service(pid: int, spec: ServiceSpec) -> bool:
-    """True if `pid` is the process `spec` describes: the interpreter
-    arguments match AND every identity variable has the table's value.
-    A reused pid running some other python fails both checks; a
-    sibling service (same argv, different identity) fails the second."""
+def is_service(pid: int, start_ticks: int, spec: ServiceSpec) -> bool:
+    """True if `pid` is the exact process the pid file recorded for
+    `spec`. Three proofs, in order of what they catch: the start ticks
+    match (a pid handed out again to a different process fails here,
+    even one with the same argv and environment from a second checkout
+    of the repo), the interpreter arguments match, and every identity
+    variable has the table's value (two relay children share argv, so
+    the environment is what tells them apart)."""
+    try:
+        if _start_ticks(pid) != start_ticks:
+            return False
+    except OSError, IndexError, ValueError:
+        return False
     fields = _proc_fields(pid)
     if fields is None:
         return False
@@ -373,17 +449,59 @@ def port_in_use(port: int, host: str = HOST_ADDRESS) -> bool:
         return sock.connect_ex((host, port)) == 0
 
 
+def dials(spec: ServiceSpec, cluster: Cluster) -> list[int]:
+    """Every port this ONE service connects to, derived from the
+    services' own connection calls (not guessed from the proxy list):
+
+    - gateway: its Toxiproxy proxies - client `gateway` (gateway/app.py
+      reaches HQ and the regions through them, direct=False);
+    - coordinator: its proxies - client `coordinator`;
+    - hq-worker: its proxies - client `hq` (relay/menu.py, holding.py
+      reach the region nodes through them) - plus HQ's published port
+      (relay/holding.py dials hq-primary with direct=True);
+    - relay-r<n>: its proxies - client `relay-r<n>` (relay/worker.py
+      reaches HQ through them) - plus r<n>'s published node ports
+      (relay/worker.py dials its own region with direct=True, primary
+      or standby after a promotion);
+    - edge-r<n>: r<n>'s published node ports only (gateway/app.py in
+      edge mode dials its region directly and keeps no HQ directory).
+
+    The database-to-database replication proxies (a standby to its
+    primary) are dialed by postgres, not by a service, so they are not
+    here; neither is the Toxiproxy API (8474) or `baseline`."""
+
+    def proxy_ports(client: str) -> list[int]:
+        return [proxy.port for proxy in proxies(cluster) if proxy.client == client]
+
+    def region_node_ports(rid: str) -> list[int]:
+        wanted = {primary_of(rid)}
+        if cluster.standbys:
+            wanted.add(standby_of(rid))
+        return [host_port(cluster, node) for node in cluster.nodes if node in wanted]
+
+    rid = _region_of(spec.name)
+    if spec.name == "gateway":
+        return proxy_ports("gateway")
+    if spec.name == "coordinator":
+        return proxy_ports("coordinator")
+    if spec.name == "hq-worker":
+        return proxy_ports("hq") + [host_port(cluster, HQ_PRIMARY)]
+    if spec.name.startswith("relay-") and rid is not None:
+        return proxy_ports(f"relay-{rid}") + region_node_ports(rid)
+    if spec.name.startswith("edge-") and rid is not None:
+        return region_node_ports(rid)
+    return []
+
+
 def dialed_ports(cluster: Cluster) -> list[int]:
-    """Every port the spawned services will dial, deduplicated: their
-    Toxiproxy proxies (the gateway, coordinator, HQ worker and region
-    relays reach the databases through them) and the nodes' published
-    ports (the edge APIs and region relays go direct to their own
-    region's nodes). The Toxiproxy API on 8474 and `baseline` are not
-    on any service's path, so neither is checked - the precheck dials
-    what the children dial, nothing else."""
-    ports = [proxy.port for proxy in proxies(cluster)]
-    ports += [host_port(cluster, node) for node in cluster.nodes]
-    return sorted(set(ports))
+    """Every port the WHOLE service table dials, deduplicated: the
+    union of `dials` over `service_specs(cluster)`. `up` itself checks
+    only what the SELECTED services dial; this is the all-services
+    view the tests pin."""
+    ports: set[int] = set()
+    for spec in service_specs(cluster):
+        ports.update(dials(spec, cluster))
+    return sorted(ports)
 
 
 def port_labels(cluster: Cluster) -> dict[int, str]:
@@ -413,11 +531,11 @@ def unreachable_ports(
 
 def precheck_message(cluster: Cluster, unreachable: Sequence[int]) -> str:
     """The error for a cluster that does not answer: each unreachable
-    port named by what it is, then the three usual causes. Bootstrap is
-    the LAST resort in the list - it rebuilds from empty volumes, and
-    the common causes (stopped containers, a fault test that left a
-    proxy disabled) do not need it. Following a bare 'run bootstrap'
-    hint there would throw away a run's orders."""
+    port named by what it is, then the usual causes. The disabled-proxy
+    case names the exact reset command - pointing at `rosctl bootstrap`
+    there would send someone to the command that wipes the volumes.
+    Bootstrap is named only for the no-cluster case, where rebuilding
+    from empty volumes is genuinely the fix."""
     labels = port_labels(cluster)
     shown = ", ".join(f"{labels.get(port, '?')} ({port})" for port in unreachable[:5])
     more = f" (+{len(unreachable) - 5} more)" if len(unreachable) > 5 else ""
@@ -426,9 +544,10 @@ def precheck_message(cluster: Cluster, unreachable: Sequence[int]) -> str:
         f"reachable. If the containers were stopped, bring them back with "
         f"docker compose -p restaurantos -f infra/generated/compose.yaml up -d "
         f"(stopping does not delete the data). If a fault test left a proxy "
-        f"disabled, the named proxies above are the suspects: POST /reset on "
-        f"the Toxiproxy API, or the sync in rosctl bootstrap, re-enables them. "
-        f"If there is no cluster yet, run 'uv run rosctl bootstrap'. Pass "
+        f"disabled, the named proxies above are the suspects: "
+        f"curl -X POST http://127.0.0.1:8474/reset re-enables every proxy and "
+        f"removes every toxic. If there is no cluster yet, run "
+        f"'uv run rosctl bootstrap' (it rebuilds from empty volumes). Pass "
         f"--no-precheck to start the services anyway."
     )
 
@@ -453,10 +572,11 @@ def child_env(spec: ServiceSpec, cluster_file: Path | None) -> dict[str, str]:
 
 
 def dotenv_identity_warnings(env_path: Path = Path(".env")) -> list[str]:
-    """The .env lines that also say who a process is (IDENTITY_KEYS or
-    ROS_NETWORK). Every child reads .env, so a key the table does not
-    set falls back to it - see IDENTITY_KEYS. The caller prints one
-    warning per line returned."""
+    """The .env lines that also say who a process is (IDENTITY_KEYS).
+    Every child reads .env, so a key the table does not set falls back
+    to it - see IDENTITY_KEYS. ROS_NETWORK is NOT reported: rosctl
+    always sets it itself, so it can never leak into a service. The
+    caller prints one warning per line returned."""
     try:
         text = env_path.read_text(encoding="utf-8")
     except OSError:
@@ -467,7 +587,7 @@ def dotenv_identity_warnings(env_path: Path = Path(".env")) -> list[str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key = line.partition("=")[0].strip().removeprefix("export ").strip()
-        if key in IDENTITY_KEYS or key == "ROS_NETWORK":
+        if key in IDENTITY_KEYS:
             out.append(line)
     return out
 
@@ -478,46 +598,93 @@ def start_service(
     runs_dir: Path,
     cluster_file: Path | None = None,
 ) -> Step:
-    """Start one service as a detached child and record its pid. An
-    already-running service is reported, not duplicated (idempotent
-    `up`); a port someone else holds is reported, not fought over."""
-    pid = read_pid(runs_dir, spec.name)
-    if pid is not None:
-        if _alive(pid) and is_service(pid, spec):
-            return Step(spec.name, "already-running", f"pid {pid}, not started again")
-        pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-    if spec.port is not None and port_in_use(spec.port):
-        return Step(
-            spec.name,
-            "port-in-use",
-            f"port {spec.port} already answers - already running without a "
-            f"pid file, or another process holds it",
-        )
-    log_path(runs_dir, spec.name).parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path(runs_dir, spec.name), "ab") as log:
-        # one header line per start, so an appended log stays readable
-        started = datetime.now(UTC).isoformat(timespec="seconds")
-        identity = " ".join(f"{key}={value}" for key, value in sorted(spec.env.items()))
-        command = " ".join([sys.executable, *spec.args])
-        log.write(f"# {started} start {spec.name}: {command} ({identity})\n".encode())
-        log.flush()
-        process = subprocess.Popen(
-            [sys.executable, *spec.args],
-            env=child_env(spec, cluster_file),
-            stdin=subprocess.DEVNULL,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    pid_path(runs_dir, spec.name).write_text(f"{process.pid}\n", encoding="utf-8")
-    return Step(spec.name, "started", f"pid {process.pid}")
+    """Start one service as a detached child and record its pid. The
+    start of one name is serialized by a lock file, so two `up`s at
+    once cannot both spawn the same service - the second waits and
+    sees `already-running`. An already-running service is reported, not
+    duplicated (idempotent `up`); a port someone else holds is
+    reported, not fought over. An I/O failure (log folder, log file,
+    the run itself, the pid file) is a `launch-failed` step that names
+    the path - never an exception that ends the whole sweep; a child
+    whose pid file could not be written is killed and reaped, because
+    it must not outlive the record of it."""
+    services = runs_dir / "services"
+    try:
+        services.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(services / f"{spec.name}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError as error:
+        return Step(spec.name, "launch-failed", f"could not prepare the lock file: {error}")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        record = read_pid_record(runs_dir, spec.name)
+        if isinstance(record, str):
+            # up owns its own pid file: a malformed one is replaced, not
+            # obeyed (down leaves it for a person; up overwrites it)
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+        elif record is not None:
+            pid, ticks = record
+            if _alive(pid) and is_service(pid, ticks, spec):
+                return Step(spec.name, "already-running", f"pid {pid}, not started again")
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+        if spec.port is not None and port_in_use(spec.port):
+            return Step(
+                spec.name,
+                "port-in-use",
+                f"port {spec.port} already answers - already running without a "
+                f"pid file, or another process holds it",
+            )
+        try:
+            with open(log_path(runs_dir, spec.name), "ab") as log:
+                # one header line per start, so an appended log stays readable
+                started = datetime.now(UTC).isoformat(timespec="seconds")
+                identity = " ".join(f"{key}={value}" for key, value in sorted(spec.env.items()))
+                command = " ".join([sys.executable, *spec.args])
+                log.write(f"# {started} start {spec.name}: {command} ({identity})\n".encode())
+                log.flush()
+                try:
+                    process = subprocess.Popen(
+                        [sys.executable, *spec.args],
+                        env=child_env(spec, cluster_file),
+                        stdin=subprocess.DEVNULL,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        start_new_session=True,
+                    )
+                except OSError as error:
+                    return Step(spec.name, "launch-failed", f"could not run {command}: {error}")
+        except OSError as error:
+            return Step(
+                spec.name,
+                "launch-failed",
+                f"could not write the service log {log_path(runs_dir, spec.name)}: {error}",
+            )
+        try:
+            # the start time is read before the exec completes and never
+            # changes across it
+            ticks = _start_ticks(process.pid)
+            _write_pid_file(pid_path(runs_dir, spec.name), process.pid, ticks)
+        except (OSError, IndexError, ValueError) as error:
+            process.kill()
+            process.wait()
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            return Step(
+                spec.name,
+                "launch-failed",
+                f"could not write {pid_path(runs_dir, spec.name)}: {error}",
+                pid=process.pid,
+            )
+        return Step(spec.name, "started", f"pid {process.pid}", pid=process.pid)
+    finally:
+        os.close(lock_fd)  # also releases the flock
 
 
-def _start_failure(spec: ServiceSpec, runs_dir: Path, outcome: str, reason: str = "") -> Step:
-    """The failure step for a service that died or never became ready:
-    the pid file is cleaned, the message carries the log tail (the
-    cause is usually the last exception in it) and says the other
-    services keep running."""
+def _start_failure(
+    spec: ServiceSpec, runs_dir: Path, outcome: str, reason: str = "", *, pid: int | None = None
+) -> Step:
+    """The failure step for a service that died before becoming ready:
+    the pid file is cleaned (the process is gone), the message carries
+    the log tail (the cause is usually the last exception in it) and
+    says the other services keep running."""
     pid_path(runs_dir, spec.name).unlink(missing_ok=True)
     detail = f"{reason} - see {log_path(runs_dir, spec.name)}".lstrip(" -")
     return Step(
@@ -526,6 +693,7 @@ def _start_failure(spec: ServiceSpec, runs_dir: Path, outcome: str, reason: str 
         f"{detail}; last log lines:\n{log_tail(runs_dir, spec.name)}\n"
         f"(the other services keep running - a second 'rosctl up' skips "
         f"what is already up)",
+        pid=pid,
     )
 
 
@@ -540,41 +708,72 @@ def _ready_step(
     """Wait for a just-started service to be ready: an HTTP service
     answers its readiness route with 200 (a service that binds but
     fails inside startup, like a gateway whose directory read fails,
-    never answers it); a relay or the HQ worker just has to survive
-    its grace period, because their configuration errors exit within
-    a second."""
+    never answers it); a relay or the HQ worker just has to survive its
+    grace period, because their configuration errors exit within a
+    second. A service that never becomes ready is STOPPED, not
+    orphaned: it holds its port, and `down` could not find it behind a
+    removed pid file. The pid file is removed only if the stop
+    succeeded; if it did not, the message says so and the file stays."""
     if spec.port is None:
         deadline = time.monotonic() + grace_s
         while time.monotonic() < deadline and _alive(pid):
             time.sleep(0.1)
         if not _alive(pid):
-            return _start_failure(spec, runs_dir, "exited-immediately")
+            return _start_failure(spec, runs_dir, "exited-immediately", pid=pid)
         return Step(
             spec.name,
             "started",
             f"pid {pid} alive after {grace_s}s (no HTTP port), log {log_path(runs_dir, spec.name)}",
+            pid=pid,
         )
     url = f"http://{HOST_ADDRESS}:{spec.port}{spec.ready}"
     deadline = time.monotonic() + ready_timeout_s
     while time.monotonic() < deadline:
         if not _alive(pid):
-            return _start_failure(spec, runs_dir, "exited-immediately")
+            return _start_failure(spec, runs_dir, "exited-immediately", pid=pid)
         try:
-            if httpx.get(url, timeout=1.0).status_code == 200:
+            # trust_env=False: a machine with HTTP_PROXY set must not
+            # have its loopback readiness probe routed through the proxy
+            if httpx.get(url, timeout=1.0, trust_env=False).status_code == 200:
                 return Step(
                     spec.name,
                     "started",
                     f"pid {pid} ready on port {spec.port}, log {log_path(runs_dir, spec.name)}",
+                    pid=pid,
                 )
         except httpx.HTTPError:
             pass
         time.sleep(0.25)
-    return _start_failure(
-        spec,
-        runs_dir,
+    stop = stop_service(spec, runs_dir=runs_dir)
+    base = f"still not answering {spec.ready} on port {spec.port} within {ready_timeout_s}s"
+    if stop.outcome in ("stopped", "killed", "not-running"):
+        tail = f"{base} - the service was stopped ({stop.outcome}), pid file removed"
+    else:
+        tail = f"{base} - could not stop it ({stop.outcome}: {stop.detail}); pid file kept"
+    return Step(
+        spec.name,
         "not-ready",
-        f"still not answering {spec.ready} on port {spec.port} within {ready_timeout_s}s",
+        f"{tail}; last log lines:\n{log_tail(runs_dir, spec.name)}\n"
+        f"(the other services keep running - a second 'rosctl up' skips "
+        f"what is already up)",
+        pid=pid,
     )
+
+
+def _wait_pidfd(fd: int, timeout_s: float) -> bool:
+    """True if the process behind `fd` exited within the timeout: a
+    pidfd becomes readable when its process exits, so the wait is one
+    poll, not a loop of pid-number lookups that a recycled pid could
+    confuse."""
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if poller.poll(remaining * 1000):
+            return True
 
 
 def stop_service(
@@ -586,44 +785,78 @@ def stop_service(
 ) -> Step:
     """Stop one service: SIGINT first (uvicorn and the relay's
     asyncio.run both shut down cleanly on it), then SIGKILL after the
-    timeout. Only a process proven to be `spec` is signalled (see
-    `is_service`); a missing, dead or foreign pid is reported and its
-    file cleaned up. The control plane on 8002 has no pid file here,
-    so `down` can never touch it."""
-    pid = read_pid(runs_dir, spec.name)
-    if pid is None:
+    timeout, all through a pidfd opened for the exact pid that passed
+    the identity proof - never by bare pid number, so a pid reused
+    between the check and the signal cannot be hit. A missing, dead or
+    foreign pid is reported and its file cleaned up; a malformed pid
+    file is reported and left in place for a person to look at. A
+    process that vanishes mid-stop was the goal all along: stopped. A
+    platform without pidfds (kernels older than 5.3; WSL2 is 5.15 or
+    newer) reports `cannot-signal` and never falls back to os.kill -
+    signalling a number that was only just proven is the one thing this
+    design exists to prevent. The control plane on 8002 has no pid file
+    here, so `down` can never touch it."""
+    record = read_pid_record(runs_dir, spec.name)
+    if isinstance(record, str):
+        return Step(
+            spec.name,
+            "malformed-pid-file",
+            f"{record} - pid file left in place so it can be inspected",
+        )
+    if record is None:
         return Step(spec.name, "not-running", "no pid file")
+    pid, ticks = record
     if not _alive(pid):
         pid_path(runs_dir, spec.name).unlink(missing_ok=True)
         return Step(spec.name, "not-running", f"pid {pid} was not running, pid file removed")
-    if not is_service(pid, spec):
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        # vanished between the alive check and the open: gone is the goal
         pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+        return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+    except OSError as error:
         return Step(
             spec.name,
-            "stale-pid",
-            f"pid {pid} is not {spec.name} (exited and the pid was reused, or "
-            f"the file is wrong) - pid file removed, process left alone",
+            "cannot-signal",
+            f"pid {pid}: could not open a pidfd ({error}) - pid file left in place",
         )
-    os.kill(pid, signal.SIGINT)
-    deadline = time.monotonic() + stop_timeout_s
-    while _alive(pid) and time.monotonic() < deadline:
-        time.sleep(0.05)
-    outcome, detail = "stopped", f"pid {pid}"
-    if _alive(pid):
-        os.kill(pid, signal.SIGKILL)
-        deadline = time.monotonic() + kill_timeout_s
-        while _alive(pid) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if _alive(pid):
+    try:
+        if not is_service(pid, ticks, spec):
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
             return Step(
                 spec.name,
-                "unkillable",
-                f"pid {pid} did not exit after SIGKILL, pid file left in place",
+                "stale-pid",
+                f"pid {pid} is not {spec.name} (exited and the pid was reused, or "
+                f"the file is wrong) - pid file removed, process left alone",
             )
-        outcome = "killed"
-        detail = f"pid {pid} did not answer SIGINT within {stop_timeout_s}s, killed"
-    pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-    return Step(spec.name, outcome, detail)
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGINT)
+        except ProcessLookupError:
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+        if _wait_pidfd(fd, stop_timeout_s):
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            return Step(spec.name, "stopped", f"pid {pid}")
+        try:
+            signal.pidfd_send_signal(fd, signal.SIGKILL)
+        except ProcessLookupError:
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+        if _wait_pidfd(fd, kill_timeout_s):
+            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            return Step(
+                spec.name,
+                "killed",
+                f"pid {pid} did not answer SIGINT within {stop_timeout_s}s, killed",
+            )
+        return Step(
+            spec.name,
+            "unkillable",
+            f"pid {pid} did not exit after SIGKILL, pid file left in place",
+        )
+    finally:
+        os.close(fd)
 
 
 def up_services(
@@ -638,39 +871,38 @@ def up_services(
     specs: Sequence[ServiceSpec] | None = None,
 ) -> list[Step]:
     """Start every service (or the named ones) and wait for each to be
-    ready. Precheck first, all of it before anything spawns: no
-    half-started set to reason about afterwards. `specs` overrides the
-    table - how the lifecycle tests drive a fake target instead of the
-    real services."""
+    ready. The selection happens first, then the precheck dials only
+    what the SELECTED services dial, all of it before anything spawns:
+    no half-started set to reason about afterwards. `specs` overrides
+    the table - how the lifecycle tests drive a fake target instead of
+    the real services."""
     require_proc()
-    if precheck:
-        unreachable = unreachable_ports(dialed_ports(cluster))
-        if unreachable:
-            raise PrecheckError(precheck_message(cluster, unreachable))
     table = list(specs) if specs is not None else service_specs(cluster)
     selected = select_specs(table, names)
+    if precheck:
+        wanted = sorted({port for spec in selected for port in dials(spec, cluster)})
+        unreachable = unreachable_ports(wanted)
+        if unreachable:
+            raise PrecheckError(precheck_message(cluster, unreachable))
     steps: list[Step] = []
     for spec in selected:
         step = start_service(spec, runs_dir=runs_dir, cluster_file=cluster_file)
+        steps.append(step)
         if step.outcome != "started":
-            steps.append(step)
             continue
-        pid = read_pid(runs_dir, spec.name)
-        assert pid is not None  # just written by start_service
-        steps.append(
-            _ready_step(
-                spec,
-                runs_dir=runs_dir,
-                pid=pid,
-                ready_timeout_s=ready_timeout_s,
-                grace_s=grace_s,
-            )
+        assert step.pid is not None  # set by start_service on the spawn
+        steps[-1] = _ready_step(
+            spec,
+            runs_dir=runs_dir,
+            pid=step.pid,
+            ready_timeout_s=ready_timeout_s,
+            grace_s=grace_s,
         )
     return steps
 
 
 def down_services(
-    cluster: Cluster,
+    cluster: Cluster | None = None,
     *,
     runs_dir: Path,
     names: Sequence[str] | None = None,
@@ -680,11 +912,11 @@ def down_services(
     """Stop the services started by `up`. With no names, the work list
     is the pid files themselves, in down order (see `_stop_key`), each
     one's spec rebuilt from its name - so a plain `rosctl down` stops
-    everything `up` started even when it was given a different
-    cluster file. With names, they are looked up in the table (or, for
-    a relay/edge of another cluster shape, built from the name). A pid
-    file whose name matches no service pattern is reported and left
-    alone."""
+    everything `up` started even when it was given a different cluster
+    file, and needs no cluster file at all. With names, EVERY name is
+    resolved to a spec first (nothing is stopped if any name is
+    invalid), then they are stopped in down order. A pid file whose
+    name matches no service pattern is reported and left alone."""
     require_proc()
     steps: list[Step] = []
     if names is None:
@@ -698,27 +930,43 @@ def down_services(
                 continue
             steps.append(stop_service(spec, runs_dir=runs_dir, stop_timeout_s=stop_timeout_s))
         return steps
-    table = {spec.name: spec for spec in (specs or service_specs(cluster))}
-    for name in sorted(names, key=_stop_key):
+    rows: Sequence[ServiceSpec]
+    if specs is not None:
+        rows = specs
+    elif cluster is not None:
+        rows = service_specs(cluster)
+    else:
+        rows = []
+    table = {spec.name: spec for spec in rows}
+    resolved: list[ServiceSpec] = []
+    for name in names:
         spec = table.get(name)
         if spec is None:
+            if cluster is None:
+                valid = ", ".join(sorted(table))
+                raise ValueError(
+                    f"no service {name} - valid names: {valid or '(no table to name them)'}"
+                ) from None
             try:
                 spec = spec_for_name(name, cluster)
             except KeyError:
                 valid = ", ".join(sorted(table))
                 raise ValueError(f"no service {name} - valid names: {valid}") from None
+        resolved.append(spec)
+    for spec in sorted(resolved, key=lambda s: _stop_key(s.name)):
         steps.append(stop_service(spec, runs_dir=runs_dir, stop_timeout_s=stop_timeout_s))
     return steps
 
 
 def up_exit_code(steps: Sequence[Step]) -> int:
-    """`up` fails when a service could not be started or never became
-    ready; an already-running service is the idempotent case, not a
-    failure."""
-    bad = {"port-in-use", "exited-immediately", "not-ready"}
+    """`up` fails when a service could not be started, could not be
+    launched, or never became ready; an already-running service is the
+    idempotent case, not a failure."""
+    bad = {"port-in-use", "exited-immediately", "not-ready", "launch-failed"}
     return 1 if any(step.outcome in bad for step in steps) else 0
 
 
 def down_exit_code(steps: Sequence[Step]) -> int:
-    """`down` fails only when a process survived SIGKILL."""
-    return 1 if any(step.outcome == "unkillable" for step in steps) else 0
+    """`down` fails when a process survived SIGKILL, or could not be
+    signalled at all (no pidfd: `cannot-signal`)."""
+    return 1 if any(step.outcome in ("unkillable", "cannot-signal") for step in steps) else 0
