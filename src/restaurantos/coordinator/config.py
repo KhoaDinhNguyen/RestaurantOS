@@ -15,3 +15,4 @@ class CoordinatorSettings(BaseSettings):
     gateway_timeout_s: float = Field(default=4.0, gt=0, allow_inf_nan=False)
     gateway_url: AnyHttpUrl | None = None
     failover_timeout_s: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    rejoin_timeout_s: PositiveInt = 300
