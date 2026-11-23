@@ -149,17 +149,21 @@ One image runs every Python service (gateway, edge, coordinator, relay, HQ worke
 docker build -f infra/Dockerfile -t restaurantos-services:local .
 ```
 
-Inside the image: the virtualenv at `/app/.venv` (on `PATH`), `src/`, `db/` and `infra/postgres/rejoin-node.sh`; nothing else. No `.env`, no dataset: settings come only from the environment (`--env-file`), and the dataset never enters an image (`.dockerignore` is an allowlist).
+Inside the image: the virtualenv at `/app/.venv` (on `PATH`), `src/` and `db/`; nothing else. No `.env`, no dataset: settings come only from the environment (`--env-file`), and the dataset never enters an image (`.dockerignore` is an allowlist).
 
-The image uses Debian trixie's own `libpq5` 17, while the host builds `psycopg[c]` against PGDG's libpq (`docs/setup.md`, "libpq 17 or newer"). Both meet the 17-or-newer rule: below 17, psycopg cancels a query with a blocking `PQcancel` that freezes a whole process on a link a fault test has silenced.
+The image uses Debian trixie's own `libpq5` 17, while the host builds `psycopg[c]` against PGDG's libpq (see "libpq 17 or newer" above). Both meet the 17-or-newer rule: below 17, psycopg cancels a query with a blocking `PQcancel` that freezes a whole process on a link a fault test has silenced.
 
 The cluster definition is **mounted, not copied**: a region-count change needs no rebuild.
 
+A service container joins the cluster's Compose network (named after the Compose project; `restaurantos_default` for the default project name) and publishes its HTTP port on the loopback interface only:
+
 ```bash
 docker run --rm \
+  --network restaurantos_default \
   --env-file .env.example \
   -e ROS_NETWORK=compose \
   -e ROS_CLUSTER_FILE=/app/infra/cluster.toml \
   -v "$PWD/infra/cluster.toml:/app/infra/cluster.toml:ro" \
+  -p 127.0.0.1:8000:8000 \
   restaurantos-services:local python -m restaurantos.gateway
 ```
