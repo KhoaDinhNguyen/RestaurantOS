@@ -97,7 +97,7 @@ uv run pytest -m "not cluster"                         # unit and integration
 uv run pytest -m cluster                               # needs the dev cluster
 ```
 
-**Services.** Each one is started with `uv run python -m restaurantos.<component>`, and settings say who the process is. The full table is "How each service starts" in architecture Section 4; each brief repeats the line for its own service. `rosctl up` starts all of them at once as host-mode processes (Linux/WSL2 only), and `rosctl up <name>` starts single ones - so one service can run under a debugger while the rest are up. `rosctl down` stops everything `up` started.
+**Services.** Each one is started with `uv run python -m restaurantos.<component>`, and settings say who the process is. The full table is "How each service starts" in architecture Section 4; each brief repeats the line for its own service. `rosctl up` starts all of them at once as host-mode processes (Linux/WSL2 only), and `rosctl up <name>` starts single ones. To run one service under a debugger: `rosctl up`, then `rosctl down <name>`, then start it by hand with its command from the architecture Section 4 table. `rosctl down` stops everything `up` started.
 
 **Data.** The dev cluster starts empty. Until WP6a's bootstrap and mini fixture exist, tests insert the few rows they need, and the briefs show the control rows a service needs to start.
 

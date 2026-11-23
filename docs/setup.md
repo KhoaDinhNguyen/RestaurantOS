@@ -137,7 +137,7 @@ uv run pytest -m cluster tests/cluster/test_deadline.py    # checks the path end
 
 - With `ROS_NETWORK=host`, a service reaches every database on `127.0.0.1`, through the same Toxiproxy proxies a container would use. The Compose file publishes those ports on `127.0.0.1` only, so they are not visible from the network your machine is on.
 - These ports must be free for the dev baseline: 8474; 5500, 5501, 5510 and 5511; 21000 to 21005 and 21010 to 21019. Each extra region adds ten proxy ports and two database ports.
-- Service ports are fixed, and must also be free: gateway 8000, coordinator 8001, control 8002, the edge API of region n on 8010 + n (so 8011 up to 8010 + N for an N-region cluster).
+- The ports `rosctl up` needs free: gateway 8000, coordinator 8001, and the edge API of region n on 8010 + n (so 8011 up to 8010 + N for an N-region cluster). Port 8002 is not one of them - it is the default of the playback control routes (`ROS_SIM_CONTROL_PORT`, or `--port` on `rosctl playback start`), served while a playback run is live.
 - `rosctl up` and `rosctl down` need Linux or WSL2: their process checks read `/proc`. On macOS, start each service by hand with the commands in the architecture Section 4 table.
 - Host mode is for developing and debugging. Do not report performance numbers from it: every query takes an extra hop through Docker's port forwarding. Measured runs use container mode (`docs/architecture.md` Section 4).
 
