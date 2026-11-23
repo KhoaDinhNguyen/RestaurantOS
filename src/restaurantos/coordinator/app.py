@@ -1,4 +1,4 @@
-"""Coordinator admin reads from architecture Section 6.2."""
+"""Coordinator admin API from architecture Section 6.2."""
 
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -10,7 +10,15 @@ from restaurantos.common.cluster import load_cluster
 from restaurantos.common.config import get_settings
 from restaurantos.common.errors import RegionUnreachableError
 from restaurantos.coordinator.config import CoordinatorSettings
-from restaurantos.coordinator.models import ClusterEvent, ClusterStatus, ExceptionEntry
+from restaurantos.coordinator.failover import ManualFailoverError
+from restaurantos.coordinator.models import (
+    ClusterEvent,
+    ClusterStatus,
+    ExceptionEntry,
+    FailoverConflict,
+    FailoverNotFound,
+    ManualFailoverResult,
+)
 from restaurantos.coordinator.service import Coordinator
 
 
@@ -31,7 +39,7 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
 
     app = FastAPI(
         title="RestaurantOS coordinator",
-        description="Node health monitoring and admin reads. Promotion is a follow-up increment.",
+        description="Cluster health, event and exception feeds, and resumable regional failover.",
         lifespan=lifespan,
     )
 
@@ -41,6 +49,25 @@ def create_app(coordinator: Coordinator | None = None) -> FastAPI:
             status_code=503,
             content={"error": "region_unreachable", "region_id": exc.region_id},
         )
+
+    @app.exception_handler(ManualFailoverError)
+    async def failover_error(request, exc: ManualFailoverError):
+        return JSONResponse(status_code=exc.status_code, content={"error": exc.error})
+
+    @app.post(
+        "/admin/regions/{region_id}/failover",
+        response_model=ManualFailoverResult,
+        responses={
+            404: {"model": FailoverNotFound, "description": "Unknown region"},
+            409: {
+                "model": FailoverConflict,
+                "description": "Standby unavailable or failover running",
+            },
+            503: {"description": "HQ or promotion target did not respond before the deadline"},
+        },
+    )
+    async def manual_failover(region_id: str) -> ManualFailoverResult:
+        return await coordinator.failover.manual(region_id)
 
     @app.get("/admin/cluster", response_model=ClusterStatus)
     async def cluster() -> ClusterStatus:
