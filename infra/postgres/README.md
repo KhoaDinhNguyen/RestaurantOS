@@ -141,3 +141,49 @@ restart. It also checks stable async mode after healing and a second automatic
 fallback after an operator explicitly re-enables sync and isolates the standby.
 Do not enable this flag on a populated cluster. Recreate the disposable cluster
 after the test.
+
+## Manual regional failover API
+
+`POST /admin/regions/{region_id}/failover` takes no body. It uses the same
+promotion/epoch/directory/event sequence as automatic failover, and an operator
+may call it while the current primary is healthy:
+
+```bash
+curl -s -X POST localhost:8001/admin/regions/r1/failover
+```
+
+A completed promotion returns `200` with `region_id`, the new `epoch`,
+`primary_node`, `standby_node`, and the committed `event_id`. The response is
+returned after HQ commits its directory update and matching failover event.
+The standby must be marked `up` and pass a fresh role/epoch probe. An unknown
+region returns `404 {"error":"not_found"}`; an unavailable standby returns
+`409 {"error":"standby_unavailable"}`. A locked region directory row or a
+partially completed promotion returns `409 {"error":"failover_in_progress"}`.
+The fencing epoch transaction flushes WAL locally so it does not wait for the
+old partner to rejoin when a promoted node retains synchronous settings. This
+is a transaction-local setting for the control write.
+The database lock serializes manual and automatic attempts across coordinator
+instances. An unrelated region's in-process sampling lock does not block the
+request. HQ is excluded from this API.
+
+A request that cannot confirm completion before the configured failover deadline
+returns `503`. Promotion itself cannot be rolled back: the background coordinator
+can finish a partial operation after a timeout or restart. Inspect
+`/admin/cluster` and `/admin/events` before retrying; this POST has no idempotency
+key in the current contract. A repeat request cannot promote an old writable
+primary with a lower epoch. After any successful promotion, use the rejoin
+command above to return the old node as a physical standby. As documented in
+architecture Section 6.2, asynchronous promotion can lose unreplicated old-node
+writes. The coordinator OpenAPI export includes the response shapes.
+
+The manual endpoint test runs only on a fresh disposable dev topology:
+
+```bash
+ROS_MANUAL_FAILOVER_TEST_CLUSTER=1 ROS_NETWORK=compose \
+uv run pytest -m cluster tests/cluster/test_coordinator_manual.py
+```
+
+It checks actual HTTP responses, standby rejection, a healthy-primary promotion,
+competing coordinator instances, the committed event ID, epoch fencing, local
+primary selection, and rejection of an unsafe repeat. Recreate that disposable
+cluster after the run.

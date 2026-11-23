@@ -146,6 +146,37 @@
         "title": "ExceptionEntry",
         "type": "object"
       },
+      "FailoverConflict": {
+        "properties": {
+          "error": {
+            "enum": [
+              "standby_unavailable",
+              "failover_in_progress"
+            ],
+            "title": "Error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "FailoverConflict",
+        "type": "object"
+      },
+      "FailoverNotFound": {
+        "properties": {
+          "error": {
+            "const": "not_found",
+            "title": "Error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "title": "FailoverNotFound",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -157,6 +188,39 @@
           }
         },
         "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "ManualFailoverResult": {
+        "properties": {
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "event_id": {
+            "title": "Event Id",
+            "type": "integer"
+          },
+          "primary_node": {
+            "title": "Primary Node",
+            "type": "string"
+          },
+          "region_id": {
+            "title": "Region Id",
+            "type": "string"
+          },
+          "standby_node": {
+            "title": "Standby Node",
+            "type": "string"
+          }
+        },
+        "required": [
+          "region_id",
+          "epoch",
+          "primary_node",
+          "standby_node",
+          "event_id"
+        ],
+        "title": "ManualFailoverResult",
         "type": "object"
       },
       "NodeStatus": {
@@ -380,7 +444,7 @@
     }
   },
   "info": {
-    "description": "Node health monitoring and admin reads. Promotion is a follow-up increment.",
+    "description": "Cluster health, event and exception feeds, and resumable regional failover.",
     "title": "RestaurantOS coordinator",
     "version": "0.1.0"
   },
@@ -528,6 +592,68 @@
           }
         },
         "summary": "Exceptions"
+      }
+    },
+    "/admin/regions/{region_id}/failover": {
+      "post": {
+        "operationId": "manual_failover_admin_regions__region_id__failover_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "region_id",
+            "required": true,
+            "schema": {
+              "title": "Region Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManualFailoverResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FailoverNotFound"
+                }
+              }
+            },
+            "description": "Unknown region"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FailoverConflict"
+                }
+              }
+            },
+            "description": "Standby unavailable or failover running"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          },
+          "503": {
+            "description": "HQ or promotion target did not respond before the deadline"
+          }
+        },
+        "summary": "Manual Failover"
       }
     }
   }

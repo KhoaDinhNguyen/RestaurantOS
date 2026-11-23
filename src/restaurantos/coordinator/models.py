@@ -56,3 +56,19 @@ class ExceptionEntry(BaseModel):
     attempted_status: str
     attempted_at: datetime
     hq_applied_at: datetime
+
+
+class ManualFailoverResult(BaseModel):
+    region_id: str
+    epoch: int
+    primary_node: str
+    standby_node: str
+    event_id: int
+
+
+class FailoverConflict(BaseModel):
+    error: Literal["standby_unavailable", "failover_in_progress"]
+
+
+class FailoverNotFound(BaseModel):
+    error: Literal["not_found"]
