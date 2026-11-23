@@ -18,6 +18,7 @@ import sys
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from itertools import zip_longest
 from pathlib import Path
 from typing import Any
 
@@ -100,9 +101,16 @@ def run_command(args: argparse.Namespace) -> int:
 
     region = args.region
     cluster: Cluster | None = None
+    cluster_file: Path | None = None
+    # The region's share of the whole cache, the number playback's
+    # region mode records as `region_cached_orders` in meta.json: compare
+    # checks the two, so a report scoped by a different cluster file than
+    # the run's is caught as a fact, not as 1.7M per-order mismatches.
+    region_cached_orders: int | None = None
     if region is not None:
+        cluster_file = Path(args.config or common.cluster_file)
         try:
-            cluster = load_cluster(args.config or common.cluster_file)
+            cluster = load_cluster(cluster_file)
         except (OSError, ValueError) as error:
             print(f"rosctl oracle run: {error}", file=sys.stderr)
             return 1
@@ -158,6 +166,7 @@ def run_command(args: argparse.Namespace) -> int:
                 from_day=window.from_day,
                 to_day=window.to_day,
             )
+            region_cached_orders = share.region_orders
             if share.unknown_orders:
                 print(
                     f"rosctl oracle run: {share.unknown_orders} cached orders have a "
@@ -215,6 +224,8 @@ def run_command(args: argparse.Namespace) -> int:
     summary = {
         "oracle_id": oracle_id,
         "region": region,
+        "region_cached_orders": region_cached_orders,
+        "cluster": {"config": str(cluster_file)} if cluster_file is not None else None,
         "from_day": window.from_day,
         "to_day": window.to_day,
         "restock_days": run_restock_days,
@@ -271,6 +282,11 @@ class OrderComparison:
             self.mismatch_lines.append(line)
 
 
+def _order_lines(lines: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    """Only the order lines; the log also carries restocks and status events."""
+    return (line for line in lines if line.get("kind") == "order")
+
+
 def compare_order_lines(
     log_lines: Iterable[dict[str, Any]], report_lines: Iterable[dict[str, Any]]
 ) -> OrderComparison:
@@ -281,18 +297,20 @@ def compare_order_lines(
     skipped. The log line must hold a decided order outcome: a parked,
     failed or cancelled send is a mismatch, because the oracle predicts
     accepted and refused, not what a broken link does.
+
+    Both inputs are consumed one line at a time and never held in
+    memory: a full-window run is 1.7M lines a side (the brief's "stream
+    the files, do not build Python objects for all of them up front").
     """
     comparison = OrderComparison()
-    log_orders = [line for line in log_lines if line.get("kind") == "order"]
-    report_orders = [line for line in report_lines if line.get("kind") == "order"]
-    comparison.log_orders = len(log_orders)
-    comparison.report_orders = len(report_orders)
-
-    for position in range(max(len(log_orders), len(report_orders))):
-        log = log_orders[position] if position < len(log_orders) else None
-        report = report_orders[position] if position < len(report_orders) else None
+    pairs = zip_longest(_order_lines(log_lines), _order_lines(report_lines))
+    for position, (log, report) in enumerate(pairs):
+        if log is not None:
+            comparison.log_orders += 1
+        if report is not None:
+            comparison.report_orders += 1
         if log is None:
-            # the loop index sits past the log's end, so the report's
+            # zip_longest pads only the shorter side, so the report's
             # line is there by construction
             assert report is not None
             comparison.add_mismatch(
@@ -440,6 +458,22 @@ def compare_command(args: argparse.Namespace) -> int:
             f"{(run_meta.get('restock') or {}).get('days')}, the report says "
             f"{summary.get('restock_days')}"
         )
+    run_share = run_meta.get("region_cached_orders")
+    report_share = summary.get("region_cached_orders")
+    if report_share is None:
+        facts_wrong.append(
+            f"report {report_id!r} does not record its region's cached-order count "
+            f"(written before compare checked it); rerun `rosctl oracle run --region {region}`"
+        )
+    elif run_share != report_share:
+        run_cluster = (run_meta.get("cluster") or {}).get("config")
+        report_cluster = (summary.get("cluster") or {}).get("config")
+        facts_wrong.append(
+            f"the run's region {region} holds {run_share} cached orders, the report's "
+            f"holds {report_share}: the two were scoped with different cluster files "
+            f"(run: {run_cluster}, report: {report_cluster}); rerun `rosctl oracle run "
+            f"--region {region} --config {run_cluster}`"
+        )
     if facts_wrong:
         for line in facts_wrong:
             print(f"rosctl oracle compare: {line}", file=sys.stderr)
@@ -541,6 +575,14 @@ def compare_command(args: argparse.Namespace) -> int:
         )
     for line in counts_wrong:
         print(f"count mismatch: {line}", file=sys.stderr)
+    if counts_wrong:
+        # The counts are every row on the region, not this run's rows: a
+        # region that took any other order since bootstrap cannot match.
+        print(
+            "count mismatch: compare counts every order and refusal on the region; "
+            "it needs a freshly bootstrapped region that took only this run",
+            file=sys.stderr,
+        )
     verdict = "MISMATCH" if failed else "MATCH"
     print(f"oracle {report_id} vs run {args.run_id}: {verdict}")
     return 1 if failed else 0

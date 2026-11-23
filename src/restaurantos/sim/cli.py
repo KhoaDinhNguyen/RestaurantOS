@@ -218,7 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ocmp = osub.add_parser(
         "compare",
-        help="check an oracle report against a sequential run's log and its region",
+        help="check an oracle report against a sequential run's log and its region "
+        "(bootstrap fresh before that run: compare counts every row on the region)",
     )
     ocmp.add_argument(
         "--run-id",

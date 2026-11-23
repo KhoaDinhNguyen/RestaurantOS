@@ -19,6 +19,7 @@ import hashlib
 import io
 import json
 import shutil
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -149,6 +150,8 @@ def test_run_replays_the_mini_fixture_end_to_end(
     assert summary["stock_rows"] == 17  # warm-up-derived: no counter for the none dish
     assert summary["restock_days"] == []  # W=14, R=7: the first restock is day 21
     assert summary["region"] is None
+    assert summary["region_cached_orders"] is None
+    assert summary["cluster"] is None
     assert summary["counters_ever_zero"] >= 1
 
     stock = (run_dir / "stock.csv").read_text(encoding="utf-8").splitlines()
@@ -201,6 +204,10 @@ def test_run_with_a_region_scopes_the_orders_and_the_stock(
     assert rc == 0
     summary = json.loads((tmp_path / "runs" / "o-r1" / "summary.json").read_text(encoding="utf-8"))
     assert summary["region"] == "r1"
+    # the region's share of the whole cache: the hand-checked split puts
+    # v001-v003 (15 of the fixture's 20 orders) in r1 and v004 in r2
+    assert summary["region_cached_orders"] == 15
+    assert summary["cluster"]["config"]
     assert summary["orders"] == 15  # 20 minus v004's five
     assert summary["refused"] == 2  # both refusals are v002 orders
     assert summary["stock_rows"] == 15  # v004's caramel and cupcakes are out of scope
@@ -273,6 +280,7 @@ def _write_run(
     sequential: bool = True,
     restock: tuple[int, ...] = (),
     cache: str = "sha-abc",
+    region_cached_orders: int | None = 5,
 ) -> None:
     run_dir = tmp_path / "runs" / run_id
     run_dir.mkdir(parents=True)
@@ -285,6 +293,7 @@ def _write_run(
         "cache": {"orders_sha256": cache},
         "restock": {"days": list(restock)},
         "cluster": {"config": "cluster.toml"},
+        "region_cached_orders": region_cached_orders,
     }
     (run_dir / "meta.json").write_text(json.dumps(meta) + "\n", encoding="utf-8")
     (run_dir / "orders.jsonl").write_text(
@@ -302,6 +311,7 @@ def _write_report(
     refused: int | None = None,
     cache: str = "sha-abc",
     restock: tuple[int, ...] = (),
+    region_cached_orders: int | None = 5,
 ) -> Path:
     report_dir = tmp_path / "runs" / report_id
     report_dir.mkdir(parents=True)
@@ -320,6 +330,8 @@ def _write_report(
     summary = {
         "oracle_id": report_id,
         "region": "r1",
+        "region_cached_orders": region_cached_orders,
+        "cluster": {"config": "cluster.toml"},
         "from_day": 14,
         "to_day": 16,
         "restock_days": list(restock),
@@ -478,3 +490,82 @@ def test_compare_defaults_to_the_newest_oracle_report(
 def test_compare_names_a_missing_run(tmp_path, runs_cwd, monkeypatch, capsys) -> None:
     assert oracle_cli.run(_parse(["oracle", "compare", "--run-id", "nope"])) == 1
     assert "no run 'nope'" in capsys.readouterr().err
+
+
+def test_compare_fails_a_report_scoped_with_another_cluster_file(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """A report from `oracle run` with a different cluster file than the
+    run's has a different region share: one clear fact, not a mismatch
+    per order."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")], region_cached_orders=5)
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")], region_cached_orders=9)
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "different cluster files" in err
+    assert "--config cluster.toml" in err
+
+
+def test_compare_asks_to_rerun_a_report_without_the_region_share(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    _write_report(
+        tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")], region_cached_orders=None
+    )
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    assert "does not record its region's cached-order count" in capsys.readouterr().err
+
+
+def test_a_count_mismatch_says_the_region_must_be_fresh(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")])
+    # an earlier run left 7 more orders on the region
+    _stub_region(monkeypatch, orders=8, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    assert "freshly bootstrapped region" in capsys.readouterr().err
+
+
+def test_compare_order_lines_streams_both_sides_in_lockstep() -> None:
+    """Neither side is read ahead of the other by more than one line:
+    the comparison never holds a whole file."""
+    taken = {"log": 0, "report": 0}
+    widest_gap = 0
+
+    def lines(side: str, make) -> Iterator[dict]:
+        nonlocal widest_gap
+        for seq in range(1000):
+            taken[side] += 1
+            widest_gap = max(widest_gap, abs(taken["log"] - taken["report"]))
+            if side == "log" and seq % 10 == 0:
+                # a restock line in the log is skipped, not compared
+                yield {"kind": "restock", "seq": seq}
+            yield make(seq, f"o{seq}", "accepted")
+
+    comparison = compare_order_lines(lines("log", _order_line), lines("report", _report_line))
+    assert comparison.mismatch_count == 0
+    assert (comparison.log_orders, comparison.report_orders) == (1000, 1000)
+    assert comparison.both_accepted == 1000
+    assert widest_gap <= 1
+
+
+def test_compare_order_lines_counts_a_shorter_side() -> None:
+    log = [_order_line(0, "o1", "accepted"), _order_line(1, "o2", "accepted")]
+    report = [_report_line(0, "o1", "accepted")]
+    comparison = compare_order_lines(iter(log), iter(report))
+    assert (comparison.log_orders, comparison.report_orders) == (2, 1)
+    assert comparison.mismatch_count == 1
+    assert "has no oracle line" in comparison.mismatch_lines[0]
