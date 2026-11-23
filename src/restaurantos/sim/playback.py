@@ -565,6 +565,9 @@ class Playback:
             "restock": {
                 "days": run_restock_days,
                 "vendors": len(self._restock_vendors),
+                # R itself, so `rosctl oracle compare` can print the
+                # exact `oracle run` for this run
+                "every": self._restock_every,
             },
             # where the kitchen-side calls (events, restocks) went:
             # the region edges, one override URL, or the target itself

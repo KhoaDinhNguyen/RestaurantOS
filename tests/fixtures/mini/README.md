@@ -61,10 +61,11 @@ the briefs ask for:
 - Two `product_dish` rows have `multiplier` above 1 (one real, one edited).
 - One dish has an empty `dish_name` (the real data has 3,053 of those).
 - One vendor has an empty `chain_id` (the real data has 1,499).
-- One stock counter is deliberately low (`on_hand` 2, `par_level` 10 for
-  caramel at v004): an order of a dish that uses caramel 3 piece at v004
-  takes more than the counter holds, so tests can drive an out-of-stock
-  refusal without touching anything else.
+- One stock counter is deliberately low (`on_hand` 6, `par_level` 10 for
+  caramel at v004): one unit of p001 takes caramel 3 piece x multiplier 2
+  = 6, exactly what the counter holds, so the first p001 order empties
+  it and a second is refused on stock. (The 6 is the floor rule: a
+  counter may never start below one unit of any product.)
 
 ## Expected answers, in short
 

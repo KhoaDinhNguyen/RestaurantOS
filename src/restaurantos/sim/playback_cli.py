@@ -278,6 +278,7 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
     run_meta: dict[str, Any] = {
         "cache": {
             "orders_sha256": meta.orders_sha256,
+            "order_items_sha256": meta.order_items_sha256,
             "warm_up_days": meta.warm_up_days,
             "cached_orders": meta.orders,
         },
