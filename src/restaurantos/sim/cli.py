@@ -1,8 +1,8 @@
 """The rosctl command line (WP6a). pyproject.toml points the `rosctl`
 script at app().
 
-`bootstrap`, `playback` and `baseline sync` exist; the other
-subcommands are the rest of WP6a and are registered so that
+`bootstrap`, `playback`, `baseline sync`, `up` and `down` exist; the
+other subcommands are the rest of WP6a/WP6b and are registered so that
 `rosctl --help` shows the full shape of the tool while it is being
 built.
 """
@@ -16,8 +16,6 @@ from collections.abc import Sequence
 from pathlib import Path
 
 NOT_BUILT = {
-    "up": "start the services (WP6a, later)",
-    "down": "stop the services (WP6a, later)",
     "control": "the control API for the fault tests (WP6b)",
 }
 
@@ -281,6 +279,52 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("infra/cluster.toml"),
         help="cluster description to copy from (default: infra/cluster.toml)",
     )
+    # --- services (up/down) ---------------------------------------------
+    # The service table and the start/stop machinery live in
+    # restaurantos.sim.services; this block only wires them up.
+    up = sub.add_parser(
+        "up",
+        help="start the services on the host (ROS_NETWORK=host), detached, "
+        "logs in runs/services/<name>.log",
+    )
+    up.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="start only this service (e.g. run the gateway under a debugger "
+        "while the rest are up)",
+    )
+    up.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="cluster description to build the service list from - use the "
+        "file bootstrap ran with (default: ROS_CLUSTER_FILE setting, "
+        "infra/cluster.toml)",
+    )
+    up.add_argument(
+        "--no-precheck",
+        action="store_true",
+        help="start without checking the cluster is reachable first (the "
+        "services will then fail on their own connection errors)",
+    )
+    down = sub.add_parser(
+        "down",
+        help="stop the services started by up (SIGTERM, then SIGKILL)",
+    )
+    down.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        help="stop only this service",
+    )
+    down.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="cluster description to name the services from (default: "
+        "ROS_CLUSTER_FILE setting, infra/cluster.toml)",
+    )
 
     # D10 is implemented by WP5; rosctl only registers the command.
     hq = sub.add_parser("hq", help="HQ database operator commands (WP5)")
@@ -369,5 +413,39 @@ def app(argv: Sequence[str] | None = None) -> int:
             print(warning, file=sys.stderr)
         print(format_report(counts))
         return 0
+    if args.command in ("up", "down"):
+        from restaurantos.common.cluster import load_cluster
+        from restaurantos.common.config import get_settings
+        from restaurantos.sim.services import (
+            RUNS_DIR,
+            PrecheckError,
+            down_exit_code,
+            down_services,
+            up_exit_code,
+            up_services,
+        )
+
+        config = args.config or get_settings().cluster_file
+        names = [args.name] if args.name else None
+        try:
+            cluster = load_cluster(config)
+            if args.command == "up":
+                steps = up_services(
+                    cluster,
+                    runs_dir=RUNS_DIR,
+                    names=names,
+                    cluster_file=config,
+                    precheck=not args.no_precheck,
+                )
+            else:
+                steps = down_services(cluster, runs_dir=RUNS_DIR, names=names)
+        except (PrecheckError, ValueError, OSError) as error:
+            # a silent cluster, an unknown --name, a bad cluster file:
+            # the user should see the message, not a traceback
+            print(f"rosctl {args.command}: {error}", file=sys.stderr)
+            return 1
+        for step in steps:
+            print(f"{step.name}: {step.outcome} - {step.detail}")
+        return up_exit_code(steps) if args.command == "up" else down_exit_code(steps)
     print(f"rosctl {args.command}: not built yet ({NOT_BUILT[args.command]})", file=sys.stderr)
     return 2
