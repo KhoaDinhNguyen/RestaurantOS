@@ -660,6 +660,14 @@ def compare_command(args: argparse.Namespace) -> int:
             f"{comparison.both_refused} refused, its summary says {report_totals[0]} and "
             f"{report_totals[1]}; the report is damaged, rerun `rosctl oracle run`"
         )
+    # The same for stock.csv: a file missing counters must not pass just
+    # because the region lost the same ones. Checked always - the region
+    # comparison above cannot tell a short file from a short region.
+    if len(stock_rows) != summary.get("stock_rows"):
+        report_wrong.append(
+            f"report {report_id!r}: stock.csv holds {len(stock_rows)} counters, its summary "
+            f"says {summary.get('stock_rows')}; the report is damaged, rerun `rosctl oracle run`"
+        )
     failed = bool(
         comparison.mismatch_count
         or stock_mismatch_count

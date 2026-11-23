@@ -706,6 +706,29 @@ def test_compare_fails_a_report_whose_lines_disagree_with_its_summary(
     assert "count mismatch" not in captured.err
 
 
+def test_compare_fails_a_stock_csv_shorter_than_its_summary(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """stock.csv and the region agree row for row, but the file holds fewer
+    counters than the summary says: a damaged report, not a MATCH."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    report_dir = _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")])
+    summary_file = report_dir / "summary.json"
+    summary = json.loads(summary_file.read_text(encoding="utf-8"))
+    summary["stock_rows"] = len(STOCK_ROWS) + 1
+    summary_file.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert (
+        f"stock.csv holds {len(STOCK_ROWS)} counters, its summary says {len(STOCK_ROWS) + 1}" in err
+    )
+    assert "stock mismatch" not in err
+
+
 # --- review round 3 ---------------------------------------------------------
 
 
