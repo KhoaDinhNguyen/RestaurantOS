@@ -14,3 +14,4 @@ class CoordinatorSettings(BaseSettings):
     heartbeat_timeout_s: float = Field(default=0.8, gt=0, allow_inf_nan=False)
     gateway_timeout_s: float = Field(default=4.0, gt=0, allow_inf_nan=False)
     gateway_url: AnyHttpUrl | None = None
+    failover_timeout_s: float = Field(default=15.0, gt=0, allow_inf_nan=False)

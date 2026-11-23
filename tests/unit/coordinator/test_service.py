@@ -104,6 +104,7 @@ async def test_slow_figures_do_not_delay_node_heartbeats(runtime, monkeypatch):
 
     monkeypatch.setattr(runtime, "_heartbeat", heartbeat)
     monkeypatch.setattr(runtime, "_sample_figures", figures)
+    monkeypatch.setattr(runtime, "_reconcile_regions", AsyncMock())
     await runtime.start()
     await asyncio.gather(*runtime.tasks)
     assert min(heartbeats.values()) >= 3
