@@ -246,9 +246,12 @@ def run_command(args: argparse.Namespace) -> int:
         "stock_rows": len(oracle.on_hand),
         "counters_ever_zero": len(oracle.counters_ever_zero),
     }
-    (run_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    # summary.json marks the report complete (compare and the newest-report
+    # pick both look for it), so it appears whole or not at all: written
+    # to a temporary file in the same directory, then renamed over.
+    partial = run_dir / "summary.json.tmp"
+    partial.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    partial.replace(run_dir / "summary.json")
     region_note = f", region {region}" if region is not None else ""
     print(
         f"oracle {oracle_id}: {oracle.orders} orders, days {window.from_day} to "
@@ -379,6 +382,10 @@ def _read_stock_csv(path: Path) -> dict[StockKey, tuple[int, int]]:
             if len(row) != 5:
                 raise ValueError(f"stock.csv line {number}: expected 5 values, got {len(row)}")
             key = (row[0], row[1], row[2])
+            if key in rows:
+                # write_report writes each counter once; a second row is
+                # a damaged file, and keeping either row would hide it
+                raise ValueError(f"stock.csv line {number}: counter {key} appears twice")
             rows[key] = (int(row[3]), int(row[4]))
     return rows
 
@@ -403,11 +410,38 @@ def _newest_report_id(runs_dir: Path) -> str | None:
     return newest.name
 
 
+def _rerun_hint(run_id: str, run_meta: dict[str, Any], region: str) -> str:
+    """The `oracle run` that writes a report for exactly this run's scope:
+    its region, cluster file, window and restock interval."""
+    parts = ["rosctl oracle run", f"--region {region}"]
+    cluster_file = (run_meta.get("cluster") or {}).get("config")
+    if cluster_file:
+        parts.append(f"--config {cluster_file}")
+    parts.append(f"--from-day {run_meta.get('from_day')} --to-day {run_meta.get('to_day')}")
+    every = (run_meta.get("restock") or {}).get("every")
+    if every is not None:
+        parts.append(f"--restock-days {every}")
+    parts.append("--run-id <new id>")
+    note = (
+        ""
+        if every is not None
+        else " (add --restock-days with the interval the run used: its meta.json "
+        "predates recording it)"
+    )
+    return (
+        f"to write a report for this run: `{' '.join(parts)}`{note}, then "
+        f"`rosctl oracle compare --run-id {run_id} --report-id <new id>`"
+    )
+
+
 def compare_command(args: argparse.Namespace) -> int:
     runs_dir = Path("runs")
     run_dir = runs_dir / args.run_id
     if not (run_dir / "meta.json").is_file():
         print(f"rosctl oracle compare: no run {args.run_id!r} under runs/", file=sys.stderr)
+        return 1
+    if not (run_dir / "orders.jsonl").is_file():
+        print(f"rosctl oracle compare: run {args.run_id!r} has no orders.jsonl", file=sys.stderr)
         return 1
     run_meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
     region = run_meta.get("region")
@@ -434,13 +468,19 @@ def compare_command(args: argparse.Namespace) -> int:
         )
         return 1
     report_dir = runs_dir / report_id
-    try:
-        summary = json.loads((report_dir / "summary.json").read_text(encoding="utf-8"))
-    except FileNotFoundError as error:
+    missing = [
+        name
+        for name in ("summary.json", "report.jsonl", "stock.csv")
+        if not (report_dir / name).is_file()
+    ]
+    if missing:
         print(
-            f"rosctl oracle compare: report {report_id!r} is incomplete: {error}", file=sys.stderr
+            f"rosctl oracle compare: report {report_id!r} is incomplete: no "
+            f"{', '.join(missing)} under runs/{report_id}/",
+            file=sys.stderr,
         )
         return 1
+    summary = json.loads((report_dir / "summary.json").read_text(encoding="utf-8"))
 
     # The report must describe the same window, region, cache and
     # restock days as the run, or the comparison would be against the
@@ -463,12 +503,16 @@ def compare_command(args: argparse.Namespace) -> int:
     # the second digest gets a warning for it, not a failure.
     run_cache = run_meta.get("cache") or {}
     report_cache = summary.get("cache") or {}
-    if run_cache.get("orders_sha256") != report_cache.get("orders_sha256"):
+    if run_cache.get("orders_sha256") is None or report_cache.get("orders_sha256") is None:
+        # two missing digests are not two equal ones
+        side = "run" if run_cache.get("orders_sha256") is None else "report"
+        facts_wrong.append(f"the {side} does not record orders.csv's digest")
+    elif run_cache.get("orders_sha256") != report_cache.get("orders_sha256"):
         facts_wrong.append("the run and the report replayed different order caches")
     elif report_cache.get("order_items_sha256") is None:
         facts_wrong.append(
             f"report {report_id!r} does not record order_items.csv's digest "
-            f"(written before compare checked it); rerun `rosctl oracle run`"
+            "(written before compare checked it)"
         )
     elif run_cache.get("order_items_sha256") is None:
         print(
@@ -492,7 +536,7 @@ def compare_command(args: argparse.Namespace) -> int:
     if report_share is None:
         facts_wrong.append(
             f"report {report_id!r} does not record its region's cached-order count "
-            f"(written before compare checked it); rerun `rosctl oracle run --region {region}`"
+            "(written before compare checked it)"
         )
     elif run_share != report_share:
         run_cluster = (run_meta.get("cluster") or {}).get("config")
@@ -500,12 +544,15 @@ def compare_command(args: argparse.Namespace) -> int:
         facts_wrong.append(
             f"the run's region {region} holds {run_share} cached orders, the report's "
             f"holds {report_share}: the two were scoped with different cluster files "
-            f"(run: {run_cluster}, report: {report_cluster}); rerun `rosctl oracle run "
-            f"--region {region} --config {run_cluster}`"
+            f"(run: {run_cluster}, report: {report_cluster})"
         )
     if facts_wrong:
         for line in facts_wrong:
             print(f"rosctl oracle compare: {line}", file=sys.stderr)
+        print(
+            f"rosctl oracle compare: {_rerun_hint(args.run_id, run_meta, region)}",
+            file=sys.stderr,
+        )
         return 1
 
     comparison = compare_order_lines(
@@ -526,7 +573,15 @@ def compare_command(args: argparse.Namespace) -> int:
     except (OSError, ValueError) as error:
         print(f"rosctl oracle compare: {error}", file=sys.stderr)
         return 1
-    state = read_region_state(cluster, region)
+    try:
+        state = read_region_state(cluster, region)
+    except psycopg.OperationalError as error:
+        print(
+            f"rosctl oracle compare: cannot reach region {region}'s primary "
+            f"({primary_of(region)}): {error}",
+            file=sys.stderr,
+        )
+        return 1
 
     # Final stock, counter for counter.
     stock_mismatch_lines: list[str] = []

@@ -24,12 +24,14 @@ from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
 
+import psycopg
 import pytest
 from conftest import drive, make_playback  # noqa: A004
 from test_oracle import MINI_VENDORS, mini_orders, mini_rules, mini_stock_rows
 
 from restaurantos.sim import oracle_cli
 from restaurantos.sim.cli import app, build_parser
+from restaurantos.sim.config import get_sim_settings
 from restaurantos.sim.datacheck import REQUIRED_FILES
 from restaurantos.sim.mini import mini_dir
 from restaurantos.sim.oracle import CountingOracle
@@ -54,8 +56,31 @@ def mini_data_dir(tmp_path: Path) -> Path:
     return data_dir
 
 
+# The stock settings the mini replay's numbers rest on, at their defaults:
+# a ROS_SIM_STOCK_* variable or a .env on a dev machine must not move the
+# warm-up floor under these tests (the pattern in test_cli_playback.py).
+PINNED_STOCK_SETTINGS = {
+    "ROS_SIM_STOCK_WARM_UP_DAYS": "14",
+    "ROS_SIM_STOCK_COVER_DAYS": "7",
+    "ROS_SIM_STOCK_FLOOR": "5",
+    "ROS_SIM_STOCK_RESTOCK_DAYS": "7",
+}
+
+
+@pytest.fixture(autouse=True)
+def fresh_sim_settings():
+    """get_sim_settings() is cached per process: start every test here
+    from a clean cache and leave one behind."""
+    get_sim_settings.cache_clear()
+    yield
+    get_sim_settings.cache_clear()
+
+
 def _use_data_dir(monkeypatch, data_dir: Path, cluster_file: Path) -> None:
     monkeypatch.chdir(data_dir.parent)
+    for name, value in PINNED_STOCK_SETTINGS.items():
+        monkeypatch.setenv(name, value)
+    get_sim_settings.cache_clear()
     monkeypatch.setattr(
         oracle_cli,
         "get_settings",
@@ -160,7 +185,7 @@ def test_run_replays_the_mini_fixture_end_to_end(
     stock = (run_dir / "stock.csv").read_text(encoding="utf-8").splitlines()
     assert stock[0] == "vendor_id,item_kind,item_id,on_hand,par_level"
     assert len(stock) == 18  # the header and 17 counters
-    assert "rosctl" not in capsys.readouterr().out or True
+    assert "report: runs/o1/" in capsys.readouterr().out
 
 
 def test_run_refuses_a_report_id_that_already_exists(
@@ -304,7 +329,7 @@ def _write_run(
         "from_day": 14,
         "to_day": 16,
         "cache": _cache(cache, items_cache),
-        "restock": {"days": list(restock)},
+        "restock": {"days": list(restock), "every": 7},
         "cluster": {"config": "cluster.toml"},
         "region_cached_orders": region_cached_orders,
     }
@@ -408,7 +433,7 @@ def test_compare_matches_when_run_report_and_region_agree(
         == 0
     )
     out = capsys.readouterr().out
-    assert "MATCH" in out
+    assert "oracle oracle-1 vs run run1: MATCH" in out.splitlines()
     assert "2 in the run log, 2 in the" in out
 
 
@@ -505,7 +530,9 @@ def test_compare_defaults_to_the_newest_oracle_report(
     _age(newer, 2_000)
     _stub_region(monkeypatch, orders=1, refused=0)
     assert oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1"])) == 0
-    assert "oracle-20260202-000000 vs run run1: MATCH" in capsys.readouterr().out
+    assert (
+        "oracle oracle-20260202-000000 vs run run1: MATCH" in capsys.readouterr().out.splitlines()
+    )
 
 
 def test_the_newest_report_is_the_newest_written_not_the_last_name(
@@ -522,7 +549,9 @@ def test_the_newest_report_is_the_newest_written_not_the_last_name(
     _age(stamped, 2_000)
     _stub_region(monkeypatch, orders=1, refused=0)
     assert oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1"])) == 0
-    assert "oracle-20260202-000000 vs run run1: MATCH" in capsys.readouterr().out
+    assert (
+        "oracle oracle-20260202-000000 vs run run1: MATCH" in capsys.readouterr().out.splitlines()
+    )
 
 
 def test_compare_names_a_missing_run(tmp_path, runs_cwd, monkeypatch, capsys) -> None:
@@ -641,7 +670,7 @@ def test_compare_warns_on_a_run_logged_without_the_items_digest(
     captured = capsys.readouterr()
     assert "warning" in captured.err
     assert "only orders.csv is checked" in captured.err
-    assert "MATCH" in captured.out
+    assert "oracle oracle-1 vs run run1: MATCH" in captured.out.splitlines()
 
 
 def test_compare_asks_to_rerun_a_report_without_the_items_digest(
@@ -674,3 +703,136 @@ def test_compare_fails_a_report_whose_lines_disagree_with_its_summary(
     assert "report mismatch" in captured.err
     assert "the report is damaged" in captured.err
     assert "count mismatch" not in captured.err
+
+
+# --- review round 3 ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("name", ["report.jsonl", "stock.csv", "summary.json"])
+def test_compare_names_a_missing_report_file(tmp_path, runs_cwd, monkeypatch, capsys, name) -> None:
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    report_dir = _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")])
+    (report_dir / name).unlink()
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "report 'oracle-1' is incomplete" in err
+    assert name in err
+
+
+def test_compare_names_a_run_without_its_log(tmp_path, runs_cwd, monkeypatch, capsys) -> None:
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    (tmp_path / "runs" / "run1" / "orders.jsonl").unlink()
+    assert oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1"])) == 1
+    assert "run 'run1' has no orders.jsonl" in capsys.readouterr().err
+
+
+def test_a_stock_csv_with_a_counter_twice_is_rejected(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """The second row would overwrite the first and could hide a mismatch;
+    the CLI reports the line instead of a traceback."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    _write_report(
+        tmp_path,
+        "oracle-1",
+        [_report_line(0, "o1", "accepted")],
+        stock_rows=[*STOCK_ROWS, ("v001", "ingredient", "beef", 50, 50)],
+    )
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert app(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]) == 1
+    assert "stock.csv line 4: counter ('v001', 'ingredient', 'beef') appears twice" in (
+        capsys.readouterr().err
+    )
+
+
+@pytest.mark.parametrize("side", ["run", "report"])
+def test_compare_fails_when_a_side_has_no_orders_digest(
+    tmp_path, runs_cwd, monkeypatch, capsys, side
+) -> None:
+    """Two missing digests are not two equal ones."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    report_dir = _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")])
+    target = (
+        tmp_path / "runs" / "run1" / "meta.json" if side == "run" else (report_dir / "summary.json")
+    )
+    data = json.loads(target.read_text(encoding="utf-8"))
+    del data["cache"]["orders_sha256"]
+    target.write_text(json.dumps(data) + "\n", encoding="utf-8")
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    assert f"the {side} does not record orders.csv's digest" in capsys.readouterr().err
+
+
+def test_a_wrong_report_prints_the_exact_oracle_run_for_this_run(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    """The hint keeps the run's window, cluster file and restock interval,
+    and names --report-id for the new report."""
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")], region_cached_orders=9)
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert (
+        "`rosctl oracle run --region r1 --config cluster.toml --from-day 14 --to-day 16 "
+        "--restock-days 7 --run-id <new id>`"
+    ) in err
+    assert "`rosctl oracle compare --run-id run1 --report-id <new id>`" in err
+
+
+def test_the_hint_asks_for_the_interval_when_the_run_did_not_record_it(
+    tmp_path, runs_cwd, monkeypatch, capsys
+) -> None:
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    meta_file = tmp_path / "runs" / "run1" / "meta.json"
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    del meta["restock"]["every"]
+    meta_file.write_text(json.dumps(meta) + "\n", encoding="utf-8")
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")], region_cached_orders=9)
+    _stub_region(monkeypatch, orders=1, refused=0)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "--restock-days" not in err.split("`rosctl oracle run")[1].split("`")[0]
+    assert "add --restock-days with the interval the run used" in err
+
+
+def test_compare_reports_an_unreachable_primary(tmp_path, runs_cwd, monkeypatch, capsys) -> None:
+    _write_run(tmp_path, "run1", [_order_line(0, "o1", "accepted")])
+    _write_report(tmp_path, "oracle-1", [_report_line(0, "o1", "accepted")])
+    monkeypatch.setattr(oracle_cli, "load_cluster", lambda path: "the cluster")
+
+    def unreachable(cluster, region):
+        raise psycopg.OperationalError("connection refused")
+
+    monkeypatch.setattr(oracle_cli, "read_region_state", unreachable)
+    assert (
+        oracle_cli.run(_parse(["oracle", "compare", "--run-id", "run1", "--report-id", "oracle-1"]))
+        == 1
+    )
+    err = capsys.readouterr().err
+    assert "cannot reach region r1's primary (r1-primary)" in err
+    assert "connection refused" in err
+
+
+def test_run_writes_the_summary_whole_and_leaves_no_temporary_file(
+    tmp_path: Path, mini_data_dir: Path, monkeypatch
+) -> None:
+    _use_data_dir(monkeypatch, mini_data_dir, mini_data_dir / "cluster.toml")
+    argv = ["oracle", "run", "--from-day", "14", "--to-day", "16", "--run-id", "o-atomic"]
+    assert oracle_cli.run(_parse(argv)) == 0
+    run_dir = tmp_path / "runs" / "o-atomic"
+    assert json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))["orders"] > 0
+    assert not (run_dir / "summary.json.tmp").exists()
