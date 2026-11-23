@@ -24,6 +24,10 @@ TOXIPROXY_HOST = "toxiproxy"
 HOST_ADDRESS = "127.0.0.1"
 POSTGRES_PORT = 5432
 HOST_BASE_PORT = 5500
+# The single source of truth for the application service ports. There is
+# no environment-variable or cluster.toml override: to move a port,
+# change it here and every consumer (the services' __main__, rosctl up,
+# the Compose generator, the tests) follows through service_port().
 SERVICE_PORTS = {"gateway": 8000, "coordinator": 8001, "control": 8002}
 EDGE_BASE_PORT = 8010
 HQ_PRIMARY = "hq-primary"
