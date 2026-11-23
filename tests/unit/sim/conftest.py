@@ -157,6 +157,8 @@ def make_playback(
     kitchen_urls: Mapping[str, str] | None = None,
     vendor_regions: Mapping[str, str] | None = None,
     sequential: bool = False,
+    duplicate_offset_s: float = 0.0,
+    shuffle_window: int = 8,
 ) -> Playback:
     """An engine over a fixed order list, posting to an in-process stub."""
     if transport is None:
@@ -183,6 +185,8 @@ def make_playback(
         kitchen_urls=kitchen_urls,
         vendor_regions=vendor_regions,
         sequential=sequential,
+        duplicate_offset_s=duplicate_offset_s,
+        shuffle_window=shuffle_window,
     )
 
 

@@ -11,7 +11,15 @@ Besides the order stream, one dispatcher merges two more timelines
 (the extras): each accepted order's four status events at +1, +3, +15
 and +25 simulated minutes plus hash-based jitter, and a restock for
 every vendor at 00:00:00 of each restock day, before that day's first
-order. An event's simulated deadline is fixed when its order is
+order. Two more deliveries join the same total order: duplicate resends
+(an order's second POST, scheduled at the order's own instant plus a
+hash-drawn offset) and, when shuffle is on, the orders themselves
+dispatched out of a bounded reorder buffer drained in shuffle-key order.
+Nothing draws from a shared generator: which orders are resent, the
+resend offset and the shuffle key are each a hash of (seed, order_id,
+purpose), so the whole delivery plan is a pure function of the inputs.
+
+An event's simulated deadline is fixed when its order is
 dispatched - it depends on nothing but the order's simulated time, the
 seed and the settings - but the event only goes out once the order's
 outcome is known, because it needs the order id the response carries
@@ -60,6 +68,7 @@ import contextlib
 import heapq
 import json
 import logging
+import math
 import re
 import time
 import traceback
@@ -316,6 +325,8 @@ class Playback:
         vendor_regions: Mapping[str, str] | None = None,
         run_meta: Mapping[str, Any] | None = None,
         sequential: bool = False,
+        duplicate_offset_s: float = 0.0,
+        shuffle_window: int = 8,
     ) -> None:
         self._orders_fn = orders_fn
         self._api_base = target_url.rstrip("/")
@@ -389,6 +400,25 @@ class Playback:
         # belt-and-braces guard.
         self._sequential = sequential
 
+        # Duplicates and shuffle (architecture 7.2). Engine-level facts:
+        # the resend offset bound (a per-run rate is a start parameter,
+        # like the seed) and the shuffle window. Both are validated here
+        # because tests and API callers build the engine directly, not
+        # only through the settings.
+        if not math.isfinite(duplicate_offset_s) or duplicate_offset_s < 0.0:
+            raise ValueError(
+                f"duplicate_offset_s {duplicate_offset_s} must be a number >= 0: "
+                "a resend is scheduled at its order's own instant plus a "
+                "hash-drawn offset in [0, duplicate_offset_s) simulated seconds"
+            )
+        if shuffle_window < 1:
+            raise ValueError(
+                f"shuffle_window {shuffle_window} must be at least 1: the window "
+                "bounds how far shuffle may reorder delivery (1: no reorder)"
+            )
+        self._duplicate_offset_s = duplicate_offset_s
+        self._shuffle_window = shuffle_window
+
         self._state = IDLE
         self._wake = asyncio.Event()
         self._done = asyncio.Event()
@@ -430,6 +460,10 @@ class Playback:
         self._restocks_sent = 0
         self._restocks_acked = 0
         self._restocks_failed = 0
+        # per-run duplicates/shuffle facts (start parameters, reset per run)
+        self._duplicate_rate = 0.0
+        self._shuffle_on = False
+        self._resent = 0
 
     def _next_seq(self) -> int:
         """The send sequence number of the next dispatched item."""
@@ -487,11 +521,27 @@ class Playback:
         to_day: int | None,
         speed: float,
         run_id: str | None = None,
+        duplicate_rate: float = 0.0,
+        shuffle: bool = False,
         meta_extra: dict[str, Any] | None = None,
     ) -> str:
         """Begin a run from `from_day` to `to_day` (None: to the end)."""
         if to_day is not None and to_day < from_day:
             raise ValueError(f"to_day {to_day} is before from_day {from_day}")
+        # The duplicates/shuffle parameters are part of the run (the start
+        # body, architecture 6.3), validated before anything is reserved:
+        # a rate outside [0, 1] or a NaN means nothing, and shuffle in
+        # sequential mode would quietly break the mode's one guarantee -
+        # in-order, one-at-a-time delivery the oracle can match. A NaN
+        # fails every comparison, so isfinite comes first.
+        if not math.isfinite(duplicate_rate) or not 0.0 <= duplicate_rate <= 1.0:
+            raise ValueError(f"duplicate_rate {duplicate_rate} must be a number in [0, 1]")
+        if shuffle and self._sequential:
+            raise ValueError(
+                "shuffle cannot run in sequential mode: sequential delivers one "
+                "order at a time in stream order so the oracle can match it - "
+                "run shuffle without --sequential"
+            )
         # what the caller asked for, recorded next to the effective days
         # so the run log can be read against the request (a window check
         # may shorten to_day to the last day the data holds)
@@ -546,6 +596,13 @@ class Playback:
         meta = {
             "run_id": candidate,
             "seed": seed,
+            # what this run's extras do, next to the seed they derive from
+            # (a rate of 0 and shuffle off are recorded too, so a clean run
+            # says so and `rosctl oracle compare` can refuse the rest)
+            "duplicate_rate": duplicate_rate,
+            "duplicate_offset_s": self._duplicate_offset_s,
+            "shuffle": shuffle,
+            "shuffle_window": self._shuffle_window,
             "from_day": from_day,
             "to_day": to_day,
             "to_day_requested": requested_to_day,
@@ -622,6 +679,9 @@ class Playback:
         self._restocks_sent = 0
         self._restocks_acked = 0
         self._restocks_failed = 0
+        self._duplicate_rate = duplicate_rate
+        self._shuffle_on = shuffle
+        self._resent = 0
         self._heap = [
             (
                 day * SECONDS_PER_DAY,
@@ -751,6 +811,9 @@ class Playback:
             "orders_parked": self._parked,
             "orders_refused": self._refused,
             "orders_failed": self._failed,
+            # resends are their own count: the buckets above count the
+            # original sends only, and a resend's answer lives on its line
+            "orders_resent": self._resent,
             "events_sent": self._events_sent,
             "events_acked": self._events_acked,
             "events_conflicted": self._events_conflicted,
@@ -796,20 +859,44 @@ class Playback:
         # millisecond of it is a simulated second.
         last_dispatched_at: float | None = None
         try:
-            # One dispatcher, one total order: the next stream order
-            # against the earliest scheduled event or restock, both
-            # compared by (simulated instant, kind, stream position).
-            # Only this loop mutates the heap or pulls the stream, so a
-            # peek, a wait and a pop cannot race anything.
+            # One dispatcher, one total order: the next delivery against
+            # the earliest scheduled event or restock, both compared by
+            # (simulated instant, kind, stream position). Only this loop
+            # mutates the heap or pulls the stream, so a peek, a wait and
+            # a pop cannot race anything.
+            #
+            # The stream side goes through a reorder buffer: with shuffle
+            # off (window 1) it holds one item, which IS the old `pending`
+            # - the window only widens when shuffle is on. The buffer is
+            # filled with the next `window` stream items and drained in
+            # shuffle-key order - the smallest
+            # (stable_float(seed, order_id, "shuffle"), stream position) -
+            # BEFORE the stream is pulled again, so the batch is exactly
+            # the reorder's reach: an item moves at most window-1 places,
+            # the run still dispatches every item exactly once, and a
+            # window of 1 is the stream order itself.
             stream_items = enumerate(stream)
-            pending = next(stream_items, None)
-            while pending is not None or self._heap:
+            window = self._shuffle_window if self._shuffle_on else 1
+            buffer: list[tuple[float, int, OrderRequest]] = []
+            while len(buffer) < window:
+                item = next(stream_items, None)
+                if item is None:
+                    break
+                index, request = item
+                buffer.append(
+                    (stable_float(self._seed, request.external_order_id, "shuffle"), index, request)
+                )
+            while buffer or self._heap:
                 if self._state == STOPPING:
                     stopped = True
                     break
                 heap_next = self._heap[0][:4] if self._heap else None
-                if pending is not None and (heap_next is None or _stream_key(pending) <= heap_next):
-                    index, request = pending
+                entry = min(buffer, key=lambda e: (e[0], e[1])) if buffer else None
+                if entry is not None and (
+                    heap_next is None or _delivery_key(entry[2], entry[1]) <= heap_next
+                ):
+                    _shuffle_rank, index, request = entry
+                    buffer.remove(entry)
                     order_target = to_sim_seconds(request.order_day, request.order_time)
                     await self._wait_until(order_target)
                     if self._state == STOPPING:
@@ -834,7 +921,32 @@ class Playback:
                         # orders events and restocks by their simulated
                         # timestamps; only order sends serialize.
                         await asyncio.wait(set(self._send_tasks))
-                    pending = next(stream_items, None)
+                    # Refill AFTER the dispatch, exactly where the old
+                    # `pending = next(...)` sat: the next stream pull must
+                    # not happen before this order is out (a stream that
+                    # raises on its next pull still delivers the order it
+                    # yielded, and the drain then holds the run open for
+                    # it). BATCH, not sliding: the buffer drains fully
+                    # before the stream is pulled again - only then does
+                    # the next refill fill a whole window - so the window
+                    # bounds each item's displacement (< window) and the
+                    # reorder stays local. With the window at 1 this is
+                    # the old one-item pending, pull-for-pull.
+                    if not buffer:
+                        while len(buffer) < window:
+                            item = next(stream_items, None)
+                            if item is None:
+                                break
+                            refill_index, refill_request = item
+                            buffer.append(
+                                (
+                                    stable_float(
+                                        self._seed, refill_request.external_order_id, "shuffle"
+                                    ),
+                                    refill_index,
+                                    refill_request,
+                                )
+                            )
                 else:
                     deadline, _rank, tie_a, tie_b, kind, payload = heapq.heappop(self._heap)
                     await self._wait_until(deadline)
@@ -871,6 +983,27 @@ class Playback:
                             break
                         last_dispatched_at = deadline
                         self._dispatch_event(deadline - sim_start, handle, to_status, jitter)
+                    elif kind == "duplicate":
+                        # A scheduled resend: an order's second POST of the
+                        # same body, at the order's own instant plus a
+                        # hash-drawn offset (see _schedule_duplicate). It is
+                        # an order delivery, so the day's restocks are
+                        # acknowledged first, a pause or stop that arrived
+                        # during the wait is honored, and sequential mode
+                        # waits for its answer before anything else goes
+                        # out - the same discipline as the stream branch.
+                        request, _offset = payload
+                        if self._restock_tasks:
+                            if not await self._restock_barrier():
+                                stopped = True
+                                break
+                            if not await self._after_gate():
+                                stopped = True
+                                break
+                        last_dispatched_at = deadline
+                        self._dispatch_duplicate(deadline - sim_start, request)
+                        if self._sequential and self._send_tasks:
+                            await asyncio.wait(set(self._send_tasks))
                     else:
                         if deadline != last_restock_deadline:
                             # The first restock of an instant waits for
@@ -1114,7 +1247,72 @@ class Playback:
         seq = self._next_seq()
         self._sent += 1
         handle = self._schedule_events(seq, request, sim_offset)
+        self._schedule_duplicate(seq, request, sim_offset)
         task = asyncio.create_task(self._send_one(seq, request, sim_offset, handle))
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
+
+    def _schedule_duplicate(self, order_seq: int, request: OrderRequest, sim_offset: float) -> None:
+        """Reserve this order's resend, or nothing (architecture 7.2).
+
+        An order is resent when stable_float(seed, order_id, "duplicate")
+        is below the run's duplicate_rate - a hash decision, so the resent
+        share over a stream is exactly the rate, not a statistical draw,
+        and the same seed always resends the same orders. The resend goes
+        out at the order's own instant plus a hash-drawn offset in
+        [0, duplicate_offset_s) simulated seconds, scheduled here at the
+        order's dispatch like an event deadline: it depends on nothing
+        but the seed, the order and the settings, never on when the
+        first answer happens to come back. The tiebreak (dispatch
+        sequence, 1) sorts a zero-offset resend after its own original -
+        the stream item's key is (..., order_seq, 0) - and before the
+        next stream order, so a same-instant resend never swaps with
+        either.
+        """
+        if self._duplicate_rate <= 0.0:
+            return
+        if stable_float(self._seed, request.external_order_id, "duplicate") >= self._duplicate_rate:
+            return
+        offset = (
+            stable_float(self._seed, request.external_order_id, "duplicate-offset")
+            * self._duplicate_offset_s
+        )
+        sim_time = self._from_day * SECONDS_PER_DAY + sim_offset
+        heapq.heappush(
+            self._heap,
+            (
+                sim_time + offset,
+                RANK_ORDER,
+                order_seq,
+                1,
+                "duplicate",
+                (request, offset),
+            ),
+        )
+
+    def _dispatch_duplicate(self, sim_offset: float, request: OrderRequest) -> None:
+        """Dispatch the resend: the same request body, again, through the
+        same in-flight bound - the point is exercising the services'
+        idempotency (the region's inbox answers duplicate on the second
+        POST of an external_order_id it already holds). The line carries
+        the same kind=order plus resend: true, so the log keeps one line
+        per POST and the checker's line kinds stay unchanged. The
+        response buckets in status() count the original sends only; the
+        resend's own answer lives on its line and in orders_resent.
+        """
+        seq = self._next_seq()
+        self._resent += 1
+        record: dict[str, Any] = {
+            "kind": "order",
+            "seq": seq,
+            "external_order_id": request.external_order_id,
+            "order_day": request.order_day,
+            "order_time": request.order_time.isoformat(),
+            "sim_sent_at": sim_offset,
+            "resend": True,
+            "wall_sent_at": None,
+        }
+        task = asyncio.create_task(self._send_one(seq, request, sim_offset, record=record))
         self._send_tasks.add(task)
         task.add_done_callback(self._send_tasks.discard)
 
@@ -1268,20 +1466,29 @@ class Playback:
         request: OrderRequest,
         sim_offset: float,
         handle: _OrderHandle | None = None,
+        record: dict[str, Any] | None = None,
     ) -> None:
         assert self._log is not None and self._client is not None and self._slots is not None
-        # The record exists before the semaphore: a task cancelled while
-        # still queued for a slot was never sent, and the run log must
-        # carry one line for every dispatched order either way.
-        record: dict[str, Any] = {
-            "kind": "order",
-            "seq": seq,
-            "external_order_id": request.external_order_id,
-            "order_day": request.order_day,
-            "order_time": request.order_time.isoformat(),
-            "sim_sent_at": sim_offset,
-            "wall_sent_at": None,
-        }
+        # A duplicate resend passes its line in (built by
+        # _dispatch_duplicate: kind=order plus resend: true); an original
+        # send builds it here. The record exists before the semaphore: a
+        # task cancelled while still queued for a slot was never sent, and
+        # the run log must carry one line for every dispatched order
+        # either way.
+        if record is None:
+            record = {
+                "kind": "order",
+                "seq": seq,
+                "external_order_id": request.external_order_id,
+                "order_day": request.order_day,
+                "order_time": request.order_time.isoformat(),
+                "sim_sent_at": sim_offset,
+                "wall_sent_at": None,
+            }
+        # a resend is counted once, in orders_resent: the response buckets
+        # describe the original sends, and the resend's own answer lives
+        # on its line
+        resend = record.get("resend") is True
         try:
             async with self._slots:
                 if self._state == STOPPING:
@@ -1295,7 +1502,8 @@ class Playback:
                     # cancelled call; the handle resolves cancelled
                     # below, like the existing cancel path.
                     record["error"] = "cancelled"
-                    self._failed += 1
+                    if not resend:
+                        self._failed += 1
                 else:
                     record["wall_sent_at"] = round(self._wall.now(), 3)
                     try:
@@ -1312,23 +1520,27 @@ class Playback:
                             )
                         record["http_status"] = response.status_code
                         record.update(_response_fields(response))
-                        self._count(response)
+                        if not resend:
+                            self._count(response)
                     except TimeoutError:
                         # the outer wall-clock deadline expired: the order
                         # is failed, exactly like an httpx timeout
                         record["error"] = "Timeout"
-                        self._failed += 1
+                        if not resend:
+                            self._failed += 1
                     except Exception as error:  # noqa: BLE001 - a failed send is a logged outcome
                         # httpx errors, bad URLs, anything: the line is still
                         # written and the failure still counted, or the
                         # reorder buffer would hold every later record hostage
                         record["error"] = type(error).__name__
-                        self._failed += 1
+                        if not resend:
+                            self._failed += 1
         except asyncio.CancelledError:
             record["error"] = "cancelled"
             self._log.add(seq, record)
             self._log.flush()
-            self._failed += 1
+            if not resend:
+                self._failed += 1
             if handle is not None:
                 # the dispatcher may be waiting on this order's outcome
                 handle.resolve(_OrderOutcome(False, None, "cancelled"))
@@ -1656,11 +1868,13 @@ def _outcome_of(record: dict[str, Any]) -> _OrderOutcome:
     return _OrderOutcome(accepted, order_id, reason, record.get("region_id"))
 
 
-def _stream_key(item: tuple[int, OrderRequest]) -> tuple[int, int, int, int]:
-    """The sort key of a (stream position, order) pair on the merged
-    timeline: (simulated instant, rank, position, 0)."""
-    index, request = item
-    return (to_sim_seconds(request.order_day, request.order_time), RANK_ORDER, index, 0)
+def _delivery_key(order: OrderRequest, index: int) -> tuple[int, int, int, int]:
+    """The sort key of a stream order (by its stream position) on the
+    merged timeline: (simulated instant, rank, position, 0). The shuffle
+    buffer's picked entry is compared with the heap by this key, so a
+    shuffled delivery still respects the events' and restocks'
+    simulated instants."""
+    return (to_sim_seconds(order.order_day, order.order_time), RANK_ORDER, index, 0)
 
 
 def default_run_id(seed: int) -> str:
