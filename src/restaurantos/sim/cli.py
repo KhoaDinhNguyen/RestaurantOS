@@ -251,6 +251,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="cluster description to copy from (default: infra/cluster.toml)",
     )
 
+    # D10 is implemented by WP5; rosctl only registers the command.
+    hq = sub.add_parser("hq", help="HQ database operator commands (WP5)")
+    hsub = hq.add_subparsers(dest="hq_command", required=True)
+    promote = hsub.add_parser("promote", help="stop the old HQ primary and promote its standby")
+    promote.add_argument(
+        "--compose-file",
+        type=Path,
+        required=True,
+        help="the running cluster's Compose file",
+    )
+    promote.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="cluster description (default ROS_CLUSTER_FILE)",
+    )
+    promote.add_argument(
+        "--yes",
+        action="store_true",
+        help="authorize stopping HQ and possible async data loss; client switching is separate",
+    )
+
     for name, helptext in NOT_BUILT.items():
         sub.add_parser(name, help=helptext)
 
@@ -259,6 +281,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def app(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command == "hq":
+        from restaurantos.coordinator.hq_promotion import run as run_hq_promotion
+
+        return run_hq_promotion(args)
     if args.command == "bootstrap":
         from restaurantos.sim.bootstrap import BootstrapError, bootstrap
         from restaurantos.sim.datacheck import DataCheckError
