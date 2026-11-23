@@ -30,6 +30,7 @@ from restaurantos.coordinator.models import (
     NodeStatus,
     RegionStatus,
 )
+from restaurantos.coordinator.replication import ReplicationFallback
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,7 @@ class Coordinator:
         self.stop = asyncio.Event()
         self.tasks: list[asyncio.Task] = []
         self.failover = Failover(self)
+        self.replication = ReplicationFallback(self)
 
     async def start(self) -> None:
         for pool in self.pools.values():
@@ -85,6 +87,7 @@ class Coordinator:
         # authorize a promotion. Reconciliation also runs on the first cycle.
         for region_id in self.cluster.region_ids:
             await self.failover.step(region_id)
+            await self.replication.step(region_id)
 
     async def close(self) -> None:
         self.stop.set()

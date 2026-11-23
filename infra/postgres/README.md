@@ -83,3 +83,61 @@ read-only enforcement, and cuts/heals the reverse proxy. It then removes a genui
 rewind prerequisite to test clone fallback, forces a lost slot to test slot
 replacement, and verifies that an unavailable source leaves the target stopped
 until a retry succeeds. Recreate the disposable cluster after the run.
+
+## Synchronous standby fallback
+
+The coordinator checks the primary's actual replication settings and its expected
+physical standby slot. Confirmed loss through both health paths overrides a
+stale streaming view. After `ROS_COORDINATOR_HEARTBEAT_MISSES` consecutive samples
+without an eligible streaming synchronous standby, it records
+`sync_downgrade_requested` at HQ. A later cycle clears
+`synchronous_standby_names` with `ALTER SYSTEM`, reloads PostgreSQL, verifies the
+live setting, and records `sync_downgrade`. Local WAL flushing remains enabled;
+the primary's existing and new connections stop waiting for a standby.
+
+The HQ request is the recovery journal. A restart after the configuration change
+finishes its audit event without repeating the downgrade event. New requests are
+scoped to the current primary and epoch. An unfinished promotion, unhealthy
+primary, unknown role/epoch, or an unavailable HQ cannot authorize a new change.
+Healthy replication and already-asynchronous primaries are left alone. The
+eligibility check also detects a severed replication link while the standby's
+health probes still answer. A silent replication-only link can remain reported as streaming until
+PostgreSQL's WAL sender timeout expires when both health paths still answer.
+Confirmed standby loss does not wait for that stale connection to expire.
+
+Fallback stays asynchronous after reconnection or coordinator restart. The docs
+do not specify automatic re-enabling, so an operator must explicitly start a new
+synchronous experiment. Configure the policy through a reloadable file or
+`ALTER SYSTEM`; a command-line `-c synchronous_standby_names=...` override cannot
+be disabled by reloading and is reported as an error. Database configuration
+privilege errors leave the completion event pending and are logged without
+stopping the failover loop. Async fallback trades standby durability for continued
+write availability and is visible in `/admin/cluster` and `/admin/events`.
+
+The WP6a generator currently rejects `synchronous = true`. Enabling that bootstrap
+switch is a follow-up for its owner. This increment handles primaries already
+configured for synchronous replication and adds no bootstrap or proxy changes.
+For a two-node experiment, after setup and with the standby streaming, an operator
+can run these statements on the current region primary using the configured
+connection helpers:
+
+```sql
+ALTER SYSTEM SET synchronous_standby_names = 'FIRST 1 (*)';
+SELECT pg_reload_conf();
+```
+
+The default `synchronous_commit = on` preserves local flush plus standby waits.
+The wildcard supports both the original standby and a node rejoined with its
+node-specific application name. These rules assume the documented single
+physical standby per region. See PostgreSQL 18's
+[replication settings](https://www.postgresql.org/docs/18/runtime-config-replication.html)
+for synchronous standby selection.
+
+`ROS_SYNC_TEST_CLUSTER=1 ROS_NETWORK=compose uv run pytest -m cluster
+ tests/cluster/test_coordinator_sync.py` runs the disposable-cluster scenario.
+It proves an existing commit waits before fallback, resumes after downgrade,
+keeps its data, and leaves one completion event after a simulated coordinator
+restart. It also checks stable async mode after healing and a second automatic
+fallback after an operator explicitly re-enables sync and isolates the standby.
+Do not enable this flag on a populated cluster. Recreate the disposable cluster
+after the test.
