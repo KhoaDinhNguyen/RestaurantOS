@@ -236,7 +236,7 @@ def _prepare(cluster: Cluster, data_dir: Path, sim: SimSettings) -> Prepared:
         f"region(s), {sum(counts.values())} vendors"
     )
 
-    compose = compose_text(cluster)  # refuses synchronous = true
+    compose = compose_text(cluster)
     proxy_list = toxiproxy_config(cluster)
 
     stock = warm_up_stock(

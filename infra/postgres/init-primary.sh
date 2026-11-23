@@ -46,3 +46,12 @@ if [ "$ROS_NODE_KIND" = "region" ]; then
 INSERT INTO node_state (region_id, epoch, menu_version) VALUES (:'region_id', 1, 1);
 SQL
 fi
+
+# Enable synchronous acknowledgements only on the final server restart.
+# The initialization server must finish its schema transactions before a
+# standby can clone it. Keep this reloadable (never a postgres -c override).
+if [ -n "${ROS_SYNC_STANDBY:-}" ]; then
+    [[ "$ROS_SYNC_STANDBY" =~ ^[a-z0-9_]+$ ]] || exit 1
+    printf "\nsynchronous_standby_names = 'FIRST 1 (%s)'\nsynchronous_commit = on\n" \
+        "$ROS_SYNC_STANDBY" >> "$PGDATA/postgresql.auto.conf"
+fi

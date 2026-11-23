@@ -242,11 +242,12 @@ def _no_docker(monkeypatch) -> list[str]:
     return events
 
 
-def test_a_synchronous_cluster_fails_before_teardown(monkeypatch, tmp_path):
+def test_a_synchronous_cluster_prepares_reloadable_settings_before_teardown(monkeypatch, tmp_path):
     _write_dataset(tmp_path)
     events = _no_docker(monkeypatch)
-    with pytest.raises(NotImplementedError, match="synchronous"):
-        bootstrap._prepare(Cluster(regions=1, synchronous=True), tmp_path, SIM)
+    prepared = bootstrap._prepare(Cluster(regions=1, synchronous=True), tmp_path, SIM)
+    assert "ROS_SYNC_STANDBY: r1_standby" in prepared.compose
+    assert "ROS_SYNC_STANDBY: hq_standby" in prepared.compose
     assert events == []  # the running cluster was never touched
 
 

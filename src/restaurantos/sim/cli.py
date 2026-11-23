@@ -254,24 +254,25 @@ def build_parser() -> argparse.ArgumentParser:
     # D10 is implemented by WP5; rosctl only registers the command.
     hq = sub.add_parser("hq", help="HQ database operator commands (WP5)")
     hsub = hq.add_subparsers(dest="hq_command", required=True)
-    promote = hsub.add_parser("promote", help="stop the old HQ primary and promote its standby")
-    promote.add_argument(
-        "--compose-file",
-        type=Path,
-        required=True,
-        help="the running cluster's Compose file",
-    )
-    promote.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help="cluster description (default ROS_CLUSTER_FILE)",
-    )
-    promote.add_argument(
-        "--yes",
-        action="store_true",
-        help="authorize stopping HQ and possible async data loss; client switching is separate",
-    )
+    for operation, helptext in (
+        ("promote", "fence the old HQ primary and promote its standby"),
+        ("rejoin", "rewind or rebuild the fenced old HQ primary as a standby"),
+    ):
+        hp = hsub.add_parser(operation, help=helptext)
+        hp.add_argument(
+            "--compose-file", type=Path, required=True, help="the running cluster's Compose file"
+        )
+        hp.add_argument(
+            "--config",
+            type=Path,
+            default=None,
+            help="cluster description (default ROS_CLUSTER_FILE)",
+        )
+        hp.add_argument(
+            "--yes",
+            action="store_true",
+            help="authorize this HQ operation and possible async data loss",
+        )
 
     for name, helptext in NOT_BUILT.items():
         sub.add_parser(name, help=helptext)

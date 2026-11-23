@@ -157,6 +157,18 @@ async def promote(
             state = await role(conn)
             if not state or state[1] != identifier or not state[2]:
                 raise HQPromotionError("candidate is not a copy of this project's HQ database")
+            if not state[0] and old["State"]["Running"]:
+                async with make_pool(
+                    node_conninfo(cluster, HQ_PRIMARY, settings=settings), settings
+                ) as old_pool:
+                    try:
+                        old_role = await run_on(old_pool, role, settings=settings)
+                    except RegionUnreachableError:
+                        old_role = None
+                    if old_role and old_role[0] and old_role[1] == identifier:
+                        raise HQPromotionError(
+                            "HQ is already promoted and its old primary has rejoined"
+                        )
             # A failed or ambiguous fence must never authorize promotion.
             await command(["docker", "update", "--restart=no", old["Id"]])
             await command(["docker", "stop", "--time", "5", old["Id"]])
@@ -208,6 +220,7 @@ async def promote(
                             "old_primary": HQ_PRIMARY,
                             "new_primary": HQ_STANDBY,
                             "manual": True,
+                            "replication_after_promotion": "async",
                         }
                     ),
                 },
@@ -219,35 +232,67 @@ async def promote(
                 "primary_node": HQ_STANDBY,
                 "old_primary_stopped": True,
                 "event_id": event[0],
-                "client_switch_required": True,
+                "client_switch_required": False,
             }
 
-        return await run_on(pool, record, region_id="hq", settings=settings)
+        result = await run_on(pool, record, region_id="hq", settings=settings)
+        # The old partner is fenced. Retained sync settings cannot be
+        # satisfied until rejoin, so manual promotion leaves HQ async.
+        async with make_pool(
+            node_conninfo(cluster, HQ_STANDBY, settings=settings), settings
+        ) as config_pool:
+
+            async def disable(conn):
+                await conn.set_autocommit(True)
+                await conn.execute(load_query("coordinator/disable_sync"))
+                await conn.execute(load_query("coordinator/reload_config"))
+
+            await run_on(config_pool, disable, settings=settings)
+        deadline = time.monotonic() + config.failover_timeout_s
+
+        async def names(conn):
+            return await (await conn.execute(load_query("coordinator/sync_names"))).fetchone()
+
+        while await run_on(pool, names, settings=settings) != ("",):
+            if time.monotonic() >= deadline:
+                raise HQPromotionError(
+                    "HQ asynchronous policy not confirmed; inspect before retrying"
+                )
+            await asyncio.sleep(0.05)
+        return result
 
 
 def run(args) -> int:
+    from restaurantos.coordinator.hq_rejoin import recover
+    from restaurantos.coordinator.rejoin import RecoveryError
+
+    operation = args.hq_command
     if not args.yes:
         print(
-            "rosctl hq promote: requires --yes; this stops HQ's old primary and may lose "
-            "unreplicated data. Client routing still requires coordinated changes.",
+            f"rosctl hq {operation}: requires --yes; this changes HQ and may lose "
+            "unreplicated data.",
             file=sys.stderr,
         )
         return 1
     settings = Settings(client="coordinator", network="host")
     try:
         cluster = load_cluster(args.config or settings.cluster_file)
-        result = asyncio.run(promote(cluster, settings, CoordinatorSettings(), args.compose_file))
-    except (HQPromotionError, RegionUnreachableError, OSError, ValueError) as error:
+        if operation == "rejoin":
+            output = asyncio.run(
+                recover(cluster, settings, CoordinatorSettings(), args.compose_file)
+            )
+            print(output, file=sys.stderr, end="")
+            result = {"primary_node": HQ_STANDBY, "standby_node": HQ_PRIMARY, "rejoined": True}
+        else:
+            result = asyncio.run(
+                promote(cluster, settings, CoordinatorSettings(), args.compose_file)
+            )
+    except (HQPromotionError, RecoveryError, RegionUnreachableError, OSError, ValueError) as error:
         print(
-            f"rosctl hq promote: {error}. Inspect HQ before retrying; do not restart the old "
-            "primary without rebuilding/rejoining it.",
+            f"rosctl hq {operation}: {error}. Inspect HQ before retrying; do not restart "
+            "the old primary without rebuilding/rejoining it.",
             file=sys.stderr,
         )
         return 1
     print(json.dumps(result))
-    print(
-        "HQ database promoted. Services still target hq-primary; coordinate client switching "
-        "before resuming HQ traffic. Keep the old primary stopped.",
-        file=sys.stderr,
-    )
     return 0

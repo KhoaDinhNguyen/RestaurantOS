@@ -149,10 +149,14 @@ async def probe_node(node: str, conninfo: str, settings: Settings | None = None)
             yield conn
 
     async def look(conn: psycopg.AsyncConnection) -> NodeView:
-        cur = await conn.execute(load_query("common/local_node_probe"))
+        cur = await conn.execute(
+            load_query("common/hq_probe" if node.startswith("hq-") else "common/local_node_probe")
+        )
         row = await cur.fetchone()
         if row is None:
             return NodeView(node)
+        if node.startswith("hq-"):
+            return NodeView(node, reachable=True, in_recovery=row[0])
         # Column order is (epoch, in_recovery); see common/local_node_probe.sql.
         return NodeView(node, reachable=True, in_recovery=row[1], epoch=row[0])
 

@@ -127,7 +127,7 @@ async def test_hq_promotion_lock_and_restart_recovery(monkeypatch, crash):
             monkeypatch.setattr(hq, "run_on", original_run)
             result = await promote()
             assert result["primary_node"] == HQ_STANDBY
-            assert result["old_primary_stopped"] and result["client_switch_required"]
+            assert result["old_primary_stopped"] and not result["client_switch_required"]
             assert await sql(HQ_STANDBY, "SELECT note FROM menu_versions WHERE version=2") == [
                 ("hq-crash-probe",)
             ]

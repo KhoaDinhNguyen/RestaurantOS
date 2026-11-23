@@ -14,7 +14,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from restaurantos.common.cluster import (
-    HQ_PRIMARY,
     Cluster,
     load_cluster,
     primary_of,
@@ -25,6 +24,7 @@ from restaurantos.common.cluster import (
 from restaurantos.common.config import Settings
 from restaurantos.common.db import make_pool, node_conninfo, probe_node, run_on
 from restaurantos.common.errors import RegionUnreachableError
+from restaurantos.common.hq import HQPool
 from restaurantos.common.sqlfiles import load_query
 from restaurantos.coordinator.config import CoordinatorSettings
 
@@ -51,7 +51,7 @@ class RejoinPlan:
 
 
 async def read_plan(cluster: Cluster, settings: Settings, region_id: str) -> RejoinPlan:
-    pool = make_pool(node_conninfo(cluster, HQ_PRIMARY, settings=settings), settings)
+    pool = HQPool(cluster, settings)
     await pool.open()
     try:
 
@@ -116,7 +116,7 @@ async def stop_target(
     cluster: Cluster, settings: Settings, plan: RejoinPlan, compose: list[str]
 ) -> None:
     """Serialize stopping against automatic promotion of this very node."""
-    pool = make_pool(node_conninfo(cluster, HQ_PRIMARY, settings=settings), settings)
+    pool = HQPool(cluster, settings)
     await pool.open()
     try:
 

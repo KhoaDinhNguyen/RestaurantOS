@@ -20,7 +20,7 @@ async def test_unreachable_region_does_not_stop_another_region(monkeypatch):
     menus = []
 
     @asynccontextmanager
-    async def pool(*args):
+    async def pool(*args, **kwargs):
         instance = object()
         pools.append(instance)
         yield instance
@@ -45,7 +45,7 @@ async def test_unreachable_region_does_not_stop_another_region(monkeypatch):
         await real_sleep(0)
         raise StopWorker
 
-    monkeypatch.setattr(holding, "make_pool", pool)
+    monkeypatch.setattr(holding, "HQPool", pool)
     monkeypatch.setattr(holding, "drain_batch", drain)
     monkeypatch.setattr(holding, "publish_menu", publish)
     monkeypatch.setattr(holding.asyncio, "sleep", stop_after_poll)

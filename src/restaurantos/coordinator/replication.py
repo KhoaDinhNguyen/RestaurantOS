@@ -7,7 +7,7 @@ from uuid import uuid4
 from psycopg import Error
 from psycopg.rows import dict_row
 
-from restaurantos.common.cluster import HQ_PRIMARY, slot_name
+from restaurantos.common.cluster import HQ_PRIMARY, HQ_STANDBY, slot_name
 from restaurantos.common.db import make_pool, node_conninfo, probe_node, run_on
 from restaurantos.common.errors import RegionUnreachableError
 from restaurantos.common.sqlfiles import load_query
@@ -56,10 +56,98 @@ class ReplicationFallback:
         finally:
             await pool.close()
 
+    async def step_hq(self) -> None:
+        """HQ sync loss must not block its own recovery journal's commit."""
+        runtime = self.runtime
+        if not runtime.cluster.standbys:
+            return
+        try:
+            primary = await runtime.hq_pool.select()
+            standby = HQ_STANDBY if primary == HQ_PRIMARY else HQ_PRIMARY
+
+            async def reconcile(conn):
+                locked = await (
+                    await conn.execute(load_query("coordinator/hq_promotion_lock"))
+                ).fetchone()
+                if locked != (True,):
+                    return
+
+                async def read():
+                    async with conn.cursor(row_factory=dict_row) as cursor:
+                        await cursor.execute(
+                            load_query("coordinator/hq_sync_status"), {"slot": slot_name(standby)}
+                        )
+                        return await cursor.fetchone()
+
+                state = await read()
+                if state["in_recovery"]:
+                    return
+                # Read business commit policy before the transaction-local
+                # control override; otherwise every status would say local.
+                await conn.execute(load_query("coordinator/local_epoch_commit"))
+                row = {"region_id": None, "primary_node": primary, **state}
+                async with conn.cursor(row_factory=dict_row) as cursor:
+                    await cursor.execute(load_query("coordinator/pending_hq_sync_downgrade"), row)
+                    pending = await cursor.fetchone()
+                key = ("hq", primary, state["timeline"])
+                if pending is not None:
+                    if state["standby_names"]:
+                        await self.disable(primary)
+                        state = await read()
+                    if state["standby_names"] or state["in_recovery"]:
+                        return
+                    detail = {
+                        **pending["detail"],
+                        "request_id": pending["detail"]["coordinator_event_id"],
+                        "replication": "async",
+                    }
+                    await runtime.failover.event(
+                        conn,
+                        row,
+                        "sync_downgrade",
+                        primary,
+                        0,
+                        detail,
+                        marker=f"sync-complete:{detail['request_id']}",
+                    )
+                    self.misses.pop(key, None)
+                    return
+                if (
+                    not state["standby_names"]
+                    or state["commit_mode"] in ("off", "local")
+                    or state["sync_connected"]
+                ):
+                    self.misses.pop(key, None)
+                    return
+                self.misses[key] = self.misses.get(key, 0) + 1
+                if self.misses[key] < runtime.config.heartbeat_misses:
+                    return
+                await runtime.failover.event(
+                    conn,
+                    row,
+                    "sync_downgrade_requested",
+                    primary,
+                    0,
+                    {
+                        "scope": "hq",
+                        "primary_node": primary,
+                        "system_id": state["system_id"],
+                        "timeline": state["timeline"],
+                    },
+                    marker=str(uuid4()),
+                )
+
+            await run_on(
+                runtime.pools[primary], reconcile, region_id="hq", settings=runtime.settings
+            )
+        except RegionUnreachableError:
+            logger.warning("HQ synchronous fallback deferred")
+
     async def step(self, region_id: str) -> None:
         runtime = self.runtime
 
         async def reconcile(conn):
+            await conn.execute(load_query("coordinator/local_epoch_commit"))
             await conn.execute(
                 load_query("coordinator/promotion_limits"),
                 {"timeout_ms": str(int(runtime.config.failover_timeout_s * 1000))},
@@ -168,7 +256,7 @@ class ReplicationFallback:
 
         try:
             await run_on(
-                runtime.pools[HQ_PRIMARY],
+                runtime.hq_pool,
                 reconcile,
                 region_id="hq",
                 settings=runtime.failover.settings,

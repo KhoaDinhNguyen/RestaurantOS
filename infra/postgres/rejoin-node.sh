@@ -6,8 +6,17 @@ set -euo pipefail
 : "${PGDATA:?}"
 : "${ROS_REJOIN_OFFLINE:?must be launched by the recovery command}"
 : "${ROS_REJOIN_SOURCE_DSN:?}"
-: "${ROS_REJOIN_REGION:?}"
-: "${ROS_REJOIN_EPOCH:?}"
+kind=${ROS_REJOIN_KIND:-region}
+if [[ "$kind" == region ]]; then
+    : "${ROS_REJOIN_REGION:?}"
+    : "${ROS_REJOIN_EPOCH:?}"
+    [[ "$ROS_REJOIN_EPOCH" =~ ^[0-9]+$ ]]
+elif [[ "$kind" == hq ]]; then
+    : "${ROS_REJOIN_HQ_ID:?}"
+    : "${ROS_REJOIN_HQ_TIMELINE:?}"
+else
+    echo 'rejoin: invalid node kind' >&2; exit 1
+fi
 : "${ROS_PRIMARY_HOST:?}"
 : "${ROS_PRIMARY_PORT:?}"
 : "${ROS_REPL_PASSWORD:?}"
@@ -17,7 +26,6 @@ queries=/ros/rejoin-sql
 PGDATA=$(realpath -m "$PGDATA")
 [[ "$ROS_REJOIN_OFFLINE" == 1 && "$PGDATA" == /var/lib/postgresql/* ]]
 [[ "$ROS_SLOT_NAME" =~ ^[a-z0-9_]+$ ]]
-[[ "$ROS_REJOIN_EPOCH" =~ ^[0-9]+$ ]]
 
 # The lock is outside PGDATA: a failed rewind may require replacing its entire
 # contents. flock releases the lock even if this helper is killed.
@@ -37,8 +45,14 @@ if [[ -s "$PGDATA/global/pg_control" ]]; then
     }
 fi
 
-expected="${ROS_REJOIN_REGION}|${ROS_REJOIN_EPOCH}|f"
-[[ "$(source_sql -f "$queries/rejoin_source.sql")" == "$expected" ]] || {
+if [[ "$kind" == hq ]]; then
+    expected="${ROS_REJOIN_HQ_ID}|${ROS_REJOIN_HQ_TIMELINE}|f"
+    source_query=rejoin_hq_source.sql
+else
+    expected="${ROS_REJOIN_REGION}|${ROS_REJOIN_EPOCH}|f"
+    source_query=rejoin_source.sql
+fi
+[[ "$(source_sql -f "$queries/$source_query")" == "$expected" ]] || {
     echo 'rejoin: source role or epoch does not match HQ; leaving target stopped' >&2
     exit 1
 }

@@ -78,7 +78,12 @@ Both outbox queries use the partial index `outbox_pending_idx`, so they stay che
 
 ### 5. HQ
 
-Standby with **manual** promotion only: one `rosctl` command. Automatic HQ failover is a stretch goal.
+Standby with **manual** promotion only: `rosctl hq promote --compose-file <file> --yes`.
+Clients choose the sole writable HQ through `common.hq.HQPool`; both writable
+is an unavailable result. `rosctl hq rejoin --compose-file <file> --yes` returns
+the fenced old primary as a streaming standby. HQ uses physical fencing and
+database identity/timeline checks, not a regional epoch. Automatic HQ promotion
+remains a stretch goal. See `infra/postgres/README.md` for operational details.
 
 ## Run it on its own
 
