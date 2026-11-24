@@ -187,6 +187,7 @@ def parse_allowed_origins(value: str) -> tuple[str, ...]:
     items = [item for item in (entry.strip() for entry in value.split(",")) if item]
     return tuple(dict.fromkeys(normalise_origin(item) for item in items))
 
+
 @cache
 def get_sim_settings() -> SimSettings:
     return SimSettings()

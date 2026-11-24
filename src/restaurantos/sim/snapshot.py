@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import shutil
@@ -43,6 +44,7 @@ from restaurantos.common.cluster import BASELINE, Cluster, load_cluster
 from restaurantos.common.simclock import SECONDS_PER_DAY
 from restaurantos.sim.checker import RESUMED_FROM
 from restaurantos.sim.config import SimSettings
+from restaurantos.sim.timeline import EVENT_SCHEDULE
 from restaurantos.sim.toxiproxy import Toxiproxy
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
@@ -90,6 +92,24 @@ def frontier_seconds(status: dict[str, Any]) -> int | None:
     return sim_seconds(
         {"sim_day": status.get("dispatched_sim_day"), "sim_time": status.get("dispatched_sim_time")}
     )
+
+
+def offset_floor(engine: dict[str, Any]) -> int:
+    """The least a snapshot's point may stand into its day, for the engine
+    that runs the run (its `engine` block in `GET /sim/playback`).
+
+    Restore replays the day from midnight, so everything of the PREVIOUS
+    day must be dispatched by the snapshot point: a late order's last
+    status event is due up to the schedule's last offset plus the jitter
+    after midnight. With events off only the midnight restock batch
+    remains, which a point one second past midnight is already beyond.
+    Read from the live engine, not this process's settings: the playback
+    host may run with another jitter than the shell that saves."""
+    events = engine.get("events") or {}
+    if not events.get("enabled") or not events.get("sample_rate"):
+        return 1
+    last = max(offset for _status, offset in EVENT_SCHEDULE)
+    return max(1, last + math.ceil(float(events.get("jitter_s") or 0.0)))
 
 
 def _at(seconds: int) -> str:
@@ -311,6 +331,21 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
         return None, False
     was_running = status["state"] == "running"
     minimum = ctx.sim.snapshot_min_day_offset_s
+    engine = status.get("engine")
+    if not isinstance(engine, dict):
+        raise SnapshotError(
+            "the playback host does not report its engine settings (GET /sim/playback "
+            "has no 'engine'): restart it from this checkout"
+        )
+    floor = offset_floor(engine)
+    if minimum < floor:
+        events = engine.get("events") or {}
+        raise SnapshotError(
+            f"ROS_SIM_SNAPSHOT_MIN_DAY_OFFSET_S is {minimum} s, but this run's last status "
+            f"event of a day can be due {floor} s after midnight (the schedule's last "
+            f"offset plus up to {events.get('jitter_s')} s jitter), and restore replays "
+            f"only the snapshot's own day: raise it to at least {floor}"
+        )
     while True:
         frontier = frontier_seconds(status)
         if frontier is not None and frontier % SECONDS_PER_DAY >= minimum:

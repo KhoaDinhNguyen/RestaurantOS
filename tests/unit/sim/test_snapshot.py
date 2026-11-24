@@ -155,6 +155,18 @@ class FakeHost:
         # once set, the frontier reported after the pause (to cross midnight)
         self.frontier_after_pause: int | None = None
         self.dispatched = True
+        # GET /sim/playback's engine block (what every run on it shares)
+        self.engine: dict[str, Any] = {
+            "sequential": False,
+            "region": None,
+            "target_url": "http://127.0.0.1:8000/api/v1",
+            "inflight": 64,
+            "events": {"enabled": True, "sample_rate": 1.0, "jitter_s": 60.0},
+            "restock_every": 7,
+            "duplicate_offset_s": 1.0,
+            "shuffle_window": 8,
+            "kitchen": {"mode": "edge", "urls": {"r1": "http://127.0.0.1:8011/api/v1"}},
+        }
 
     def advance(self, wall_s: float) -> None:
         if self.state == "running":
@@ -184,6 +196,7 @@ class FakeHost:
                 if self.dispatched
                 else None
             ),
+            "engine": self.engine,
         }
         if self.state == "paused" and self.inflight:
             self.inflight -= 1
@@ -360,6 +373,31 @@ async def test_dispatch_crossing_midnight_at_the_pause_refuses_and_resumes(world
     assert [body["action"] for body in host.commands] == ["pause", "resume"]
     assert docker.calls == []
     assert not (ctx.snapshot_dir / "crossed").exists()
+
+
+async def test_save_refuses_a_minimum_below_the_engines_event_floor(world) -> None:
+    ctx, host, docker, _, _ = world
+    ctx.sim = SimSettings(
+        _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_min_day_offset_s=600
+    )
+    with pytest.raises(SnapshotError, match="at least 1560"):
+        await save("low", ctx)
+    assert host.commands == [] and docker.calls == []
+    # the host's own jitter decides, not this process's settings
+    ctx.sim = SimSettings(
+        _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_min_day_offset_s=1600
+    )
+    host.engine["events"]["jitter_s"] = 120.0
+    with pytest.raises(SnapshotError, match="at least 1620"):
+        await save("low", ctx)
+    # with events off only the midnight restock is left: any point past it
+    host.engine["events"]["enabled"] = False
+    ctx.sim = SimSettings(
+        _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_min_day_offset_s=600
+    )
+    host.offset = 700
+    record = await save("events-off", ctx)
+    assert sim_seconds(record) % 86400 >= 600
 
 
 async def test_save_refuses_a_paused_run_that_dispatched_nothing(world) -> None:
