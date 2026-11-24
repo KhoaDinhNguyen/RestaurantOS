@@ -95,6 +95,11 @@ class SimSettings(BaseSettings):
     # `rosctl playback start` while its run is live.
     control_host: str = "127.0.0.1"
     control_port: int = Field(default=8002, ge=1, le=65535)
+    # Origins (scheme://host[:port]) allowed to send state-changing
+    # requests to the control API. CLI clients (rosctl, curl) send no
+    # Origin and need nothing; a browser page (WP7) must be served from
+    # a listed origin. Empty means CLI-only.
+    control_allowed_origins: str = ""
 
 
 @cache

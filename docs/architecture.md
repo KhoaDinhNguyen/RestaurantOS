@@ -814,6 +814,8 @@ It answers `201` with the fault; `404` for an unknown link group; `409` with `{"
 
 **The control process.** `rosctl control` serves all of this on port 8002 and hosts playback in the same process (the same engine flags as `rosctl playback start`, fixed for every run it hosts); runs are started through `POST /sim/playback`, or `rosctl playback start --via-control --from-day N`. A standalone `rosctl playback start` still works when no control process runs; only one of the two can own the port. The `rosctl` clients are `rosctl links`, `rosctl fault add|heal|heal-all|list`, `rosctl node kill|start` and `rosctl job <job_id>`.
 
+**Cross-origin requests.** Every state-changing request (POST/PUT/PATCH/DELETE) with `Sec-Fetch-Site: cross-site`, or with an `Origin` the allowlist does not contain exactly (scheme + host + port), is rejected with `403 {"detail": "cross-origin request rejected"}`; the `null` origin is always rejected. Requests without `Origin` - what `rosctl`, curl and every CLI client send - are unaffected. The allowlist is `ROS_SIM_CONTROL_ALLOWED_ORIGINS` (comma-separated origins, empty by default: CLI-only); a browser client (WP7) must be served from a listed origin.
+
 **Nodes.** `POST /sim/nodes/{node_id}/kill` and `/start` answer `200` with `{"node_id": "r1-primary", "running": false}`, or `404` for an unknown node. Killing a stopped node or starting a running one changes nothing.
 
 **Jobs.** A scenario, a snapshot, a restore and a check take from seconds to minutes. Their `POST` answers `202` with a job, and `GET /sim/jobs/{job_id}` reports on it:

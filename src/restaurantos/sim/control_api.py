@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from restaurantos.sim.config import get_sim_settings
 from restaurantos.sim.faults import FaultError, FaultExistsError, FaultLayer
 from restaurantos.sim.jobs import JobRunner, UnknownJobError
 from restaurantos.sim.nodes import NodeError, Nodes, UnknownNodeError
@@ -35,10 +36,59 @@ def _toxiproxy_down(error: ToxiproxyError) -> JSONResponse:
     return error_response(502, "toxiproxy_error", str(error))
 
 
+# --- cross-site protection -------------------------------------------------
+
+_STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+
+def _normalise_origin(origin: str) -> str:
+    """Normalise for exact comparison: scheme and host compare
+    case-insensitively, a trailing slash is dropped."""
+    return origin.strip().rstrip("/").lower()
+
+
+def allowed_origins(raw: str) -> set[str]:
+    """The configured allowlist as normalised origins."""
+    return {_normalise_origin(origin) for origin in raw.split(",") if origin.strip()}
+
+
+def _rejected() -> JSONResponse:
+    return JSONResponse(status_code=403, content={"detail": "cross-origin request rejected"})
+
+
+def add_origin_guard(app: FastAPI) -> None:
+    """Reject cross-origin state changes on every route of this app.
+
+    A browser fires kill/start/heal-all as a "simple" cross-origin POST
+    (no preflight), so the check cannot live in a route: it runs as a
+    middleware for every POST/PUT/PATCH/DELETE, including the embedded
+    playback routes. GET/HEAD/OPTIONS are unaffected, and requests with
+    no Origin (the CLI clients) pass: the allowlist is only consulted
+    when a browser sent one."""
+    if getattr(app.state, "origin_guard", False):
+        return
+    app.state.origin_guard = True
+
+    @app.middleware("http")
+    async def reject_cross_site(request: Request, call_next: Any) -> Any:
+        if request.method in _STATE_CHANGING:
+            if request.headers.get("sec-fetch-site", "").lower() == "cross-site":
+                return _rejected()
+            origin = request.headers.get("origin")
+            if origin is not None:
+                allowlist = allowed_origins(get_sim_settings().control_allowed_origins)
+                # the literal "null" origin is never allowlisted: it is
+                # what a sandboxed iframe or a redirected form sends
+                if origin == "null" or _normalise_origin(origin) not in allowlist:
+                    return _rejected()
+        return await call_next(request)
+
+
 def add_control_routes(app: FastAPI, *, faults: FaultLayer, nodes: Nodes, jobs: JobRunner) -> None:
     """Mount the links, faults, nodes and jobs routes on `app`. The three
     objects are also left on `app.state`, so later routes (the check,
     snapshot and scenario jobs) reach the same instances."""
+    add_origin_guard(app)
     app.state.faults = faults
     app.state.nodes = nodes
     app.state.jobs = jobs

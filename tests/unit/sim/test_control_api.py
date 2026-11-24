@@ -162,3 +162,122 @@ async def test_jobs_route(app_and_client) -> None:
     assert done["state"] == "done" and done["result"] == {"passed": True}
     missing = await client.get("/sim/jobs/j99")
     assert missing.status_code == 404 and missing.json()["error"] == "unknown_job"
+
+
+# --- cross-site protection (CodeRabbit review, finding 3) -------------------
+
+
+@pytest.fixture
+def fresh_sim_settings(monkeypatch):
+    from restaurantos.sim.config import get_sim_settings
+
+    get_sim_settings.cache_clear()
+    monkeypatch.setenv(
+        "ROS_SIM_CONTROL_ALLOWED_ORIGINS", "http://localhost:5173, https://ui.internal:8443/"
+    )
+    get_sim_settings.cache_clear()
+    yield
+    get_sim_settings.cache_clear()
+
+
+async def test_cross_site_markers_are_rejected(client) -> None:
+    """Sec-Fetch-Site: cross-site or a foreign Origin rejects the
+    state-changing routes: kill, start, heal-all and a JSON-body one."""
+    requests = [
+        ("POST", "/sim/nodes/r1-primary/kill", None, {"Sec-Fetch-Site": "cross-site"}),
+        ("POST", "/sim/nodes/r1-primary/start", None, {"Sec-Fetch-Site": "cross-site"}),
+        ("POST", "/sim/faults/heal-all", None, {"Sec-Fetch-Site": "cross-site"}),
+        (
+            "POST",
+            "/sim/faults",
+            {"target": "repl:r1", "fault": "cut"},
+            {"Origin": "http://evil.example"},
+        ),
+        ("POST", "/sim/faults/heal-all", None, {"Origin": "null"}),
+    ]
+    for method, path, body, headers in requests:
+        response = await client.request(method, path, json=body, headers=headers)
+        assert response.status_code == 403, (method, path, headers)
+        assert response.json() == {"detail": "cross-origin request rejected"}
+
+
+async def test_a_browser_origin_must_match_the_allowlist_exactly(client, fresh_sim_settings):
+    # the allowlisted origin goes through
+    allowed = await client.post(
+        "/sim/nodes/r1-primary/kill", headers={"Origin": "http://localhost:5173"}
+    )
+    assert allowed.status_code == 200
+    for origin in (
+        "http://localhost:5174",  # a different port
+        "http://localhost.evil.com",
+        "http://localhost:5173.evil.com",
+        "http://localhost",
+    ):
+        rejected = await client.request("POST", "/sim/faults/heal-all", headers={"Origin": origin})
+        assert rejected.status_code == 403, origin
+    # a configured origin with a trailing slash matches its slashless form
+    slashed = await client.request(
+        "POST", "/sim/nodes/r1-primary/start", headers={"Origin": "https://ui.internal:8443"}
+    )
+    assert slashed.status_code == 200
+
+
+async def test_requests_without_origin_and_same_site_markers_pass(client) -> None:
+    # the CLI's shape: no Origin, no Sec-Fetch-Site
+    killed = await client.post("/sim/nodes/r1-primary/kill")
+    assert killed.status_code == 200 and killed.json()["running"] is False
+    unknown = await client.post("/sim/nodes/r9-primary/kill")
+    assert unknown.status_code == 404  # still the route's own answer
+    assert (await client.post("/sim/faults/heal-all")).status_code == 200
+    for marker in ("same-origin", "same-site", "none"):
+        response = await client.post(
+            "/sim/nodes/r1-primary/start", headers={"Sec-Fetch-Site": marker}
+        )
+        assert response.status_code == 200, marker
+
+
+async def test_gets_with_a_foreign_origin_are_still_served(client) -> None:
+    response = await client.get("/sim/links", headers={"Origin": "http://evil.example"})
+    assert response.status_code == 200
+
+
+async def test_the_playback_routes_get_the_same_guard() -> None:
+    from restaurantos.sim.control import make_control_app
+
+    calls: list[str] = []
+
+    class StubPlayback:
+        def clock(self) -> dict:
+            return {}
+
+        def status(self) -> dict:
+            return {}
+
+        async def start(self, **kwargs) -> None:
+            calls.append("start")
+
+        async def pause(self) -> None:
+            calls.append("pause")
+
+        async def resume(self) -> None:
+            calls.append("resume")
+
+        async def stop(self) -> None:
+            calls.append("stop")
+
+        async def set_speed(self, speed: float) -> None:
+            calls.append("speed")
+
+    app = make_control_app(StubPlayback())  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://control.test"
+    ) as playback_client:
+        rejected = await playback_client.post(
+            "/sim/playback", json={"action": "pause"}, headers={"Origin": "http://evil.example"}
+        )
+        assert rejected.status_code == 403
+        assert rejected.json() == {"detail": "cross-origin request rejected"}
+        assert calls == []  # the route never ran
+        served = await playback_client.post("/sim/playback", json={"action": "pause"})
+        assert served.status_code == 200
+        assert calls == ["pause"]

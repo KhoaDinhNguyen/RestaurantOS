@@ -56,6 +56,11 @@ class PlaybackSpeed(BaseModel):
 
 def make_control_app(playback: Playback) -> FastAPI:
     app = FastAPI(title="RestaurantOS playback control", docs_url="/docs")
+    # state-changing playback commands get the same cross-site rejection
+    # as the control routes (the control process embeds both)
+    from restaurantos.sim.control_api import add_origin_guard
+
+    add_origin_guard(app)
 
     @app.exception_handler(StateError)
     async def _invalid_state(request: Request, error: StateError) -> JSONResponse:
