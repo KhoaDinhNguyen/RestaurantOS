@@ -59,8 +59,13 @@ def refused(ext: str, region: str = "r1") -> dict:
     }
 
 
-def failed(ext: str) -> dict:
-    return {"kind": "order", "external_order_id": ext, "error": "Timeout"}
+def failed(ext: str, *, sent_minute: float | None = None) -> dict:
+    line: dict = {"kind": "order", "external_order_id": ext, "error": "Timeout"}
+    if sent_minute is not None:
+        # wall_sent_at is on the engine's monotonic scale; write_run's
+        # default meta puts monotonic 0 at T0
+        line["wall_sent_at"] = sent_minute * 60.0
+    return line
 
 
 def write_run(
@@ -68,7 +73,14 @@ def write_run(
 ) -> None:
     run_dir = runs / run_id
     run_dir.mkdir(parents=True)
-    body = {"run_id": run_id, "from_day": 14, "to_day": 20, **meta}
+    body = {
+        "run_id": run_id,
+        "from_day": 14,
+        "to_day": 20,
+        "wall_start_epoch": T0.timestamp(),
+        "wall_start_monotonic": 0.0,
+        **meta,
+    }
     (run_dir / "meta.json").write_text(json.dumps(body), encoding="utf-8")
     events = [{"kind": "status_event", "order_id": "x"}, {"kind": "restock", "restock_day": 21}]
     text = "\n".join(json.dumps(line) for line in [*lines, *events]) + "\n"
@@ -226,6 +238,26 @@ def test_a_sync_region_downgraded_before_the_failover_may_lose_orders(tmp_path) 
     )
     assert result["passed"] is True
     assert result["lost_at_failover"]["order_ids"] == ["1"]
+
+
+def test_an_hq_only_failed_order_needs_a_failover_after_its_first_send(tmp_path) -> None:
+    """Every send errored, HQ has the order, its region does not: only a
+    failover after the order was first sent can have lost it."""
+    cluster = facts({"r1": []}, [("1", "r1")], failovers=[("r1", at(5))])
+    late = check(tmp_path / "late", [failed("1", sent_minute=10)], cluster)
+    assert late["passed"] is False
+    assert late["unaccounted"][0]["reason"] == "in_hq_not_in_region"
+    early = check(tmp_path / "early", [failed("1", sent_minute=1)], cluster)
+    assert early["passed"] is True
+    assert early["lost_at_failover"]["order_ids"] == ["1"]
+
+
+def test_an_hq_only_failed_order_without_a_send_time_is_unaccounted(tmp_path) -> None:
+    result = check(
+        tmp_path, [failed("1")], facts({"r1": []}, [("1", "r1")], failovers=[("r1", at(5))])
+    )
+    assert result["passed"] is False
+    assert result["unaccounted"][0]["reason"] == "in_hq_not_in_region"
 
 
 def test_in_region_but_not_at_hq_after_the_drain_is_a_relay_bug(tmp_path) -> None:

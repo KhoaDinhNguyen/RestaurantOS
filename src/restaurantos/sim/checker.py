@@ -59,6 +59,9 @@ class OrderOutcome:
     outcome: str
     region_id: str | None = None
     acked_at: datetime | None = None
+    # a failed order's first send (wall time): the region cannot have
+    # committed it earlier, so only a failover after it can lose it
+    sent_at: datetime | None = None
 
 
 @dataclass
@@ -102,24 +105,38 @@ def classify_line(line: dict[str, Any]) -> str:
     return FAILED
 
 
-def _wall_acked_at(line: dict[str, Any], meta: dict[str, Any]) -> datetime | None:
-    acked = line.get("wall_acked_at")
+def _wall_time(value: Any, meta: dict[str, Any]) -> datetime | None:
+    """A run-log wall time (the engine's monotonic scale) as a datetime:
+    epoch = wall_start_epoch + (t - wall_start_monotonic), both from the
+    same run's meta.json."""
     start_epoch = meta.get("wall_start_epoch")
     start_mono = meta.get("wall_start_monotonic")
-    if not all(isinstance(v, int | float) for v in (acked, start_epoch, start_mono)):
+    if not all(isinstance(v, int | float) for v in (value, start_epoch, start_mono)):
         return None
-    return datetime.fromtimestamp(start_epoch + (acked - start_mono), tz=UTC)
+    return datetime.fromtimestamp(start_epoch + (value - start_mono), tz=UTC)
 
 
-def _later_ack(seen: OrderOutcome, outcome: str, acked_at: datetime | None) -> bool:
-    """Whether an equal-ranked line replaces the one kept so far: only a
-    later ack of an accepted order does. The latest ack is what bounds a
-    loss - an order answered after a failover survived that failover,
-    so only a failover after its LAST ack can explain it going missing
-    (a resend, or a restored day's replay, acks an order again)."""
-    if outcome != ACCEPTED or acked_at is None:
-        return False
-    return seen.acked_at is None or acked_at > seen.acked_at
+def _wall_acked_at(line: dict[str, Any], meta: dict[str, Any]) -> datetime | None:
+    return _wall_time(line.get("wall_acked_at"), meta)
+
+
+def _replaces(seen: OrderOutcome, candidate: OrderOutcome) -> bool:
+    """Whether an equal-ranked line replaces the one kept so far.
+
+    - accepted: a later ack does. The latest ack is what bounds a loss -
+      an order answered after a failover survived that failover, so only
+      a failover after its LAST ack can explain it going missing (a
+      resend, or a restored day's replay, acks an order again).
+    - failed: the first send with a known time is kept (the earliest
+      moment the region could have committed the order).
+    """
+    if candidate.outcome == ACCEPTED:
+        if candidate.acked_at is None:
+            return False
+        return seen.acked_at is None or candidate.acked_at > seen.acked_at
+    if candidate.outcome == FAILED:
+        return seen.sent_at is None and candidate.sent_at is not None
+    return False
 
 
 def run_chain(runs_dir: Path, run_ids: Sequence[str]) -> list[str]:
@@ -176,16 +193,20 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
                 continue
             key = (channel, str(line["external_order_id"]))
             outcome = classify_line(line)
-            seen = orders.get(key)
-            acked_at = None
+            candidate = OrderOutcome(outcome, line.get("region_id"))
             if outcome == ACCEPTED:
-                acked_at = _parse_time(line.get("acked_at")) or _wall_acked_at(line, meta)
+                candidate.acked_at = _parse_time(line.get("acked_at")) or _wall_acked_at(
+                    line, meta
+                )
+            elif outcome == FAILED:
+                candidate.sent_at = _wall_time(line.get("wall_sent_at"), meta)
+            seen = orders.get(key)
             if seen is not None:
                 if _RANK[seen.outcome] > _RANK[outcome]:
                     continue
-                if seen.outcome == outcome and not _later_ack(seen, outcome, acked_at):
+                if seen.outcome == outcome and not _replaces(seen, candidate):
                     continue
-            orders[key] = OrderOutcome(outcome, line.get("region_id"), acked_at)
+            orders[key] = candidate
     if len(regions) > 1:
         raise CheckError(
             "the runs disagree on the region they replayed: "
@@ -228,13 +249,17 @@ class ClusterFacts:
 # --- the evaluation (pure) ---------------------------------------------------
 
 
-def _lost_at_failover(facts: ClusterFacts, region: str | None, acked_at: datetime | None) -> bool:
-    """True if `region` failed over after `acked_at` while replicating
-    asynchronously - the one explained way an acked order goes missing."""
-    if region is None:
+def _lost_at_failover(facts: ClusterFacts, region: str | None, after: datetime | None) -> bool:
+    """True if `region` failed over after `after` while replicating
+    asynchronously - the one explained way an order goes missing.
+    `after` is the latest ack of an acked order, or the first send of a
+    failed one. Without it nothing bounds the failover in time (any
+    failover in cluster_events, even one before the run, would match),
+    so the loss is not explained."""
+    if region is None or after is None:
         return False
     for failed_region, at in facts.failovers:
-        if failed_region != region or (acked_at is not None and at <= acked_at):
+        if failed_region != region or at <= after:
             continue
         downgraded = any(r == region and when <= at for r, when in facts.downgrades)
         if not facts.synchronous or downgraded:
@@ -300,7 +325,7 @@ def evaluate(runs: RunSet, facts: ClusterFacts, *, allow_unacked: bool = False) 
             note(key, "acked_not_stored", region)
     for key in sorted(hq - stored - acked):
         region = hq_region[key]
-        if key in failed and _lost_at_failover(facts, region, None):
+        if key in failed and _lost_at_failover(facts, region, runs.orders[key].sent_at):
             lost.append(key[1])
         else:
             note(key, "in_hq_not_in_region", region)
