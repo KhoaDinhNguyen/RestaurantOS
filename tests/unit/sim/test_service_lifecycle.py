@@ -1036,8 +1036,48 @@ def test_a_second_up_with_another_cluster_file_does_not_call_it_running(
     assert [(step.name, step.outcome) for step in other] == [("sleeper", "running-other-config")]
     assert str(three.resolve()) in other[0].detail
     assert "rosctl down sleeper" in other[0].detail
+    # the hint keeps --config: a bare `rosctl up sleeper` would read the
+    # default cluster file and hit the same mismatch again
+    assert f"--config {three.resolve()}" in other[0].detail
     assert services.up_exit_code(other) == 1
     assert services.read_pid_record(runs, "sleeper") == record  # kept
+    down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
+
+
+@requires_proc
+def test_an_unreadable_cluster_setting_is_not_a_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # "couldn't read the setting" is not "same setting": a live service
+    # whose /proc cannot say which cluster file it was started with is
+    # `config-unknown` - a failure, nothing spawned, the record kept,
+    # and no readiness probe can turn it into a success
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    one = tmp_path / "one.toml"
+    first = up_services(
+        CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, cluster_file=one, specs=[spec]
+    )
+    _track(first)
+    assert [(step.name, step.outcome) for step in first] == [("sleeper", "started")]
+    record = services.read_pid_record(runs, "sleeper")
+    real_fields = services._proc_fields
+    calls: list[int] = []
+
+    def first_real_then_none(pid: int) -> tuple[list[str], dict[str, str]] | None:
+        # the identity check reads the real value; the config check
+        # after it gets None (an unreadable /proc)
+        calls.append(pid)
+        return real_fields(pid) if len(calls) == 1 else None
+
+    monkeypatch.setattr(services, "_proc_fields", first_real_then_none)
+    second = up_services(
+        CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, cluster_file=one, specs=[spec]
+    )
+    assert [(step.name, step.outcome) for step in second] == [("sleeper", "config-unknown")]
+    assert services.up_exit_code(second) == 1
+    assert services.read_pid_record(runs, "sleeper") == record  # unchanged
+    monkeypatch.undo()
     down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
 
 
@@ -1058,11 +1098,11 @@ def test_a_signal_the_kernel_refuses_is_cannot_signal_and_the_sweep_goes_on(
     real_send = signal.pidfd_send_signal
     sent: list[int] = []
 
-    def refuse_the_first(fd: int, sig: int, *args: object) -> None:
+    def refuse_the_first(fd: int, sig: int, siginfo: None = None, flags: int = 0) -> None:
         sent.append(sig)
         if len(sent) == 1:
             raise PermissionError(1, "Operation not permitted")
-        real_send(fd, sig, *args)
+        real_send(fd, sig, siginfo, flags)
 
     monkeypatch.setattr(services.signal, "pidfd_send_signal", refuse_the_first)
     stopped = down_services(
@@ -1114,7 +1154,7 @@ def test_a_record_that_cannot_be_removed_fails_the_start(
 
 @requires_proc
 def test_a_pid_file_that_cannot_be_removed_does_not_end_the_down_sweep(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_dir: Path
 ) -> None:
     # a down of two fakes: down deals with the process and THEN
     # removes the record, and if the removal raises the outcome still
@@ -1129,6 +1169,10 @@ def test_a_pid_file_that_cannot_be_removed_does_not_end_the_down_sweep(
         CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[first_spec, second_spec]
     )
     _track(up)
+    # the fakes must have installed their SIGINT handlers before the
+    # down, or a handler that is not there yet turns stopped into
+    # killed (the round-4 CI failure, again)
+    _wait_ready(up, ready_dir)
     first_pid, second_pid = up[0].pid, up[1].pid
     assert first_pid is not None and second_pid is not None
     left_path = services.pid_path(runs, "first")
@@ -1268,11 +1312,13 @@ def test_a_lock_that_cannot_be_opened_is_reported(tmp_path: Path) -> None:
 
 @requires_proc
 def test_a_record_replaced_during_the_readiness_wait_is_left_alone(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # the readiness cleanup acts only on the launch it started: when
     # the pid file names another launch by the time the wait gives up,
-    # nothing is signalled and nothing is unlinked
+    # nothing is signalled and nothing is unlinked. The replacement is
+    # written on the probe's FIRST call, synchronised by the call
+    # itself - no thread, no sleep
     runs = tmp_path / "runs"
     spec, _port = _http_fake("slow", health="/health", delay_s=10.0)
     start = services.start_service(spec, runs_dir=runs)
@@ -1282,12 +1328,17 @@ def test_a_record_replaced_during_the_readiness_wait_is_left_alone(
     other = _spawn_raw("import time; time.sleep(300)")
     other_ticks = services._start_ticks(other)
 
-    def replace() -> None:
-        time.sleep(0.2)  # while the readiness wait is running
-        services._write_pid_file(services.pid_path(runs, "slow"), other, other_ticks)
+    real_probe = services._probe_ready
+    replaced = False
 
-    rewriter = threading.Thread(target=replace)
-    rewriter.start()
+    def probe_then_replace(spec_arg: ServiceSpec, timeout_s: float) -> bool:
+        nonlocal replaced
+        if not replaced:
+            services._write_pid_file(services.pid_path(runs, "slow"), other, other_ticks)
+            replaced = True
+        return real_probe(spec_arg, timeout_s)
+
+    monkeypatch.setattr(services, "_probe_ready", probe_then_replace)
     step = services._ready_step(
         spec,
         runs_dir=runs,
@@ -1296,7 +1347,6 @@ def test_a_record_replaced_during_the_readiness_wait_is_left_alone(
         ready_timeout_s=1.0,
         grace_s=0.0,
     )
-    rewriter.join()
     assert step.outcome == "not-ready"
     assert "replaced" in step.detail
     assert services.read_pid_record(runs, "slow") == (other, other_ticks)  # not unlinked
@@ -1401,6 +1451,19 @@ def test_the_readiness_wait_gives_up_at_the_deadline_not_the_server_s(
     assert "the service was stopped" in steps[0].detail
     assert elapsed < 4.5
     assert steps[0].pid is not None and _gone(steps[0].pid)
+
+
+def test_log_tail_reads_only_the_end_of_a_grown_log(tmp_path: Path) -> None:
+    # logs only grow: the tail reads at most the last LOG_TAIL_BYTES,
+    # never the whole file, and drops the first line of the window
+    # because it may start mid-line
+    log = services.log_path(tmp_path, "grown")
+    log.parent.mkdir(parents=True)
+    filler = ("x" * 79 + "\n") * (services.LOG_TAIL_BYTES // 79 + 10)
+    log.write_text(filler + "".join(f"line-{n}\n" for n in range(25)))
+    assert log.stat().st_size > services.LOG_TAIL_BYTES
+    tail = services.log_tail(tmp_path, "grown")
+    assert tail.splitlines() == [f"line-{n}" for n in range(5, 25)]
 
 
 def test_log_tail_survives_bytes_that_are_not_utf8(tmp_path: Path) -> None:
@@ -1607,13 +1670,15 @@ def test_up_of_one_service_prechecks_only_its_own_dials(
     monkeypatch.setattr(services, "unreachable_ports", recording_unreachable)
     cluster = Cluster(regions=3)
     spec = fake("edge-r1", ROS_MODE="edge", ROS_REGION_ID="r1")
+    # edge-r2 is on the table but not selected: if the selection were
+    # broken, its 5520 and 5521 would appear in `seen`
     steps = up_services(
         cluster,
         runs_dir=tmp_path / "runs",
         names=["edge-r1"],
         precheck=True,
         grace_s=0.0,
-        specs=[spec],
+        specs=[spec, fake("edge-r2", ROS_MODE="edge", ROS_REGION_ID="r2")],
     )
     _track(steps)
     _wait_ready(steps, ready_dir)

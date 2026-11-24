@@ -123,6 +123,8 @@ in .env, so warning on it would flag every developer on every run."""
 LOG_TAIL_LINES = 20
 """Log lines shown in an up failure message, so the message names the
 cause instead of pointing at a file."""
+LOG_TAIL_BYTES = 64 * 1024
+"""How much of the end of a log `log_tail` reads: plenty for 20 lines."""
 
 _REGION_ID = re.compile(r"r[1-9][0-9]*")
 """A canonical region id: r1, r2, ... r10 - never r0, r01 or r1x."""
@@ -385,15 +387,22 @@ def running_names(runs_dir: Path) -> list[str]:
 
 
 def log_tail(runs_dir: Path, name: str, max_lines: int = LOG_TAIL_LINES) -> str:
-    """The last lines of a service's log, for failure messages. The
-    bytes are decoded with replacement characters, because a failure
-    message must never end the up sweep with a UnicodeDecodeError of
-    its own."""
+    """The last lines of a service's log, for failure messages. Logs
+    only grow, so this reads at most the last LOG_TAIL_BYTES of the
+    file, not the whole thing. The bytes are decoded with replacement
+    characters, because a failure message must never end the up sweep
+    with a UnicodeDecodeError of its own."""
     try:
-        text = log_path(runs_dir, name).read_bytes().decode("utf-8", errors="replace")
+        with open(log_path(runs_dir, name), "rb") as fh:
+            size = fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, size - LOG_TAIL_BYTES))
+            data = fh.read()
     except OSError:
         return "(no log)"
-    return "\n".join(text.splitlines()[-max_lines:])
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if size > LOG_TAIL_BYTES:
+        lines = lines[1:]  # the first line read may start mid-line
+    return "\n".join(lines[-max_lines:])
 
 
 # --- process identity ---------------------------------------------------
@@ -887,16 +896,36 @@ def start_service(
                     # another cluster file `already-running`
                     wanted = child_env(spec, cluster_file).get("ROS_CLUSTER_FILE")
                     fields = _proc_fields(pid)
-                    live = fields[1].get("ROS_CLUSTER_FILE") if fields is not None else wanted
+                    if fields is None:
+                        # "couldn't read the setting" must never be
+                        # classed as "same setting": nothing is spawned,
+                        # the record is kept, and no readiness probe can
+                        # turn it into a success
+                        return Step(
+                            spec.name,
+                            "config-unknown",
+                            f"pid {pid}: could not read which cluster file it was "
+                            f"started with - not started again, its record kept",
+                            pid=pid,
+                            start_ticks=ticks,
+                        )
+                    live = fields[1].get("ROS_CLUSTER_FILE")
                     if live != wanted:
+                        # the hint keeps --config when up was given one:
+                        # a bare `rosctl up <name>` would read the default
+                        # cluster file and hit the same mismatch again
+                        hint = (
+                            f"then rosctl up {spec.name} --config {wanted}"
+                            if wanted
+                            else f"then rosctl up {spec.name}"
+                        )
                         return Step(
                             spec.name,
                             "running-other-config",
                             f"pid {pid} is running with ROS_CLUSTER_FILE="
                             f"{live or '(unset)'}, not {wanted or '(unset)'} - left "
                             f"running, its record kept; run rosctl down {spec.name} "
-                            f"then rosctl up {spec.name} to start it with the requested "
-                            f"cluster file",
+                            f"{hint} to start it with the requested cluster file",
                             pid=pid,
                             start_ticks=ticks,
                         )
@@ -1392,11 +1421,12 @@ def down_services(
 def up_exit_code(steps: Sequence[Step]) -> int:
     """`up` fails when a service could not be started, could not be
     launched, never became ready, is running but not answering its
-    readiness route, is running for another cluster file, or is in a
-    state up could not resolve (`still-starting`: a live record up can
-    neither confirm nor rule out, and no readiness answer either). An
-    already-running AND ready service is the idempotent case, and so is
-    `running-unverified` (identity not provable, but the readiness
+    readiness route, is running for another cluster file, is running
+    with a cluster setting up could not read (`config-unknown`), or is
+    in a state up could not resolve (`still-starting`: a live record up
+    can neither confirm nor rule out, and no readiness answer either).
+    An already-running AND ready service is the idempotent case, and so
+    is `running-unverified` (identity not provable, but the readiness
     route answers): neither is a failure."""
     bad = {
         "port-in-use",
@@ -1405,6 +1435,7 @@ def up_exit_code(steps: Sequence[Step]) -> int:
         "launch-failed",
         "running-not-ready",
         "running-other-config",
+        "config-unknown",
         "still-starting",
     }
     return 1 if any(step.outcome in bad for step in steps) else 0
