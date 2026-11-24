@@ -8,6 +8,7 @@ drives playback's restock events, so it lives here with them.
 from __future__ import annotations
 
 from functools import cache
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -95,11 +96,50 @@ class SimSettings(BaseSettings):
     # `rosctl playback start` while its run is live.
     control_host: str = "127.0.0.1"
     control_port: int = Field(default=8002, ge=1, le=65535)
-    # Origins (scheme://host[:port]) allowed to send state-changing
-    # requests to the control API. CLI clients (rosctl, curl) send no
-    # Origin and need nothing; a browser page (WP7) must be served from
-    # a listed origin. Empty means CLI-only.
+    # Exact origins (scheme://host[:port], comma-separated) allowed to
+    # call the control API from a browser: they get CORS headers and
+    # pass the origin guard. CLI clients (rosctl, curl) send no Origin
+    # and need nothing. Empty means CLI-only. Entries are validated by
+    # parse_allowed_origins: an invalid one stops the process at startup.
     control_allowed_origins: str = ""
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def normalise_origin(raw: str) -> str:
+    """The canonical form of an origin: lowercase scheme and host, no
+    trailing slash, no default port. This is exactly the string a
+    browser sends in an Origin header, so both the CORS middleware and
+    the origin guard can compare origins as plain strings."""
+    parsed = urlsplit(raw.strip().rstrip("/"))
+    if (
+        parsed.scheme not in _DEFAULT_PORTS
+        or not parsed.hostname
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(f"invalid origin: {raw!r}")
+    host = parsed.hostname  # urlsplit already lower-cases it
+    if ":" in host:  # an IPv6 literal needs its brackets back
+        host = f"[{host}]"
+    port = parsed.port
+    if port is None or port == _DEFAULT_PORTS[parsed.scheme]:
+        return f"{parsed.scheme}://{host}"
+    return f"{parsed.scheme}://{host}:{port}"
+
+
+def parse_allowed_origins(value: str) -> tuple[str, ...]:
+    """The allowlist setting as normalised origins (deduped, order kept).
+
+    Raises ValueError on an invalid entry - so a process that builds a
+    control app fails at startup instead of silently ignoring part of
+    its configuration."""
+    items = [item for item in (entry.strip() for entry in value.split(",")) if item]
+    return tuple(dict.fromkeys(normalise_origin(item) for item in items))
 
 
 @cache

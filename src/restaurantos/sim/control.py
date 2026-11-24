@@ -58,7 +58,7 @@ def make_control_app(playback: Playback) -> FastAPI:
     app = FastAPI(title="RestaurantOS playback control", docs_url="/docs")
     # state-changing playback commands get the same cross-site rejection
     # as the control routes (the control process embeds both)
-    from restaurantos.sim.control_api import add_origin_guard
+    from restaurantos.sim.control_api import add_origin_guard, configure_control_cors
 
     add_origin_guard(app)
 
@@ -137,5 +137,10 @@ def make_control_app(playback: Playback) -> FastAPI:
     async def sim_playback_speed(change: PlaybackSpeed) -> dict[str, Any]:
         await playback.set_speed(change.speed)
         return playback.status()
+
+    # last: CORS must sit outside the origin guard, so its 403s carry
+    # CORS headers and a listed browser client can read them. No-op when
+    # add_control_routes already registered it (the flag guards it).
+    configure_control_cors(app)
 
     return app

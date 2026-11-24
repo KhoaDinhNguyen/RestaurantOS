@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 
 import httpx
 import pytest
@@ -281,3 +282,165 @@ async def test_the_playback_routes_get_the_same_guard() -> None:
         served = await playback_client.post("/sim/playback", json={"action": "pause"})
         assert served.status_code == 200
         assert calls == ["pause"]
+
+
+# --- CORS: browser clients read answers, the guard blocks (round 3) --------
+
+
+def test_origin_normalisation() -> None:
+    from restaurantos.sim.config import normalise_origin, parse_allowed_origins
+
+    assert normalise_origin("HTTP://LocalHost:5173/") == "http://localhost:5173"
+    assert normalise_origin("https://x.test:443") == "https://x.test"
+    assert normalise_origin(" http://[::1]:8002 ") == "http://[::1]:8002"
+    for bad in (
+        "*",
+        "null",
+        "localhost:5173",
+        "http://localhost:5173/app",
+        "http://localhost:5173?q=1",
+        "ftp://x.test",
+        "http://user:pass@localhost:5173",
+        "",
+    ):
+        with pytest.raises(ValueError, match=re.escape(bad) if bad else "invalid origin"):
+            normalise_origin(bad)
+    # duplicates (after normalisation) collapse, order is kept
+    assert parse_allowed_origins("http://a.test:1, http://a.test:1/,http://b.test") == (
+        "http://a.test:1",
+        "http://b.test",
+    )
+    assert parse_allowed_origins("") == ()
+    # one bad entry is enough to reject the whole setting
+    with pytest.raises(ValueError):
+        parse_allowed_origins("http://ok.test,*")
+
+
+@pytest.fixture
+def cors_allowlist(monkeypatch):
+    from restaurantos.sim.config import get_sim_settings
+
+    get_sim_settings.cache_clear()
+    monkeypatch.setenv("ROS_SIM_CONTROL_ALLOWED_ORIGINS", "http://localhost:5173")
+    get_sim_settings.cache_clear()
+    yield
+    get_sim_settings.cache_clear()
+
+
+async def test_a_preflight_from_a_listed_origin_is_answered(cors_allowlist, app_and_client) -> None:
+    client = app_and_client[1]
+    response = await client.options(
+        "/sim/faults/heal-all",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+    assert "POST" in response.headers["Access-Control-Allow-Methods"]
+    assert "Access-Control-Allow-Credentials" not in response.headers
+
+
+async def test_a_preflight_from_an_unlisted_origin_fails(cors_allowlist, app_and_client) -> None:
+    response = await app_and_client[1].options(
+        "/sim/faults/heal-all",
+        headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "POST"},
+    )
+    assert response.status_code == 400
+    assert "Access-Control-Allow-Origin" not in response.headers
+
+
+async def test_a_preflight_for_an_unlisted_header_fails(cors_allowlist, app_and_client) -> None:
+    response = await app_and_client[1].options(
+        "/sim/faults/heal-all",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "x-foo",
+        },
+    )
+    assert response.status_code == 400
+
+
+async def test_a_listed_origin_post_carries_cors_headers(cors_allowlist, app_and_client) -> None:
+    response = await app_and_client[1].post(
+        "/sim/faults/heal-all",
+        headers={"Origin": "http://localhost:5173", "Sec-Fetch-Site": "same-site"},
+    )
+    assert response.status_code == 200
+    assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+
+
+async def test_an_unlisted_origin_post_reaches_the_guard_without_cors_headers(
+    cors_allowlist, app_and_client
+) -> None:
+    # CORS does not block real requests: the guard does, and its 403
+    # carries no CORS headers for an origin the browser must not read
+    response = await app_and_client[1].post(
+        "/sim/faults/heal-all", headers={"Origin": "http://evil.example"}
+    )
+    assert response.status_code == 403
+    assert "Access-Control-Allow-Origin" not in response.headers
+
+
+async def test_the_guards_403_carries_cors_headers(cors_allowlist, app_and_client) -> None:
+    # layer ordering: CORS sits outside the guard, so a listed origin
+    # can read even the rejection (the UI shows the message instead of
+    # a vague "CORS error")
+    response = await app_and_client[1].post(
+        "/sim/faults/heal-all",
+        headers={"Origin": "http://localhost:5173", "Sec-Fetch-Site": "cross-site"},
+    )
+    assert response.status_code == 403
+    assert response.headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
+
+
+async def test_cli_requests_get_no_cors_headers(app_and_client) -> None:
+    response = await app_and_client[1].post("/sim/faults/heal-all")
+    assert response.status_code == 200
+    assert "Access-Control-Allow-Origin" not in response.headers
+
+
+async def test_an_empty_allowlist_answers_no_preflights(app_and_client) -> None:
+    # the default is CLI-only: no CORS middleware, so a preflight-looking
+    # OPTIONS falls through to the router (405) with no CORS headers
+    response = await app_and_client[1].options(
+        "/sim/faults/heal-all",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert response.status_code == 405
+    assert "Access-Control-Allow-Origin" not in response.headers
+
+
+async def test_cors_methods_cover_every_route(server) -> None:
+    """Drift: a new route using a method outside CONTROL_CORS_METHODS
+    would silently break browser access (its preflight would 400)."""
+    from fastapi.routing import APIRoute
+
+    from restaurantos.sim.control import make_control_app
+    from restaurantos.sim.control_api import CONTROL_CORS_METHODS
+
+    class StubPlayback:
+        def clock(self) -> dict:
+            return {}
+
+        def status(self) -> dict:
+            return {}
+
+    app = make_control_app(StubPlayback())  # type: ignore[arg-type]
+    add_control_routes(
+        app,
+        faults=FaultLayer(server.client(), link_groups(CLUSTER)),
+        nodes=Nodes(CLUSTER, compose=FakeCompose({"r1-primary"})),
+        jobs=JobRunner(),
+    )
+    used = {m for r in app.routes if isinstance(r, APIRoute) for m in r.methods} - {
+        "HEAD",
+        "OPTIONS",
+    }
+    assert used <= set(CONTROL_CORS_METHODS), used - set(CONTROL_CORS_METHODS)

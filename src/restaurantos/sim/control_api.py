@@ -12,10 +12,11 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from restaurantos.sim.config import get_sim_settings
+from restaurantos.sim.config import get_sim_settings, normalise_origin, parse_allowed_origins
 from restaurantos.sim.faults import FaultError, FaultExistsError, FaultLayer
 from restaurantos.sim.jobs import JobRunner, UnknownJobError
 from restaurantos.sim.nodes import NodeError, Nodes, UnknownNodeError
@@ -38,18 +39,13 @@ def _toxiproxy_down(error: ToxiproxyError) -> JSONResponse:
 
 # --- cross-site protection -------------------------------------------------
 
+# Every method the control routes use; CORSMiddleware needs them listed
+# explicitly (its default allows GET only, which would fail every POST
+# preflight). A drift test in test_control_api.py walks app.routes and
+# fails when a new route uses a method missing here.
+CONTROL_CORS_METHODS = ("GET", "POST", "PATCH", "DELETE")
+
 _STATE_CHANGING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
-
-
-def _normalise_origin(origin: str) -> str:
-    """Normalise for exact comparison: scheme and host compare
-    case-insensitively, a trailing slash is dropped."""
-    return origin.strip().rstrip("/").lower()
-
-
-def allowed_origins(raw: str) -> set[str]:
-    """The configured allowlist as normalised origins."""
-    return {_normalise_origin(origin) for origin in raw.split(",") if origin.strip()}
 
 
 def _rejected() -> JSONResponse:
@@ -76,12 +72,48 @@ def add_origin_guard(app: FastAPI) -> None:
                 return _rejected()
             origin = request.headers.get("origin")
             if origin is not None:
-                allowlist = allowed_origins(get_sim_settings().control_allowed_origins)
+                allowlist = parse_allowed_origins(get_sim_settings().control_allowed_origins)
                 # the literal "null" origin is never allowlisted: it is
                 # what a sandboxed iframe or a redirected form sends
-                if origin == "null" or _normalise_origin(origin) not in allowlist:
+                try:
+                    normalised = normalise_origin(origin)
+                except ValueError:
+                    # a malformed Origin never matches an allowlist entry
+                    normalised = None
+                if origin == "null" or normalised not in allowlist:
                     return _rejected()
         return await call_next(request)
+
+
+def configure_control_cors(app: FastAPI) -> None:
+    """Exact-allowlist CORS for browser clients (WP7), same allowlist as
+    the origin guard: `parse_allowed_origins` validates the setting here,
+    so a bad entry stops the process at startup.
+
+    CORSMiddleware only decides whether the browser may *read* answers
+    and answers preflights itself; it does not block real requests -
+    the origin guard does that. It must sit outside the guard (be added
+    after it), so the guard's 403s carry CORS headers and the UI can
+    show the message instead of a vague "CORS error". An empty allowlist
+    (the default, CLI-only) registers no CORS middleware at all."""
+    if getattr(app.state, "control_cors", False):
+        return
+    app.state.control_cors = True
+    origins = parse_allowed_origins(get_sim_settings().control_allowed_origins)
+    if not origins:
+        return
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(origins),
+        allow_methods=list(CONTROL_CORS_METHODS),
+        # JSON bodies make every browser POST/PATCH a non-simple request,
+        # so its preflight always asks for content-type; this Starlette
+        # (1.10) checks requested headers strictly against this list
+        allow_headers=["content-type"],
+        allow_credentials=False,  # no cookies involved
+        expose_headers=[],
+        max_age=600,
+    )
 
 
 def add_control_routes(app: FastAPI, *, faults: FaultLayer, nodes: Nodes, jobs: JobRunner) -> None:
@@ -163,3 +195,6 @@ def add_control_routes(app: FastAPI, *, faults: FaultLayer, nodes: Nodes, jobs: 
             return jobs.get(job_id).as_dict()
         except UnknownJobError:
             return error_response(404, "unknown_job", f"no job {job_id!r}")
+
+    # added after the guard: CORS must be the outermost middleware
+    configure_control_cors(app)
