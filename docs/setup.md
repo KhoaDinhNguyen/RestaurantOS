@@ -176,17 +176,23 @@ docker run --rm \
 Every entry also loads the repository root `.env` (`env_file`, `required: false`), the same file a host-mode service reads, so the two modes agree on the settings the entries do not set - the database credentials and the timeouts. That includes the identity keys: as in host mode, a key an entry does not set falls back to `.env`, so keep `ROS_CLIENT`, `ROS_MODE`, `ROS_REGION_ID` and `ROS_RELAY_ROLE` out of it. The explicit `environment:` block of an entry always wins over `.env`.
 
 ```bash
+# the env-file flag bootstrap itself uses: passed only when the file
+# exists, because Compose fails on a missing one
+env_args=(); [ -f .env ] && env_args=(--env-file .env)
+
 # start every service container (after `uv run rosctl bootstrap`)
-docker compose -p restaurantos -f infra/generated/compose.yaml \
+docker compose -p restaurantos "${env_args[@]}" -f infra/generated/compose.yaml \
   --profile services up -d --wait
 
 # stop the service containers WITHOUT touching the databases (one region;
 # an N-region cluster also has relay-r<n> and edge-r<n> for every region)
-docker compose -p restaurantos -f infra/generated/compose.yaml \
+docker compose -p restaurantos "${env_args[@]}" -f infra/generated/compose.yaml \
   --profile services stop gateway coordinator hq-worker relay-r1 edge-r1
-docker compose -p restaurantos -f infra/generated/compose.yaml \
+docker compose -p restaurantos "${env_args[@]}" -f infra/generated/compose.yaml \
   --profile services rm -f gateway coordinator hq-worker relay-r1 edge-r1
 ```
+
+The `env_args` line matches bootstrap: without `--env-file`, Compose does not read the root `.env` on its own, a `ROS_POSTGRES_IMAGE` override is lost, and the databases get recreated when the services start.
 
 `docker compose ps` then shows each service as healthy (the entry's healthcheck is a stdlib `urllib.request` call against its readiness route - the image has no curl). Never a bare `docker compose down` to stop the services: it removes the database containers as well. A fresh `rosctl bootstrap` tears the service containers down with the rest of the cluster.
 
