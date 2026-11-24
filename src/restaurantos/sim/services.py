@@ -493,15 +493,17 @@ def _alive(pid: int) -> bool:
 def _liveness(pid: int) -> Literal["alive", "dead", "unknown"]:
     """Whether `pid` names a running process - three answers, because
     "cannot tell" must not be read as "not running". `dead`: the pid
-    does not answer kill(pid, 0), or /proc/<pid>/stat is missing, or
-    its state is a zombie (exited, not reaped) or dying. `alive`: the
-    state was read and is anything else, or the process belongs to
-    another user (PermissionError means it exists). `unknown`: any
-    other problem reading /proc - a hidepid mount, say. `start` and
-    `stop` both branch on this FIRST, before the identity proofs: a
-    `dead` record is simply replaced by the next `up` (the most
-    common use after a crash), and an `unknown` one is reported, never
-    acted on."""
+    does not answer kill(pid, 0), or its state is a zombie (exited,
+    not reaped) or dying. `alive`: the state was read and is anything
+    else, or the process belongs to another user (PermissionError
+    means it exists). `unknown`: any other problem reading /proc - a
+    hidepid mount, say, or a stat entry that went missing while the
+    pid still answers (a missing entry ALONE is not proof of exit:
+    the kernel is asked again, and only a pid that no longer answers
+    is dead). `start` and `stop` both branch on this FIRST, before
+    the identity proofs: a `dead` record is simply replaced by the
+    next `up` (the most common use after a crash), and an `unknown`
+    one is reported, never acted on."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -511,7 +513,16 @@ def _liveness(pid: int) -> Literal["alive", "dead", "unknown"]:
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
     except FileNotFoundError:
-        return "dead"
+        # a missing stat is not proof of exit: the entry may be
+        # unreadable rather than gone. Ask the kernel once more - only
+        # a pid that no longer answers kill(0) between the two checks
+        # has exited; anything else (still answers, or another user's)
+        # is unknown, never dead
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "dead"
+        return "unknown"
     except OSError:
         return "unknown"
     try:
@@ -735,11 +746,29 @@ def _service_lock(runs_dir: Path, name: str) -> Iterator[None]:
         os.close(fd)
 
 
+def _drop_record(runs_dir: Path, name: str) -> Step | None:
+    """Remove a pid record `up` no longer obeys - one guard for every
+    branch that drops one (malformed, dead, mismatch): a record that
+    cannot be removed must stop the start (`launch-failed`, nothing
+    spawns) rather than leave a new child running beside a record
+    that names a dead launch. Returns None on success."""
+    try:
+        pid_path(runs_dir, name).unlink(missing_ok=True)
+    except OSError as error:
+        return Step(
+            name,
+            "launch-failed",
+            f"could not remove the record {pid_path(runs_dir, name)}: {error}",
+        )
+    return None
+
+
 def start_service(
     spec: ServiceSpec,
     *,
     runs_dir: Path,
     cluster_file: Path | None = None,
+    ready_timeout_s: float = READY_TIMEOUT_S,
 ) -> Step:
     """Start one service as a detached child and record its pid. The
     start of one name is serialized by the per-service lock, so two
@@ -777,21 +806,18 @@ def start_service(
         if isinstance(record, str):
             # up owns its own pid file: a malformed or unreadable one
             # is replaced, not obeyed (down leaves it for a person)
-            try:
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-            except OSError as error:
-                return Step(
-                    spec.name,
-                    "launch-failed",
-                    f"could not replace the record {pid_path(runs_dir, spec.name)}: {error}",
-                )
+            failed = _drop_record(runs_dir, spec.name)
+            if failed is not None:
+                return failed
         elif record is not None:
             pid, ticks = record
             how = _liveness(pid)
             if how == "dead":
                 # the recorded launch has exited: up restarts it - the
                 # most common way up is used, after a crash
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+                failed = _drop_record(runs_dir, spec.name)
+                if failed is not None:
+                    return failed
             elif how == "unknown":
                 return Step(
                     spec.name,
@@ -802,13 +828,15 @@ def start_service(
                 who = identity(pid, ticks, spec)
                 if who == "match":
                     # running - but an HTTP service must really answer
-                    # its readiness route before up calls it started
-                    if spec.port is not None and not _probe_ready(spec, READY_TIMEOUT_S):
+                    # its readiness route before up calls it started;
+                    # the caller's ready timeout decides how long the
+                    # re-probe may take, not the module constant
+                    if spec.port is not None and not _probe_ready(spec, ready_timeout_s):
                         return Step(
                             spec.name,
                             "running-not-ready",
                             f"pid {pid} is running but not answering {spec.ready} on "
-                            f"port {spec.port} within {READY_TIMEOUT_S}s - left running, "
+                            f"port {spec.port} within {ready_timeout_s}s - left running, "
                             f"its record kept; run rosctl down {spec.name} then "
                             f"rosctl up {spec.name} to restart it",
                             pid=pid,
@@ -827,7 +855,9 @@ def start_service(
                         "still-starting",
                         "another launch is still coming up - not started again",
                     )
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+                failed = _drop_record(runs_dir, spec.name)
+                if failed is not None:
+                    return failed
         if spec.port is not None and port_in_use(spec.port):
             return Step(
                 spec.name,
@@ -1165,7 +1195,12 @@ def up_services(
             raise PrecheckError(precheck_message(cluster, unreachable))
     steps: list[Step] = []
     for spec in selected:
-        step = start_service(spec, runs_dir=runs_dir, cluster_file=cluster_file)
+        step = start_service(
+            spec,
+            runs_dir=runs_dir,
+            cluster_file=cluster_file,
+            ready_timeout_s=ready_timeout_s,
+        )
         steps.append(step)
         if step.outcome != "started":
             continue

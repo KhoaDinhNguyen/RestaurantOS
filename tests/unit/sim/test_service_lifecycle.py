@@ -772,7 +772,7 @@ def test_an_unreadable_record_is_malformed_in_down_and_launch_failed_in_up(
         ],
     )
     assert steps[0].outcome == "launch-failed"
-    assert "could not replace the record" in steps[0].detail
+    assert "could not remove the record" in steps[0].detail
     assert services.up_exit_code(steps) == 1
 
 
@@ -879,6 +879,31 @@ def test_a_proc_that_cannot_be_read_makes_liveness_unknown(
 
 
 @requires_proc
+def test_a_missing_stat_entry_is_not_proof_of_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # /proc/<pid>/stat can be MISSING while the pid still answers
+    # (procfs visibility is not liveness): the kernel is asked again,
+    # and only a pid that no longer answers kill(0) is dead. A live
+    # pid with a missing entry is unknown, and `up` keeps its record
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    first = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(first)
+    pid = first[0].pid
+    assert pid is not None and services._alive(pid)
+
+    def vanished(*args: object, **kwargs: object) -> str:
+        raise FileNotFoundError("no stat entry")
+
+    monkeypatch.setattr(services.Path, "read_text", vanished)
+    assert services._liveness(pid) == "unknown"
+    second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    assert second[0].outcome == "still-starting"
+    assert services.read_pid_record(runs, "sleeper") == (pid, first[0].start_ticks)  # kept
+
+
+@requires_proc
 def test_a_second_up_reports_a_running_service_that_is_not_ready(tmp_path: Path) -> None:
     # an already-running HTTP service must really answer its readiness
     # route before a second `up` calls it started: running but broken
@@ -888,6 +913,7 @@ def test_a_second_up_reports_a_running_service_that_is_not_ready(tmp_path: Path)
     first = services.start_service(spec, runs_dir=runs)
     _track([first])
     assert first.outcome == "started"
+    t0 = time.monotonic()
     second = up_services(
         CLUSTER,
         runs_dir=runs,
@@ -896,6 +922,11 @@ def test_a_second_up_reports_a_running_service_that_is_not_ready(tmp_path: Path)
         ready_timeout_s=0.5,
         specs=[spec],
     )
+    elapsed = time.monotonic() - t0
+    # the already-running re-probe runs on the CALLER'S ready timeout,
+    # not the module constant: a 0.5 s budget decides in well under
+    # 1.5 s even though the 404 makes the probe retry to its deadline
+    assert elapsed < 1.5
     assert second[0].outcome == "running-not-ready"
     assert "rosctl down broken" in second[0].detail
     assert services.up_exit_code(second) == 1
@@ -904,25 +935,67 @@ def test_a_second_up_reports_a_running_service_that_is_not_ready(tmp_path: Path)
 
 
 @requires_proc
+def test_a_record_that_cannot_be_removed_fails_the_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # every branch that drops a record it no longer obeys (dead,
+    # mismatch, malformed) goes through one guard: an unlink that
+    # fails must stop the start - launch-failed, nothing spawned -
+    # rather than leave a new child running beside a record that
+    # names a dead launch
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    first = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(first)
+    pid = first[0].pid
+    assert pid is not None
+    fd = os.pidfd_open(pid)
+    signal.pidfd_send_signal(fd, signal.SIGKILL)
+    os.close(fd)
+    assert _wait_gone(pid)
+    record = services.read_pid_record(runs, "sleeper")
+    assert isinstance(record, tuple)
+
+    def denied(*args: object, **kwargs: object) -> None:
+        raise PermissionError("no removing")
+
+    monkeypatch.setattr(services.Path, "unlink", denied)
+    second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    assert second[0].outcome == "launch-failed"
+    assert "could not remove the record" in second[0].detail
+    # nothing spawned: the record still names the dead launch
+    assert services.read_pid_record(runs, "sleeper") == record
+    assert services.up_exit_code(second) == 1
+
+
+@requires_proc
 def test_a_lock_that_cannot_be_opened_is_reported(tmp_path: Path) -> None:
     # a directory where the per-service lock file goes: up reports
     # launch-failed and spawns nothing, down reports lock-failed and
-    # signals nothing - the lock stays mandatory, never skipped
+    # signals nothing - the lock stays mandatory, never skipped. ONE
+    # up call proves the sweep carries on inside the call: the second
+    # service starts although the first failed
     runs = tmp_path / "runs"
     (runs / "services").mkdir(parents=True)
     (runs / "services" / "sleeper.lock").mkdir()
     spec = fake("sleeper", ROS_CLIENT="sleeper")
-    steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
-    assert steps[0].outcome == "launch-failed"
+    steps = up_services(
+        CLUSTER,
+        runs_dir=runs,
+        precheck=False,
+        grace_s=0.0,
+        specs=[spec, fake("other")],
+    )
+    assert [(s.name, s.outcome) for s in steps] == [
+        ("sleeper", "launch-failed"),
+        ("other", "started"),
+    ]
     assert "could not open the lock" in steps[0].detail
     assert services.up_exit_code(steps) == 1
+    _track(steps[1:])
     steps = down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
     assert steps[0].outcome == "lock-failed"
     assert services.down_exit_code(steps) == 1
-    # and the next service still starts: the sweep carries on
-    steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[fake("other")])
-    _track(steps)
-    assert steps[0].outcome == "started"
     down_services(CLUSTER, runs_dir=runs, names=["other"], specs=[fake("other")])
 
 
@@ -1000,27 +1073,29 @@ def test_a_concurrent_start_waits_for_the_stop_to_release_the_lock(
 def test_the_readiness_wait_gives_up_at_the_deadline_not_the_server_s(
     tmp_path: Path, ready_dir: Path
 ) -> None:
-    # a server that ACCEPTS the connection and then sleeps 5 s before
-    # answering (the slow-answer case, not a refused connection), with
-    # a 0.5 s readiness budget: the probe's timeout is the time
-    # REMAINING, so up gives up within about a second - not after the
-    # server's 5
+    # a server that ACCEPTS the connection and then sleeps 30 s
+    # before answering (the slow-answer case, not a refused
+    # connection), with a 3 s readiness budget - room for the child
+    # to start and bind even on a slow runner under coverage, so the
+    # test cannot fail for a reason it does not mean: the probe's
+    # timeout is the time REMAINING, so up gives up at its own ~3 s
+    # deadline, not at the server's 30
     runs = tmp_path / "runs"
-    spec, _port = _http_fake("slow", health="/health", answer_delay_s=5.0)
+    spec, _port = _http_fake("slow", health="/health", answer_delay_s=30.0)
     t0 = time.monotonic()
     steps = up_services(
         CLUSTER,
         runs_dir=runs,
         precheck=False,
         grace_s=0.0,
-        ready_timeout_s=0.5,
+        ready_timeout_s=3.0,
         specs=[spec],
     )
     elapsed = time.monotonic() - t0
     assert (ready_dir / "hit").exists()  # the probe really connected
     assert steps[0].outcome == "not-ready"
     assert "the service was stopped" in steps[0].detail
-    assert elapsed < 2.5
+    assert elapsed < 4.5
     assert steps[0].pid is not None and _gone(steps[0].pid)
 
 

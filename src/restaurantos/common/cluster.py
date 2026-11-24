@@ -78,6 +78,27 @@ class Cluster:
                 f"edge API ports would reach {highest_edge}, above the highest TCP "
                 f"port 65535; use fewer regions ({self.regions})"
             )
+        # Last and most general: no two ports the cluster derives may
+        # be the same, whatever shape caused it - at about 250 regions
+        # a node's host port walks into the gateway's 8000, and a low
+        # proxy base walks a proxy into any of them. One list of every
+        # derived port with its owner, and a duplicate raises naming
+        # the port and both owners, so a person can see which knob to
+        # turn. proxies(), host_port() and service_port() are module
+        # functions, so they can be called on self here.
+        derived: list[tuple[int, str]] = [
+            (TOXIPROXY_API_PORT, "the Toxiproxy API's"),
+            *[(proxy.port, f"proxy {proxy.name}'s") for proxy in proxies(self)],
+            *[(host_port(self, node), f"{node}'s host port") for node in self.nodes],
+            (host_port(self, BASELINE), "baseline's host port"),
+            *[(port, f"the {name}'s") for name, port in SERVICE_PORTS.items()],
+            *[(service_port(self, f"edge-{rid}"), f"edge-{rid}'s") for rid in self.region_ids],
+        ]
+        taken: dict[int, str] = {}
+        for port, owner in derived:
+            if port in taken:
+                raise ValueError(f"port {port} is both {taken[port]} and {owner}")
+            taken[port] = owner
 
     @property
     def region_ids(self) -> list[str]:
