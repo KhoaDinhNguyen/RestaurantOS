@@ -241,7 +241,24 @@ class FakeHost:
             self.run_id = body["run_id"]
             run_dir = self.runs_dir / self.run_id
             run_dir.mkdir(parents=True)
-            (run_dir / "meta.json").write_text(json.dumps(self.engine_meta), encoding="utf-8")
+            skip = body.get("skip_first_restock", False)
+            meta = {
+                **self.engine_meta,
+                "run_id": self.run_id,
+                "from_day": body["from_day"],
+                "to_day": body["to_day"],
+                # the engine's restock days for the window (W=14, R=7)
+                "restock": {
+                    "days": [
+                        day
+                        for day in (21, 28)
+                        if body["from_day"] <= day and not (skip and day == body["from_day"])
+                    ],
+                    "skipped_first": skip,
+                },
+            }
+            (run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            (run_dir / "orders.jsonl").write_text("", encoding="utf-8")
             self.state, self.day, self.offset = "running", body["from_day"], 0
             self.speed_value = body["speed"]
         return httpx.Response(200, json={"state": self.state})
@@ -271,6 +288,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 "duplicate_rate": 0.05,
                 "shuffle": False,
                 "target_url": "http://127.0.0.1:8000/api/v1",
+                "restock": {"days": [21, 28], "skipped_first": False},
             }
         ),
         encoding="utf-8",
@@ -656,6 +674,47 @@ async def test_restore_skips_the_restock_of_a_day_it_already_had(world) -> None:
     await restore("restocked", ctx)
     start = next(body for body in host.commands if body["action"] == "start")
     assert start["from_day"] == 21 and start["skip_first_restock"] is True
+
+
+async def test_a_second_restore_of_the_same_day_does_not_restock_again(world) -> None:
+    """Restore a day-21 snapshot: the resumed run skips day 21's restock,
+    so its own restock days no longer hold 21. Save THAT run later on day
+    21 and restore it: the restock still went out (in its parent run)."""
+    ctx, host, _, _, _ = world
+    host.day = 21
+    await save("first", ctx)
+    await restore("first", ctx)
+    assert host.run_id == "run-a-r1"
+    host.commands.clear()
+    await save("second", ctx)  # the resumed run, still on day 21
+    await restore("second", ctx)
+    start = next(body for body in host.commands if body["action"] == "start")
+    assert start["run_id"] == "run-a-r1-r1"
+    assert start["from_day"] == 21 and start["skip_first_restock"] is True
+
+
+def test_the_restock_decision_reads_the_runs_meta_only(tmp_path: Path) -> None:
+    from restaurantos.sim.snapshot import _restock_done
+
+    def run(meta: dict) -> Path:
+        run_dir = tmp_path / str(len(list(tmp_path.iterdir())))
+        run_dir.mkdir()
+        (run_dir / "meta.json").write_text(json.dumps(meta))
+        # a log that says otherwise is ignored: the decision is the spec's
+        (run_dir / "orders.jsonl").write_text(
+            json.dumps({"kind": "restock", "restock_day": 22}) + "\n"
+        )
+        return run_dir
+
+    plain = run({"from_day": 21, "restock": {"days": [21, 28], "skipped_first": False}})
+    assert _restock_done(plain, 21) is True
+    assert _restock_done(plain, 22) is False
+    resumed = run({"from_day": 21, "restock": {"days": [28], "skipped_first": True}})
+    assert _restock_done(resumed, 21) is True  # its parent restocked day 21
+    assert _restock_done(resumed, 28) is True  # its own later restock
+    assert _restock_done(resumed, 22) is False
+    no_restock = run({"from_day": 21, "restock": {"days": [], "skipped_first": False}})
+    assert _restock_done(no_restock, 21) is False
 
 
 async def test_restore_with_the_flag_replaces_the_cluster_file(world) -> None:

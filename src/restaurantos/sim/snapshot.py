@@ -589,16 +589,26 @@ def list_snapshots(snapshot_dir: Path) -> list[dict[str, Any]]:
 
 
 def _restock_done(run_dir: Path, day: int) -> bool:
-    log = run_dir / "orders.jsonl"
-    if not log.is_file():
-        return False
-    for text in log.read_text(encoding="utf-8").splitlines():
-        if '"restock"' not in text:
-            continue
-        line = json.loads(text)
-        if line.get("kind") == "restock" and line.get("restock_day") == day:
-            return True
-    return False
+    """Whether `day`'s midnight restock already went out for this run,
+    decided from its meta.json - the run's spec, written once at start -
+    never from the run log.
+
+    The snapshot point is past midnight of its day (save's minimum is at
+    least 1 s, and the engine dispatches in one time order with in-flight
+    at 0), so a restock day's batch has been sent and answered when:
+    - the day is in the run's own restock days, or
+    - the run is itself a restored replay of that day that skipped it
+      (`from_day == day` and `restock.skipped_first`): the restock went
+      out in the run it continues. Without this, saving a resumed run
+      again on the same day and restoring THAT would restock twice."""
+    try:
+        meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+    except OSError as error:
+        raise SnapshotError(f"the snapshot's run has no readable meta.json: {error}") from error
+    restock = meta.get("restock") or {}
+    if day in (restock.get("days") or []):
+        return True
+    return bool(restock.get("skipped_first")) and meta.get("from_day") == day
 
 
 def next_run_id(runs_dir: Path, run_id: str) -> str:
