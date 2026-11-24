@@ -569,7 +569,7 @@ async def test_save_without_a_cluster_is_refused(world: World) -> None:
     assert host.state == "running"
 
 
-async def test_restore_refuses_another_postgres_image_before_touching_anything(world: World) -> None:
+async def test_restore_refuses_another_postgres_image_first(world: World) -> None:
     ctx, host, docker, _, services = world
     await save("snap", ctx)
     docker.calls.clear()
@@ -612,7 +612,7 @@ async def test_restore_refuses_a_different_cluster_file_without_the_flag(world: 
     assert docker.calls == []
 
 
-async def test_restore_refuses_an_incomplete_snapshot_before_touching_anything(world: World) -> None:
+async def test_restore_refuses_an_incomplete_snapshot_first(world: World) -> None:
     ctx, host, docker, _, services = world
     await save("snap", ctx)
     snap = ctx.snapshot_dir / "snap"
@@ -834,10 +834,8 @@ def _command(run: dict, sim: SimSettings | None = None, **kwargs) -> tuple[str, 
 
 def test_a_run_on_the_current_settings_gets_the_minimal_command() -> None:
     command, notes = _command({"duplicate_rate": 0.0, "shuffle": False, "engine": ENGINE})
-    assert command == (
-        "rosctl playback start --from-day 23 --to-day 28 --seed 7 "
-        "--run-id run-a-r1 --speed 1000"
-    )
+    minimal = "--from-day 23 --to-day 28 --seed 7 --run-id run-a-r1 --speed 1000"
+    assert command == f"rosctl playback start {minimal}"
     assert notes == [
         "flags left out match your current settings (ROS_SIM_*, .env); if you "
         "change those first, add the flags back"

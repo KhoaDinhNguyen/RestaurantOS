@@ -949,7 +949,9 @@ async def _resume(
     host = await ctx.playback.status()
     if host is None:
         resume["started"] = False
-        resume["warnings"].append(f"no playback host at {ctx.playback.base_url}; resume with: {manual}")
+        resume["warnings"].append(
+            f"no playback host at {ctx.playback.base_url}; resume with: {manual}"
+        )
         resume["warnings"] += notes
         return resume
     # The host's engine settings are fixed when it starts; a start body
@@ -1011,7 +1013,9 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         raise UnknownSnapshotError(f"no snapshot {name!r} in {ctx.snapshot_dir}")
     record = json.loads(record_file.read_text(encoding="utf-8"))
     if not (snap / "cluster.toml").is_file():
-        raise SnapshotError(f"snapshot {name!r} is incomplete (no cluster.toml); nothing was changed")
+        raise SnapshotError(
+            f"snapshot {name!r} is incomplete (no cluster.toml); nothing was changed"
+        )
     snapshot_toml = (snap / "cluster.toml").read_text(encoding="utf-8")
     current_toml = (
         ctx.cluster_file.read_text(encoding="utf-8") if ctx.cluster_file.is_file() else None
@@ -1074,9 +1078,7 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         # let the relay drain the backlog the snapshot held behind it.
         ports = {proxy.name: proxy.port for proxy in proxies(snapshot_cluster)}
         expected_down = sorted(ports[name] for name in cut if name in ports)
-        await asyncio.to_thread(
-            ctx.services_up, snapshot_cluster, ctx.cluster_file, expected_down
-        )
+        await asyncio.to_thread(ctx.services_up, snapshot_cluster, ctx.cluster_file, expected_down)
     result: dict[str, Any] = {
         "name": name,
         "sim_day": record.get("sim_day"),
