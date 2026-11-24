@@ -92,6 +92,54 @@ def test_a_plain_down_needs_no_cluster_file(
     assert not (services_dir / "relay-r1.pid").exists()
 
 
+def test_a_named_down_needs_no_cluster_file_and_stops_only_the_named(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # no cluster.toml anywhere: a named down builds each spec from its
+    # name, so it must work without one - and touch only the services
+    # it was given
+    _host_like(tmp_path, monkeypatch)
+
+    @contextlib.contextmanager
+    def _null_lock(runs_dir: Path, name: str) -> Iterator[None]:
+        yield
+
+    monkeypatch.setattr(services, "_service_lock", _null_lock)
+    monkeypatch.setattr(services, "_liveness", lambda pid: "dead")
+    services_dir = tmp_path / "runs" / "services"
+    services_dir.mkdir(parents=True)
+    services._write_pid_file(services_dir / "relay-r1.pid", 4194000, 12345)
+    services._write_pid_file(services_dir / "relay-r2.pid", 4194001, 12346)
+    assert app(["down", "relay-r1"]) == 0
+    out = capsys.readouterr().out
+    assert "relay-r1: not-running" in out
+    assert "relay-r2" not in out
+    assert not (services_dir / "relay-r1.pid").exists()
+    assert (services_dir / "relay-r2.pid").exists()  # not named: untouched
+
+
+def test_a_named_down_with_one_bad_name_stops_nothing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # every name is resolved before the first stop, cluster file or not:
+    # one bad name means nothing is stopped, and the message lists the
+    # name patterns because there is no cluster table to list names from
+    _host_like(tmp_path, monkeypatch)
+    monkeypatch.setattr(services, "_liveness", lambda pid: "dead")
+    services_dir = tmp_path / "runs" / "services"
+    services_dir.mkdir(parents=True)
+    services._write_pid_file(services_dir / "relay-r1.pid", 4194000, 12345)
+    assert app(["down", "relay-r1", "nope"]) == 1
+    err = capsys.readouterr().err
+    assert "no service nope" in err
+    assert services.NAME_PATTERNS in err
+    assert (services_dir / "relay-r1.pid").exists()  # nothing stopped
+
+
 def test_a_services_folder_that_cannot_be_listed_is_an_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

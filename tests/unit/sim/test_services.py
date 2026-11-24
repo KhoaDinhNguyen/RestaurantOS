@@ -207,16 +207,26 @@ def test_running_names_lists_pid_files_in_down_order(tmp_path: Path) -> None:
 def test_dials_are_each_services_own_links() -> None:
     # derived from the services' connection calls, not from the proxy
     # list: the gateway and the coordinator go through their own
-    # proxies, the hq worker additionally dials HQ directly, the
-    # region relay goes through its HQ proxies and dials its own
-    # region's nodes directly, the edge dials its region directly
+    # proxies, the hq worker additionally dials both HQ nodes directly
+    # (HQPool with direct=True: after an HQ promotion the standby is
+    # the writer), the region relay goes through its HQ proxies and
+    # dials its own region's nodes directly, the edge dials its region
+    # directly
     cluster = Cluster(regions=1)
     by_name = {spec.name: spec for spec in service_specs(cluster)}
     assert dials(by_name["gateway"], cluster) == [21000, 21004, 21010, 21014]
     assert dials(by_name["coordinator"], cluster) == [21001, 21002, 21011, 21015]
-    assert dials(by_name["hq-worker"], cluster) == [21012, 21017, 5500]
+    assert dials(by_name["hq-worker"], cluster) == [21012, 21017, 5500, 5501]
     assert dials(by_name["relay-r1"], cluster) == [21013, 21019, 5510, 5511]
     assert dials(by_name["edge-r1"], cluster) == [5510, 5511]
+
+
+def test_the_hq_worker_dials_only_the_hq_primary_without_standbys() -> None:
+    # no standbys: HQPool holds hq-primary alone, so the precheck must
+    # not ask for a standby port that no container publishes
+    cluster = Cluster(regions=1, standbys=False)
+    by_name = {spec.name: spec for spec in service_specs(cluster)}
+    assert dials(by_name["hq-worker"], cluster) == [21012, 5500]
 
 
 def test_dialed_ports_are_the_childrens_own_links() -> None:
@@ -230,7 +240,7 @@ def test_dialed_ports_are_the_childrens_own_links() -> None:
     assert 21005 not in ports  # hq-primary__hq-standby: replication
     assert 21003 not in ports  # hq-standby__hq-primary: replication
     assert 21016 not in ports  # r1-standby__r1-primary: replication
-    assert 5500 in ports and 5511 in ports
+    assert 5500 in ports and 5501 in ports and 5511 in ports
     assert 8474 not in ports
     assert 5509 not in ports
     assert len(ports) == len(set(ports))

@@ -78,6 +78,7 @@ import httpx
 from restaurantos.common.cluster import (
     HOST_ADDRESS,
     HQ_PRIMARY,
+    HQ_STANDBY,
     SERVICE_PORTS,
     Cluster,
     host_port,
@@ -197,6 +198,11 @@ def _region_of(name: str) -> str | None:
             rid = name.removeprefix(prefix)
             return rid if _REGION_ID.fullmatch(rid) else None
     return None
+
+
+NAME_PATTERNS = "gateway, coordinator, hq-worker, relay-r<n>, edge-r<n>"
+"""The service names spec_for_name accepts, for messages that have no
+cluster table to list the concrete names from."""
 
 
 def spec_for_name(name: str, cluster: Cluster | None = None) -> ServiceSpec:
@@ -592,8 +598,10 @@ def dials(spec: ServiceSpec, cluster: Cluster) -> list[int]:
       reaches HQ and the regions through them, direct=False);
     - coordinator: its proxies - client `coordinator`;
     - hq-worker: its proxies - client `hq` (relay/menu.py, holding.py
-      reach the region nodes through them) - plus HQ's published port
-      (relay/holding.py dials hq-primary with direct=True);
+      reach the region nodes through them) - plus the published ports
+      of HQ's nodes (relay/holding.py opens HQPool with direct=True,
+      which dials hq-primary and, when the cluster has standbys,
+      hq-standby too: after an HQ promotion the standby is the writer);
     - relay-r<n>: its proxies - client `relay-r<n>` (relay/worker.py
       reaches HQ through them) - plus r<n>'s published node ports
       (relay/worker.py dials its own region with direct=True, primary
@@ -620,7 +628,8 @@ def dials(spec: ServiceSpec, cluster: Cluster) -> list[int]:
     if spec.name == "coordinator":
         return proxy_ports("coordinator")
     if spec.name == "hq-worker":
-        return proxy_ports("hq") + [host_port(cluster, HQ_PRIMARY)]
+        hq_nodes = [HQ_PRIMARY, HQ_STANDBY] if cluster.standbys else [HQ_PRIMARY]
+        return proxy_ports("hq") + [host_port(cluster, node) for node in hq_nodes]
     if spec.name.startswith("relay-") and rid is not None:
         return proxy_ports(f"relay-{rid}") + region_node_ports(rid)
     if spec.name.startswith("edge-") and rid is not None:
@@ -676,10 +685,12 @@ def precheck_message(cluster: Cluster, unreachable: Sequence[int]) -> str:
     more = f" (+{len(unreachable) - 5} more)" if len(unreachable) > 5 else ""
     return (
         f"nothing answers on {HOST_ADDRESS}: {shown}{more} - the cluster is not "
-        f"reachable. If the containers were stopped, bring them back with "
-        f"docker compose -p restaurantos -f infra/generated/compose.yaml up -d "
-        f"(stopping does not delete the data). If a fault test left a proxy "
-        f"disabled, the named proxies above are the suspects: "
+        f"reachable. If the containers were stopped, bring them back with the "
+        f"same Compose file they were started from (stopping does not delete "
+        f"the data): docker compose -p restaurantos -f infra/generated/compose.yaml "
+        f"up -d for a cluster built from the generated file, or docker compose "
+        f"-f infra/compose.yaml up -d for the committed dev cluster. If a fault "
+        f"test left a proxy disabled, the named proxies above are the suspects: "
         f"curl -X POST http://127.0.0.1:8474/reset re-enables every proxy and "
         f"removes every toxic. If there is no cluster yet, run "
         f"'uv run rosctl bootstrap' (it rebuilds from empty volumes). Pass "
@@ -796,7 +807,9 @@ def start_service(
     waits and sees `already-running`, or `still-starting` when the
     first launch is too young for /proc to prove anything about. An
     already-running service is reported, not duplicated (idempotent
-    `up`); a port someone else holds is reported, not fought over. Up
+    `up`), unless it was started for another cluster file
+    (`running-other-config`: stop it first); a port someone else holds
+    is reported, not fought over. Up
     owns its pid files: a malformed or unreadable record is replaced
     (when even that fails, `launch-failed` and nothing is spawned - a
     service must never run without its record). An I/O failure (log
@@ -822,6 +835,31 @@ def start_service(
             f"could not open the lock {runs_dir / 'services' / f'{spec.name}.lock'}: {error}",
         )
     with stack:
+
+        def _unresolved(pid: int, ticks: int, why: str) -> Step:
+            """A live record up can neither confirm nor rule out as its
+            own launch. Nothing is spawned and the record is kept either
+            way. An HTTP service that answers its readiness route within
+            the caller's timeout is `running-unverified` (exit 0: the
+            port up would start it on is serving); anything else is
+            `still-starting`, which up_exit_code counts as a failure -
+            up could not say the service is up."""
+            if spec.port is not None and _probe_ready(spec, ready_timeout_s):
+                return Step(
+                    spec.name,
+                    "running-unverified",
+                    f"pid {pid}: {why}, but port {spec.port} answers {spec.ready} - "
+                    f"not started again, its record kept",
+                    pid=pid,
+                    start_ticks=ticks,
+                )
+            return Step(
+                spec.name,
+                "still-starting",
+                f"pid {pid}: {why} - not started again, its record kept; if it "
+                f"never comes up, run rosctl down {spec.name} then rosctl up {spec.name}",
+            )
+
         record = read_pid_record(runs_dir, spec.name)
         if isinstance(record, str):
             # up owns its own pid file: a malformed or unreadable one
@@ -839,14 +877,29 @@ def start_service(
                 if failed is not None:
                     return failed
             elif how == "unknown":
-                return Step(
-                    spec.name,
-                    "still-starting",
-                    "another launch is still coming up - not started again",
-                )
+                return _unresolved(pid, ticks, "could not tell whether it is running")
             else:
                 who = identity(pid, ticks, spec)
                 if who == "match":
+                    # the same service - but started for the same cluster
+                    # file? A live service keeps the shape it was started
+                    # with, so up must not call a service started for
+                    # another cluster file `already-running`
+                    wanted = child_env(spec, cluster_file).get("ROS_CLUSTER_FILE")
+                    fields = _proc_fields(pid)
+                    live = fields[1].get("ROS_CLUSTER_FILE") if fields is not None else wanted
+                    if live != wanted:
+                        return Step(
+                            spec.name,
+                            "running-other-config",
+                            f"pid {pid} is running with ROS_CLUSTER_FILE="
+                            f"{live or '(unset)'}, not {wanted or '(unset)'} - left "
+                            f"running, its record kept; run rosctl down {spec.name} "
+                            f"then rosctl up {spec.name} to start it with the requested "
+                            f"cluster file",
+                            pid=pid,
+                            start_ticks=ticks,
+                        )
                     # running - but an HTTP service must really answer
                     # its readiness route before up calls it started;
                     # the caller's ready timeout decides how long the
@@ -870,10 +923,8 @@ def start_service(
                         start_ticks=ticks,
                     )
                 if who == "unknown":
-                    return Step(
-                        spec.name,
-                        "still-starting",
-                        "another launch is still coming up - not started again",
+                    return _unresolved(
+                        pid, ticks, "could not prove it is this service (still starting?)"
                     )
                 failed = _drop_record(runs_dir, spec.name)
                 if failed is not None:
@@ -1144,6 +1195,16 @@ def stop_service(
                 detail = f"{success}, but its pid file {error} - remove it by hand"
             return Step(spec.name, outcome, detail, record_error=error)
 
+        def _not_permitted(pid: int, sent: str, error: OSError) -> Step:
+            """The kernel refused the signal (another user's process, a
+            security module): `cannot-signal`, the record kept so a later
+            down can try again, and the sweep carries on."""
+            return Step(
+                spec.name,
+                "cannot-signal",
+                f"pid {pid}: {sent} was not permitted ({error}) - pid file left in place",
+            )
+
         record = read_pid_record(runs_dir, spec.name)
         if expect is not None and record != expect:
             return Step(
@@ -1200,12 +1261,16 @@ def stop_service(
                 signal.pidfd_send_signal(fd, signal.SIGINT)
             except ProcessLookupError:
                 return _stop_step("stopped", f"pid {pid} exited while down was stopping it")
+            except PermissionError as error:
+                return _not_permitted(pid, "SIGINT", error)
             if _wait_pidfd(fd, stop_timeout_s):
                 return _stop_step("stopped", f"pid {pid}")
             try:
                 signal.pidfd_send_signal(fd, signal.SIGKILL)
             except ProcessLookupError:
                 return _stop_step("stopped", f"pid {pid} exited while down was stopping it")
+            except PermissionError as error:
+                return _not_permitted(pid, "SIGKILL", error)
             if _wait_pidfd(fd, kill_timeout_s):
                 return _stop_step(
                     "killed",
@@ -1309,15 +1374,14 @@ def down_services(
     for name in names:
         spec = table.get(name)
         if spec is None:
-            if cluster is None:
-                valid = ", ".join(sorted(table))
-                raise ValueError(
-                    f"no service {name} - valid names: {valid or '(no table to name them)'}"
-                ) from None
+            # no table, or a name outside it: the name alone is enough
+            # to stop a service (its region id is part of the name, and
+            # stopping needs no port), so a named down needs no cluster
+            # file either - only a name that matches no pattern is an error
             try:
                 spec = spec_for_name(name, cluster)
             except KeyError:
-                valid = ", ".join(sorted(table))
+                valid = ", ".join(sorted(table)) or NAME_PATTERNS
                 raise ValueError(f"no service {name} - valid names: {valid}") from None
         resolved.append(spec)
     for spec in sorted(resolved, key=lambda s: _stop_key(s.name)):
@@ -1327,10 +1391,22 @@ def down_services(
 
 def up_exit_code(steps: Sequence[Step]) -> int:
     """`up` fails when a service could not be started, could not be
-    launched, never became ready, or is running but not answering its
-    readiness route; an already-running AND ready service is the
-    idempotent case, not a failure."""
-    bad = {"port-in-use", "exited-immediately", "not-ready", "launch-failed", "running-not-ready"}
+    launched, never became ready, is running but not answering its
+    readiness route, is running for another cluster file, or is in a
+    state up could not resolve (`still-starting`: a live record up can
+    neither confirm nor rule out, and no readiness answer either). An
+    already-running AND ready service is the idempotent case, and so is
+    `running-unverified` (identity not provable, but the readiness
+    route answers): neither is a failure."""
+    bad = {
+        "port-in-use",
+        "exited-immediately",
+        "not-ready",
+        "launch-failed",
+        "running-not-ready",
+        "running-other-config",
+        "still-starting",
+    }
     return 1 if any(step.outcome in bad for step in steps) else 0
 
 

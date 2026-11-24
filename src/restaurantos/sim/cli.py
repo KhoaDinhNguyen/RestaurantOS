@@ -322,8 +322,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         default=None,
-        help="cluster description to name the services from (default: "
-        "ROS_CLUSTER_FILE setting, infra/cluster.toml)",
+        help="accepted for symmetry with up and not needed: down works "
+        "from the pid files and the names, so it never reads a cluster file",
     )
 
     # D10 is implemented by WP5; rosctl only registers the command.
@@ -432,39 +432,35 @@ def app(argv: Sequence[str] | None = None) -> int:
         try:
             # the platform check first: everything below touches /proc
             require_proc()
-            if args.command == "down" and names is None:
-                # a plain down needs no cluster file at all: the pid
-                # files name the work, so a broken or missing
-                # cluster.toml must not stop it from cleaning up
-                steps = down_services(runs_dir=RUNS_DIR)
+            if args.command == "down":
+                # down needs no cluster file at all: a plain down takes
+                # its work list from the pid files, a named down builds
+                # each spec from its name (every name is checked before
+                # anything stops), so a broken or missing cluster.toml
+                # must not stop it from cleaning up
+                steps = down_services(runs_dir=RUNS_DIR, names=names)
             else:
                 # an explicit --config needs no settings; the default
                 # comes from settings (a bad .env value is a
                 # pydantic ValidationError, a ValueError - the user
                 # sees a message, not a traceback)
                 config = args.config or get_settings().cluster_file
-                if args.command == "up":
-                    # a .env key the table does not set falls through to
-                    # the child (it reads .env too); name the lines so
-                    # nobody has to hunt for why edge-r1 calls itself
-                    # coordinator
-                    for line in dotenv_identity_warnings():
-                        print(
-                            f"warning: .env sets {line}; rosctl up overrides these "
-                            f"only where the service table gives a value",
-                            file=sys.stderr,
-                        )
-                cluster = load_cluster(config)
-                if args.command == "up":
-                    steps = up_services(
-                        cluster,
-                        runs_dir=RUNS_DIR,
-                        names=names,
-                        cluster_file=config,
-                        precheck=not args.no_precheck,
+                # a .env key the table does not set falls through to the
+                # child (it reads .env too); name the lines so nobody has
+                # to hunt for why edge-r1 calls itself coordinator
+                for line in dotenv_identity_warnings():
+                    print(
+                        f"warning: .env sets {line}; rosctl up overrides these "
+                        f"only where the service table gives a value",
+                        file=sys.stderr,
                     )
-                else:
-                    steps = down_services(cluster, runs_dir=RUNS_DIR, names=names)
+                steps = up_services(
+                    load_cluster(config),
+                    runs_dir=RUNS_DIR,
+                    names=names,
+                    cluster_file=config,
+                    precheck=not args.no_precheck,
+                )
         except (PrecheckError, PlatformError, ValueError, OSError) as error:
             # a silent cluster, a platform without /proc, an unknown
             # name, a bad cluster file or .env value: the user should

@@ -55,9 +55,9 @@ SLEEPER = (
     "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); " + READY_MARK + "time.sleep(300)"
 )
 IGNORER = (
-    "import signal, sys, time; "
-    "signal.signal(signal.SIGINT, signal.SIG_IGN); "
-    "print('ready'); sys.stdout.flush(); time.sleep(300)"
+    "import os, signal, sys, time; "
+    "signal.signal(signal.SIGINT, signal.SIG_IGN); " + READY_MARK + "print('ready'); "
+    "sys.stdout.flush(); time.sleep(300)"
 )
 PRINTER = (
     "import os, signal, sys, time; "
@@ -805,10 +805,11 @@ def test_an_undecidable_identity_is_reported_by_up_and_down(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # a live record whose argv and environment cannot be read is
-    # neither ours nor not-ours: up says still-starting (not a
-    # failure), down says identity-unknown and keeps the record - and
-    # THAT is a failure, because something that may be running was
-    # not stopped
+    # neither ours nor not-ours: up says still-starting and keeps the
+    # record - a failure, because up could not say the service is up
+    # (this fake has no readiness route to settle it) - and down says
+    # identity-unknown and keeps the record, also a failure, because
+    # something that may be running was not stopped
     runs = tmp_path / "runs"
     spec = fake("sleeper", ROS_CLIENT="sleeper")
     start = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
@@ -817,7 +818,7 @@ def test_an_undecidable_identity_is_reported_by_up_and_down(
     monkeypatch.setattr(services, "_proc_fields", lambda pid: ([], {}))
     second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     assert second[0].outcome == "still-starting"
-    assert services.up_exit_code(second) == 0
+    assert services.up_exit_code(second) == 1
     assert isinstance(services.read_pid_record(runs, "sleeper"), tuple)  # kept
     stopped = down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
     assert stopped[0].outcome == "identity-unknown"
@@ -973,6 +974,108 @@ def test_a_second_up_reports_a_running_service_that_is_not_ready(tmp_path: Path)
     assert services.up_exit_code(second) == 1
     assert isinstance(services.read_pid_record(runs, "broken"), tuple)  # record kept
     down_services(CLUSTER, runs_dir=runs, names=["broken"], specs=[spec])
+
+
+@requires_proc
+def test_an_unprovable_identity_that_answers_its_readiness_route_is_not_a_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # identity cannot be proven, but the HTTP service answers its
+    # readiness route: running-unverified, exit 0, nothing spawned and
+    # the record kept - the port up would start it on is serving
+    runs = tmp_path / "runs"
+    spec, _port = _http_fake("web", health="/health")
+    first = up_services(
+        CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, ready_timeout_s=10.0, specs=[spec]
+    )
+    _track(first)
+    assert [(step.name, step.outcome) for step in first] == [("web", "started")]
+    record = services.read_pid_record(runs, "web")
+    monkeypatch.setattr(services, "_proc_fields", lambda pid: ([], {}))
+    second = up_services(
+        CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, ready_timeout_s=5.0, specs=[spec]
+    )
+    _track(second)
+    assert [(step.name, step.outcome) for step in second] == [("web", "running-unverified")]
+    assert services.up_exit_code(second) == 0
+    assert services.read_pid_record(runs, "web") == record  # kept, nothing new spawned
+    monkeypatch.undo()
+    down_services(CLUSTER, runs_dir=runs, names=["web"], specs=[spec])
+
+
+@requires_proc
+def test_a_second_up_with_another_cluster_file_does_not_call_it_running(
+    tmp_path: Path,
+) -> None:
+    # the same service, started for another cluster file, keeps the
+    # shape it was started with: up says running-other-config (a
+    # failure, record kept, the process left running) instead of
+    # already-running; the same file is still the idempotent no-op
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    one, three = tmp_path / "one.toml", tmp_path / "three.toml"
+
+    def up_with(cluster_file: Path) -> list[Step]:
+        steps = up_services(
+            CLUSTER,
+            runs_dir=runs,
+            precheck=False,
+            grace_s=0.0,
+            cluster_file=cluster_file,
+            specs=[spec],
+        )
+        _track(steps)
+        return steps
+
+    first = up_with(one)
+    assert [(step.name, step.outcome) for step in first] == [("sleeper", "started")]
+    record = services.read_pid_record(runs, "sleeper")
+    same = up_with(one)
+    assert [(step.name, step.outcome) for step in same] == [("sleeper", "already-running")]
+    other = up_with(three)
+    assert [(step.name, step.outcome) for step in other] == [("sleeper", "running-other-config")]
+    assert str(three.resolve()) in other[0].detail
+    assert "rosctl down sleeper" in other[0].detail
+    assert services.up_exit_code(other) == 1
+    assert services.read_pid_record(runs, "sleeper") == record  # kept
+    down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
+
+
+@requires_proc
+def test_a_signal_the_kernel_refuses_is_cannot_signal_and_the_sweep_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_dir: Path
+) -> None:
+    # pidfd_send_signal can raise PermissionError (another user's
+    # process, a security module): that service is cannot-signal with
+    # its record kept for a retry, down exits 1, and the next service
+    # in the sweep is still stopped
+    runs = tmp_path / "runs"
+    first, second = fake("first", ROS_CLIENT="first"), fake("second", ROS_CLIENT="second")
+    steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[first, second])
+    _track(steps)
+    assert [step.outcome for step in steps] == ["started", "started"]
+    _wait_ready(steps, ready_dir)
+    real_send = signal.pidfd_send_signal
+    sent: list[int] = []
+
+    def refuse_the_first(fd: int, sig: int, *args: object) -> None:
+        sent.append(sig)
+        if len(sent) == 1:
+            raise PermissionError(1, "Operation not permitted")
+        real_send(fd, sig, *args)
+
+    monkeypatch.setattr(services.signal, "pidfd_send_signal", refuse_the_first)
+    stopped = down_services(
+        CLUSTER, runs_dir=runs, names=["first", "second"], specs=[first, second]
+    )
+    assert [step.outcome for step in stopped] == ["cannot-signal", "stopped"]
+    assert "SIGINT was not permitted" in stopped[0].detail
+    refused = stopped[0].name
+    assert isinstance(services.read_pid_record(runs, refused), tuple)  # kept for a retry
+    assert services.down_exit_code(stopped) == 1
+    monkeypatch.undo()
+    retry = down_services(CLUSTER, runs_dir=runs, names=[refused], specs=[first, second])
+    assert [(step.name, step.outcome) for step in retry] == [(refused, "stopped")]
 
 
 @requires_proc
@@ -1202,35 +1305,71 @@ def test_a_record_replaced_during_the_readiness_wait_is_left_alone(
 
 @requires_proc
 def test_a_concurrent_start_waits_for_the_stop_to_release_the_lock(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_dir: Path
 ) -> None:
     # the stop holds the per-service lock for its whole run; a start of
     # the same name meanwhile must WAIT for it, then find no record and
     # start a fresh child. Without the lock it would read the live
-    # record mid-stop and say already-running
+    # record mid-stop and say already-running. Synchronised with events,
+    # not sleeps: the fake has installed SIG_IGN, the stopper is held
+    # inside its exit wait (lock held), the starter is seen reaching the
+    # lock and shown unable to pass it, and only then is the stopper
+    # released
     runs = tmp_path / "runs"
     spec = fake("stubborn", code=IGNORER)
     start = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     _track(start)
-    assert start[0].outcome == "started"
-    outcomes: list[str] = []
+    assert [(step.name, step.outcome) for step in start] == [("stubborn", "started")]
+    _wait_ready(start, ready_dir)
 
-    def starter() -> None:
-        outcomes.append(services.start_service(spec, runs_dir=runs).outcome)
+    in_wait = threading.Event()
+    release = threading.Event()
+    starter_at_lock = threading.Event()
+    real_wait = services._wait_pidfd
+    real_lock = services._service_lock
 
+    def held_wait(fd: int, timeout_s: float) -> bool:
+        if not in_wait.is_set():
+            in_wait.set()
+            release.wait(30.0)
+        return real_wait(fd, timeout_s)
+
+    @contextlib.contextmanager
+    def spying_lock(runs_dir: Path, name: str) -> Iterator[None]:
+        if threading.current_thread().name == "starter":
+            starter_at_lock.set()
+        with real_lock(runs_dir, name):
+            yield
+
+    monkeypatch.setattr(services, "_wait_pidfd", held_wait)
+    monkeypatch.setattr(services, "_service_lock", spying_lock)
+    results: list[Step] = []
     stopper = threading.Thread(
         target=lambda: down_services(
             CLUSTER, runs_dir=runs, names=["stubborn"], specs=[spec], stop_timeout_s=1.0
-        )
+        ),
+        name="stopper",
+    )
+    starter = threading.Thread(
+        target=lambda: results.append(services.start_service(spec, runs_dir=runs)),
+        name="starter",
     )
     stopper.start()
-    time.sleep(0.2)  # inside the stop's SIGINT wait, the lock is held
-    starter_thread = threading.Thread(target=starter)
-    starter_thread.start()
-    stopper.join()
-    starter_thread.join()
-    assert outcomes == ["started"]
-    down_services(CLUSTER, runs_dir=runs, names=["stubborn"], specs=[spec])
+    try:
+        assert in_wait.wait(10.0), "the stop never reached its exit wait"
+        starter.start()
+        assert starter_at_lock.wait(10.0), "the start never reached the lock"
+        starter.join(timeout=0.5)
+        assert starter.is_alive(), "the start got past the lock while the stop held it"
+    finally:
+        release.set()
+        stopper.join(timeout=30.0)
+        if starter.ident is not None:
+            starter.join(timeout=30.0)
+        _track(results)  # the replacement child, before any assertion on it
+    assert [(step.name, step.outcome) for step in results] == [("stubborn", "started")]
+    monkeypatch.undo()
+    down_services(CLUSTER, runs_dir=runs, names=["stubborn"], specs=[spec], stop_timeout_s=1.0)
 
 
 @requires_proc
