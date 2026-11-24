@@ -185,7 +185,14 @@ def _gone(pid: int) -> bool:
         return True
     except PermissionError:
         return False
-    return not Path(f"/proc/{pid}/cmdline").read_bytes()
+    try:
+        # the state, not the cmdline: the kernel releases the cmdline
+        # BEFORE the state becomes Z, so an empty cmdline can mean
+        # "dying" rather than "gone" for a just-killed child
+        state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return state.rpartition(")")[2].strip().split(" ")[0] in ("Z", "X", "x")
+    except OSError:
+        return True
 
 
 def _wait_gone(pid: int, timeout_s: float = 5.0) -> bool:
@@ -734,7 +741,9 @@ def test_a_malformed_pid_file_is_reported_and_the_sweep_continues(
     assert [step.outcome for step in steps] == ["malformed-pid-file", "stopped"]
     assert "left in place" in steps[0].detail
     assert bad.exists()  # not ours to clean
-    assert services.down_exit_code(steps) == 0
+    # down left something it could not deal with, so it exits 1 - the
+    # sweep still carried on and the live service still stopped
+    assert services.down_exit_code(steps) == 1
 
 
 @requires_proc
@@ -787,7 +796,8 @@ def test_impossible_pid_values_are_malformed_and_left_alone(tmp_path: Path) -> N
     assert [step.outcome for step in steps] == ["malformed-pid-file"] * 4
     for name in ("relay-r1", "relay-r2", "relay-r3", "relay-r4"):
         assert (services_dir / f"{name}.pid").exists()
-    assert services.down_exit_code(steps) == 0
+    # down left them all in place: that is a failure, not a clean sweep
+    assert services.down_exit_code(steps) == 1
 
 
 @requires_proc
@@ -812,6 +822,108 @@ def test_an_undecidable_identity_is_reported_by_up_and_down(
     stopped = down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
     assert stopped[0].outcome == "identity-unknown"
     assert services.down_exit_code(stopped) == 1
+
+
+@requires_proc
+def test_up_restarts_a_crashed_service(tmp_path: Path, ready_dir: Path) -> None:
+    # the round-3 regression: a dead record made `up` answer
+    # still-starting forever, so after any crash the service never came
+    # back until someone deleted the pid file by hand. Liveness is
+    # checked BEFORE the identity proofs now, so a dead record is
+    # replaced and the service restarts - the most common use of up
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    first = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(first)
+    _wait_ready(first, ready_dir)
+    pid = first[0].pid
+    assert pid is not None
+    fd = os.pidfd_open(pid)
+    try:
+        signal.pidfd_send_signal(fd, signal.SIGKILL)
+    finally:
+        os.close(fd)
+    assert _wait_gone(pid)
+
+    second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(second)
+    _wait_ready(second, ready_dir)
+    assert second[0].outcome == "started"
+    assert second[0].pid not in (None, pid)  # a new child
+    assert services.read_pid_record(runs, "sleeper") == (second[0].pid, second[0].start_ticks)
+    down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
+
+
+@requires_proc
+def test_a_proc_that_cannot_be_read_makes_liveness_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a hidepid-style mount: /proc/<pid>/stat exists but cannot be
+    # read. Liveness answers unknown, and `up` keeps the record
+    # (still-starting) instead of guessing
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    first = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(first)
+    pid = first[0].pid
+    assert pid is not None
+
+    def denied(*args: object, **kwargs: object) -> str:
+        raise PermissionError("hidepid")
+
+    monkeypatch.setattr(services.Path, "read_text", denied)
+    assert services._liveness(pid) == "unknown"
+    second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    assert second[0].outcome == "still-starting"
+    assert services.read_pid_record(runs, "sleeper") == (pid, first[0].start_ticks)  # kept
+
+
+@requires_proc
+def test_a_second_up_reports_a_running_service_that_is_not_ready(tmp_path: Path) -> None:
+    # an already-running HTTP service must really answer its readiness
+    # route before a second `up` calls it started: running but broken
+    # is running-not-ready, a failure, with the restart hint
+    runs = tmp_path / "runs"
+    spec, _port = _http_fake("broken", health="/health", bad_health=True)
+    first = services.start_service(spec, runs_dir=runs)
+    _track([first])
+    assert first.outcome == "started"
+    second = up_services(
+        CLUSTER,
+        runs_dir=runs,
+        precheck=False,
+        grace_s=0.0,
+        ready_timeout_s=0.5,
+        specs=[spec],
+    )
+    assert second[0].outcome == "running-not-ready"
+    assert "rosctl down broken" in second[0].detail
+    assert services.up_exit_code(second) == 1
+    assert isinstance(services.read_pid_record(runs, "broken"), tuple)  # record kept
+    down_services(CLUSTER, runs_dir=runs, names=["broken"], specs=[spec])
+
+
+@requires_proc
+def test_a_lock_that_cannot_be_opened_is_reported(tmp_path: Path) -> None:
+    # a directory where the per-service lock file goes: up reports
+    # launch-failed and spawns nothing, down reports lock-failed and
+    # signals nothing - the lock stays mandatory, never skipped
+    runs = tmp_path / "runs"
+    (runs / "services").mkdir(parents=True)
+    (runs / "services" / "sleeper.lock").mkdir()
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    assert steps[0].outcome == "launch-failed"
+    assert "could not open the lock" in steps[0].detail
+    assert services.up_exit_code(steps) == 1
+    steps = down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
+    assert steps[0].outcome == "lock-failed"
+    assert services.down_exit_code(steps) == 1
+    # and the next service still starts: the sweep carries on
+    steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[fake("other")])
+    _track(steps)
+    assert steps[0].outcome == "started"
+    down_services(CLUSTER, runs_dir=runs, names=["other"], specs=[fake("other")])
 
 
 @requires_proc

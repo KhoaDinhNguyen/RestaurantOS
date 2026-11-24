@@ -10,6 +10,8 @@ check patched to pass, so the suite also runs where there is no
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -67,18 +69,43 @@ def test_a_plain_down_needs_no_cluster_file(
 ) -> None:
     # no cluster.toml, no .env, no real process either: a fixed record
     # that is simply not running. The pid files alone name the work, so
-    # a broken cluster file must not stop down from cleaning up
+    # a broken cluster file must not stop down from cleaning up. The
+    # lock and liveness are patched, so the test also runs where there
+    # is no /proc and no flock; the real CLI dispatch, the pid-file
+    # discovery and the record removal are what run
     _host_like(tmp_path, monkeypatch)
+
+    @contextlib.contextmanager
+    def _null_lock(runs_dir: Path, name: str) -> Iterator[None]:
+        yield
+
+    monkeypatch.setattr(services, "_service_lock", _null_lock)
+    monkeypatch.setattr(services, "_liveness", lambda pid: "dead")
     services_dir = tmp_path / "runs" / "services"
     services_dir.mkdir(parents=True)
     # a patterned name, so the sweep can rebuild its spec from the
     # name alone - that is the whole point of the pid-file-driven down
     services._write_pid_file(services_dir / "relay-r1.pid", 4194000, 12345)
-    monkeypatch.setattr(services, "_alive", lambda pid: False)
     assert app(["down"]) == 0
     out = capsys.readouterr().out
     assert "relay-r1: not-running" in out
     assert not (services_dir / "relay-r1.pid").exists()
+
+
+def test_a_services_folder_that_cannot_be_listed_is_an_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Path.glob silently returns nothing when a folder cannot be read;
+    # down must not say "nothing running" while services may run. A
+    # services path that is not a folder at all is the same class of
+    # problem: an error message and exit 1, not a clean no-op
+    _host_like(tmp_path, monkeypatch)
+    (tmp_path / "runs").mkdir()
+    (tmp_path / "runs" / "services").write_text("a file, not a folder", encoding="utf-8")
+    assert app(["down"]) == 1
+    assert "rosctl down:" in capsys.readouterr().err
 
 
 def test_a_badly_shaped_cluster_file_is_a_message_not_a_traceback(

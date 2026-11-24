@@ -358,11 +358,17 @@ def _write_pid_file(path: Path, pid: int, start_ticks: int) -> None:
 def running_names(runs_dir: Path) -> list[str]:
     """Every name with a pid file, in down order - `down`'s work list
     when no names are given: what `up` started is what `down` stops,
-    whatever cluster file either command was given."""
+    whatever cluster file either command was given. A MISSING folder
+    is simply empty; a folder that cannot be listed raises, because
+    "nothing running" would be a lie while services run (Path.glob
+    swallows the error, so this reads the directory itself)."""
     services_dir = runs_dir / "services"
     try:
-        names = [path.stem for path in services_dir.glob("*.pid")]
-    except OSError:
+        with os.scandir(services_dir) as entries:
+            names = [
+                entry.name.removesuffix(".pid") for entry in entries if entry.name.endswith(".pid")
+            ]
+    except FileNotFoundError:
         return []
     return sorted(names, key=_stop_key)
 
@@ -440,6 +446,22 @@ def identity(
                 if not all(env.get(key) == value for key, value in spec.env.items()):
                     return "mismatch"
                 return "match"
+        # Empty or unreadable argv/environ with matching start ticks is
+        # mid-exec - or a process DYING: the kernel releases the cmdline
+        # and environ BEFORE the state becomes Z, so a just-killed child
+        # can show empty evidence with state R for a moment. The state
+        # decides between them: Z (or the entry gone) means the launch
+        # this record named has exited, which is a mismatch, not an
+        # unknown.
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            state = state.rpartition(")")[2].strip().split(" ")[0]
+        except FileNotFoundError:
+            return "mismatch"  # gone since the ticks matched
+        except OSError, IndexError:
+            state = "?"  # unreadable mid-loop: keep retrying
+        if state in ("Z", "X", "x"):
+            return "mismatch"  # it exited while we were looking
         if time.monotonic() >= deadline:
             return "unknown"
         time.sleep(0.05)
@@ -466,6 +488,66 @@ def _alive(pid: int) -> bool:
         return state not in ("Z", "X", "x")
     except OSError, IndexError:
         return False
+
+
+def _liveness(pid: int) -> Literal["alive", "dead", "unknown"]:
+    """Whether `pid` names a running process - three answers, because
+    "cannot tell" must not be read as "not running". `dead`: the pid
+    does not answer kill(pid, 0), or /proc/<pid>/stat is missing, or
+    its state is a zombie (exited, not reaped) or dying. `alive`: the
+    state was read and is anything else, or the process belongs to
+    another user (PermissionError means it exists). `unknown`: any
+    other problem reading /proc - a hidepid mount, say. `start` and
+    `stop` both branch on this FIRST, before the identity proofs: a
+    `dead` record is simply replaced by the next `up` (the most
+    common use after a crash), and an `unknown` one is reported, never
+    acted on."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return "dead"
+    except PermissionError:
+        return "alive"  # another user's process: it exists
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "dead"
+    except OSError:
+        return "unknown"
+    try:
+        state = stat.rpartition(")")[2].strip().split(" ")[0]
+    except IndexError:
+        return "unknown"
+    if state in ("Z", "X", "x"):
+        return "dead"
+    return "alive"
+
+
+def _probe_ready(spec: ServiceSpec, timeout_s: float) -> bool:
+    """One readiness probe, no cleanup and no liveness checks: wait up
+    to timeout_s for the readiness route to answer 200, with the
+    request timeout always the time REMAINING so the wait ends at its
+    deadline, never at the server's leisure. `_ready_step` slices it
+    into short attempts (it must watch the pid between them); a second
+    `up` gives it the whole budget to decide whether a running HTTP
+    service is really ready. Never reads the body: the status line is
+    the readiness answer, and a 200 after a slow answer is still
+    ready."""
+    url = f"http://{HOST_ADDRESS}:{spec.port}{spec.ready}"
+    with httpx.Client(trust_env=False) as client:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            timeout = httpx.Timeout(min(1.0, remaining))
+            try:
+                with client.stream("GET", url, timeout=timeout) as response:
+                    if response.status_code == 200:
+                        return True
+            except httpx.HTTPError:
+                pass
+            time.sleep(0.25)
 
 
 # --- reachability -------------------------------------------------------
@@ -679,7 +761,18 @@ def start_service(
         services.mkdir(parents=True, exist_ok=True)
     except OSError as error:
         return Step(spec.name, "launch-failed", f"could not prepare {services}: {error}")
-    with _service_lock(runs_dir, spec.name):
+    stack = contextlib.ExitStack()
+    try:
+        stack.enter_context(_service_lock(runs_dir, spec.name))
+    except OSError as error:
+        with contextlib.suppress(Exception):
+            stack.close()
+        return Step(
+            spec.name,
+            "launch-failed",
+            f"could not open the lock {runs_dir / 'services' / f'{spec.name}.lock'}: {error}",
+        )
+    with stack:
         record = read_pid_record(runs_dir, spec.name)
         if isinstance(record, str):
             # up owns its own pid file: a malformed or unreadable one
@@ -694,22 +787,47 @@ def start_service(
                 )
         elif record is not None:
             pid, ticks = record
-            who = identity(pid, ticks, spec)
-            if who == "match":
-                return Step(
-                    spec.name,
-                    "already-running",
-                    f"pid {pid}, not started again",
-                    pid=pid,
-                    start_ticks=ticks,
-                )
-            if who == "unknown":
+            how = _liveness(pid)
+            if how == "dead":
+                # the recorded launch has exited: up restarts it - the
+                # most common way up is used, after a crash
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            elif how == "unknown":
                 return Step(
                     spec.name,
                     "still-starting",
                     "another launch is still coming up - not started again",
                 )
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            else:
+                who = identity(pid, ticks, spec)
+                if who == "match":
+                    # running - but an HTTP service must really answer
+                    # its readiness route before up calls it started
+                    if spec.port is not None and not _probe_ready(spec, READY_TIMEOUT_S):
+                        return Step(
+                            spec.name,
+                            "running-not-ready",
+                            f"pid {pid} is running but not answering {spec.ready} on "
+                            f"port {spec.port} within {READY_TIMEOUT_S}s - left running, "
+                            f"its record kept; run rosctl down {spec.name} then "
+                            f"rosctl up {spec.name} to restart it",
+                            pid=pid,
+                            start_ticks=ticks,
+                        )
+                    return Step(
+                        spec.name,
+                        "already-running",
+                        f"pid {pid}, not started again",
+                        pid=pid,
+                        start_ticks=ticks,
+                    )
+                if who == "unknown":
+                    return Step(
+                        spec.name,
+                        "still-starting",
+                        "another launch is still coming up - not started again",
+                    )
+                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
         if spec.port is not None and port_in_use(spec.port):
             return Step(
                 spec.name,
@@ -840,34 +958,26 @@ def _ready_step(
             pid=pid,
             start_ticks=start_ticks,
         )
-    url = f"http://{HOST_ADDRESS}:{spec.port}{spec.ready}"
     deadline = time.monotonic() + ready_timeout_s
-    # trust_env=False: a machine with HTTP_PROXY set must not have its
-    # loopback readiness probe routed through the proxy
-    with httpx.Client(trust_env=False) as client:
-        while True:
-            if not _alive(pid):
-                return _start_failure(
-                    spec, runs_dir, "exited-immediately", pid=pid, start_ticks=start_ticks
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            timeout = httpx.Timeout(min(1.0, remaining))
-            try:
-                with client.stream("GET", url, timeout=timeout) as response:
-                    if response.status_code == 200:
-                        return Step(
-                            spec.name,
-                            "started",
-                            f"pid {pid} ready on port {spec.port}, "
-                            f"log {log_path(runs_dir, spec.name)}",
-                            pid=pid,
-                            start_ticks=start_ticks,
-                        )
-            except httpx.HTTPError:
-                pass
-            time.sleep(0.25)
+    while True:
+        if not _alive(pid):
+            return _start_failure(
+                spec, runs_dir, "exited-immediately", pid=pid, start_ticks=start_ticks
+            )
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        # one sliced probe between liveness checks (_probe_ready does
+        # no cleanup and takes its own remaining-time budget)
+        if _probe_ready(spec, min(1.0, remaining)):
+            return Step(
+                spec.name,
+                "started",
+                f"pid {pid} ready on port {spec.port}, log {log_path(runs_dir, spec.name)}",
+                pid=pid,
+                start_ticks=start_ticks,
+            )
+        time.sleep(0.25)
     stop = stop_service(spec, runs_dir=runs_dir, expect=(pid, start_ticks))
     base = f"still not answering {spec.ready} on port {spec.port} within {ready_timeout_s}s"
     if stop.outcome in ("stopped", "killed"):
@@ -930,7 +1040,19 @@ def stop_service(
     os.kill - signalling a number that was only just proven is the one
     thing this design exists to prevent. The control plane on 8002 has
     no pid file here, so `down` can never touch it."""
-    with _service_lock(runs_dir, spec.name):
+    stack = contextlib.ExitStack()
+    try:
+        stack.enter_context(_service_lock(runs_dir, spec.name))
+    except OSError as error:
+        with contextlib.suppress(Exception):
+            stack.close()
+        return Step(
+            spec.name,
+            "lock-failed",
+            f"could not open the lock {runs_dir / 'services' / f'{spec.name}.lock'}: "
+            f"{error} - record kept, nothing signalled",
+        )
+    with stack:
         record = read_pid_record(runs_dir, spec.name)
         if expect is not None and record != expect:
             return Step(
@@ -947,9 +1069,17 @@ def stop_service(
         if record is None:
             return Step(spec.name, "not-running", "no pid file")
         pid, ticks = record
-        if not _alive(pid):
+        how = _liveness(pid)
+        if how == "dead":
             pid_path(runs_dir, spec.name).unlink(missing_ok=True)
             return Step(spec.name, "not-running", f"pid {pid} was not running, pid file removed")
+        if how == "unknown":
+            return Step(
+                spec.name,
+                "identity-unknown",
+                f"pid {pid}: could not tell whether it is running (/proc could not "
+                f"be read) - record kept, nothing signalled",
+            )
         try:
             fd = os.pidfd_open(pid)
         except ProcessLookupError:
@@ -1110,16 +1240,20 @@ def down_services(
 
 def up_exit_code(steps: Sequence[Step]) -> int:
     """`up` fails when a service could not be started, could not be
-    launched, or never became ready; an already-running service is the
+    launched, never became ready, or is running but not answering its
+    readiness route; an already-running AND ready service is the
     idempotent case, not a failure."""
-    bad = {"port-in-use", "exited-immediately", "not-ready", "launch-failed"}
+    bad = {"port-in-use", "exited-immediately", "not-ready", "launch-failed", "running-not-ready"}
     return 1 if any(step.outcome in bad for step in steps) else 0
 
 
 def down_exit_code(steps: Sequence[Step]) -> int:
-    """`down` fails when a process survived SIGKILL, could not be
-    signalled at all (no pidfd: `cannot-signal`), or could not be
-    identified (`identity-unknown`: something that may be running was
-    not stopped)."""
-    bad = ("unkillable", "cannot-signal", "identity-unknown")
+    """`down` fails when it left something it could not deal with: a
+    process that survived SIGKILL, one it could not signal at all (no
+    pidfd: `cannot-signal`), one it could not identify
+    (`identity-unknown`: something that may be running was not
+    stopped), a malformed or unreadable record it had to leave in
+    place, or a per-service lock it could not take. The sweep still
+    continues past each of these."""
+    bad = ("unkillable", "cannot-signal", "identity-unknown", "malformed-pid-file", "lock-failed")
     return 1 if any(step.outcome in bad for step in steps) else 0

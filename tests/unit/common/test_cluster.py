@@ -227,6 +227,18 @@ def test_the_default_base_port_fits_many_regions():
     assert Cluster(regions=1000, proxy_base_port=21000).regions == 1000
 
 
+def test_absurd_region_counts_cannot_push_a_node_port_out_of_range():
+    # the proxy check alone cannot catch every shape: with a low proxy
+    # base, the node host ports (5500 + 10n, standby one higher) can
+    # overflow while the proxy ports still fit - Cluster rejects the
+    # shape at the source, so no port a consumer derives from the
+    # cluster can be out of TCP range. (The edge guard - 8010 + n - is
+    # unreachable while the host guard runs first: host ports grow ten
+    # times faster; it stays as defense in depth.)
+    with pytest.raises(ValueError, match="node host ports"):
+        Cluster(regions=6100, proxy_base_port=1)
+
+
 # ---- cluster file shape --------------------------------------------------------
 
 

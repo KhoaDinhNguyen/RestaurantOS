@@ -62,6 +62,22 @@ class Cluster:
                 f"lower proxy_base_port ({self.proxy_base_port}) or use fewer regions "
                 f"({self.regions})"
             )
+        # The same check for the other two port families, so no port any
+        # consumer derives from the cluster can be out of range: the
+        # nodes' published ports (region n primary at 5500 + 10n, its
+        # standby one higher) and the edge APIs (8010 + n).
+        highest_host = HOST_BASE_PORT + 10 * self.regions + 1
+        if highest_host > 65535:
+            raise ValueError(
+                f"node host ports would reach {highest_host}, above the highest TCP "
+                f"port 65535; use fewer regions ({self.regions})"
+            )
+        highest_edge = EDGE_BASE_PORT + self.regions
+        if highest_edge > 65535:
+            raise ValueError(
+                f"edge API ports would reach {highest_edge}, above the highest TCP "
+                f"port 65535; use fewer regions ({self.regions})"
+            )
 
     @property
     def region_ids(self) -> list[str]:
