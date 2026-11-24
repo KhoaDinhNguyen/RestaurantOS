@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from restaurantos.common.cluster import Cluster
 from restaurantos.sim.checker import (
     RESUMED_FROM,
     CheckError,
@@ -18,6 +19,7 @@ from restaurantos.sim.checker import (
     evaluate,
     format_report,
     read_runs,
+    refuse_edge_runs,
     run_chain,
 )
 
@@ -292,6 +294,31 @@ def test_runs_that_disagree_on_the_region_are_refused(tmp_path) -> None:
     write_run(tmp_path, "b", [], region="r2")
     with pytest.raises(CheckError, match="disagree"):
         read_runs(tmp_path, ["a", "b"], CH)
+
+
+def test_an_edge_run_is_refused_and_pointed_at_the_oracle(tmp_path) -> None:
+    from restaurantos.sim.playback_cli import edge_target_url
+
+    cluster = Cluster(regions=1)
+    write_run(
+        tmp_path,
+        "edge",
+        [],
+        region="r1",
+        target_url=edge_target_url(cluster, "r1"),
+    )
+    runs = read_runs(tmp_path, ["edge"], CH)
+    with pytest.raises(CheckError, match="oracle compare"):
+        refuse_edge_runs(cluster, runs)
+    # a gateway run of the same region is what the checker is for
+    write_run(
+        tmp_path,
+        "gateway",
+        [],
+        region="r1",
+        target_url="http://127.0.0.1:8000/api/v1",
+    )
+    refuse_edge_runs(cluster, read_runs(tmp_path, ["gateway"], CH))
 
 
 def test_a_missing_run_is_a_check_error(tmp_path) -> None:

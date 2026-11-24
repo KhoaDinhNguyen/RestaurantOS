@@ -68,6 +68,9 @@ class RunSet:
     to_day: int
     region: str | None
     orders: dict[Key, OrderOutcome] = field(default_factory=dict)
+    # every run's target_url: run_check refuses one that targeted a
+    # region's edge API (see refuse_edge_runs)
+    target_urls: set[str] = field(default_factory=set)
 
     def keys(self, outcome: str) -> set[Key]:
         return {key for key, order in self.orders.items() if order.outcome == outcome}
@@ -136,6 +139,7 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
     chain = run_chain(runs_dir, run_ids)
     days: list[tuple[int, int]] = []
     regions: set[str | None] = set()
+    target_urls: set[str] = set()
     orders: dict[Key, OrderOutcome] = {}
     for run_id in chain:
         run_dir = runs_dir / run_id
@@ -148,6 +152,8 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
             raise CheckError(f"run {run_id}: meta.json has no from_day/to_day")
         days.append((int(meta["from_day"]), int(meta["to_day"])))
         regions.add(meta.get("region"))
+        if meta.get("target_url") is not None:
+            target_urls.add(str(meta["target_url"]))
         for number, text in enumerate(lines, start=1):
             if not text.strip():
                 continue
@@ -177,6 +183,7 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
         to_day=max(day for _, day in days),
         region=next(iter(regions)),
         orders=orders,
+        target_urls=target_urls,
     )
 
 
@@ -463,6 +470,26 @@ def collect(cluster: Cluster, runs: RunSet) -> ClusterFacts:
     )
 
 
+def refuse_edge_runs(cluster: Cluster, runs: RunSet) -> None:
+    """A run that targeted a region's edge API (`--target edge`) stays
+    inside its region: there is no HQ behind it to compare against, so
+    the checker refuses it and the oracle covers it instead."""
+    if runs.region is None or not runs.target_urls:
+        return
+    from restaurantos.sim.playback_cli import edge_target_url
+
+    try:
+        edge = edge_target_url(cluster, runs.region)
+    except KeyError:
+        return  # region_primaries names it: this region is not in the cluster
+    if edge in runs.target_urls:
+        raise CheckError(
+            f"the runs targeted region {runs.region}'s edge API, which has no HQ "
+            "behind it: this checker compares the run log, the regions and HQ - "
+            "use rosctl oracle compare for an edge run"
+        )
+
+
 def run_check(
     cluster: Cluster,
     run_ids: Sequence[str],
@@ -475,6 +502,7 @@ def run_check(
 ) -> dict[str, Any]:
     """Drain, read, evaluate. Blocking: run it in a thread from async code."""
     runs = read_runs(runs_dir, run_ids, channel)
+    refuse_edge_runs(cluster, runs)
     wait_for_drain(cluster, timeout_s=drain_timeout_s, poll_s=poll_s, scope=runs.region)
     return evaluate(runs, collect(cluster, runs), allow_unacked=allow_unacked)
 

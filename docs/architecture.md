@@ -842,6 +842,7 @@ Browsers decide same-site by scheme + registrable domain, ignoring the port: `ht
 ```
 
   `duplicates` entries are `{"external_order_id", "where": "regions", "regions"}` or `{"external_order_id", "where": "hq", "count"}`; `unaccounted` entries are `{"external_order_id", "reason", "region_id"}` (Section 7.5 lists the reasons). `stored_unacked` fails the check unless `allow_unacked` is true.
+
 - The same code runs as `rosctl check --run <run_id> [--run ...] [--allow-unacked] [--json]` (exit 0 on pass, 1 on fail) and `rosctl snapshot save|restore|list`.
 
 ## 7. Simulation harness
@@ -893,6 +894,7 @@ Playback also sends status events for each order, triggers restocks every R simu
 - The batch waits for every earlier send to finish, because an order still in flight from before midnight must land first: the oracle applies it first.
 - That day's orders wait for the whole batch.
 - A restock that still fails after its attempts is counted and reported, and the run goes on.
+- A start can drop the restock at 00:00:00 of `from_day` (`skip_first_restock`, default off; Section 7.4): a snapshot restore replays a day whose restock already went out, and restock tops every counter up to par, so a second one would refill what was sold between midnight and the snapshot.
 
 **Duplicates and shuffle.** A configurable share of orders (`duplicate_rate`, default 0) is sent twice, and delivery can be reordered (`shuffle`, default off). Both are per-run start facts, recorded in `meta.json`, and both derive every random value from the hash of (`seed`, `order_id`, purpose) - never a shared generator.
 
@@ -954,6 +956,7 @@ How it is built (`rosctl check`, `sim/checker.py`):
 
 - **Drain** is a real condition, never a sleep: no outbox row with `relayed_at IS NULL` on any region's current primary and no `holding_queue` row with `delivered_at IS NULL`. After `ROS_SIM_CHECK_DRAIN_TIMEOUT_S` the check fails and says which queue is left.
 - It compares **sets** of `(channel, external_order_id)` within the runs' days, reading each region's current primary from `region_state` and HQ's current primary from `pg_is_in_recovery()`. Acked means a `200`/`201` with an order id, or a `202` whose holding-queue row was delivered `accepted`; resends and replayed duplicates count once, best outcome first.
+- It refuses a run that targeted a region's edge API (`--target edge`): an edge run stays inside its region with no HQ behind it, and `rosctl oracle compare` covers it.
 - **Lost at failover** only when the order's region has a `failover` in `cluster_events` after the order was acked and replicated asynchronously at that moment (`synchronous = false`, or a `sync_downgrade` before the failover). Otherwise a missing order is unaccounted.
 - **Stored but never answered** (`stored_unacked`): every send of the order errored, yet it is stored. No client was promised anything, but a gateway that saves orders and never replies would look like this, so it fails the check by default; fault scenarios pass `--allow-unacked`, where a timeout that still landed is normal. To revisit after local testing; the planned upgrade is to fail only on orders sent outside a fault window.
 - **Unaccounted reasons:** `acked_not_stored`, `in_hq_not_in_region`, `stored_not_in_hq`, `refused_but_stored`, `stored_not_acked`, `stored_not_in_run`, `refused_not_in_inbox`, `parked_without_holding_row`, `parked_not_delivered`. **Duplicates** are checked across regions, inside one region (`orders` has no unique constraint on `external_order_id`), and at HQ.
