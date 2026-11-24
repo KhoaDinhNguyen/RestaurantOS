@@ -571,6 +571,48 @@ async def test_shuffle_respects_the_kitchen_timeline(tmp_path: Path) -> None:
         assert line["external_order_id"] in accepted or line.get("skipped") is True
 
 
+class RaisingStream:
+    """Yields the given orders, then fails on the next pull, like a corrupt
+    cache would."""
+
+    def __init__(self, orders: list) -> None:
+        self.orders = orders
+
+    def __iter__(self):
+        yield from self.orders
+        raise RuntimeError("corrupt cache")
+
+
+@pytest.mark.parametrize(
+    ("window", "where"),
+    [(8, "the first fill"), (2, "a refill")],
+)
+async def test_a_stream_failure_still_sends_every_buffered_order(
+    tmp_path: Path, window: int, where: str
+) -> None:
+    """The stream yields three orders, then raises - during the first fill
+    (window 8) or during a refill (window 2: one full batch, then one order
+    and the error). Every yielded order still goes out, in the usual
+    shuffle order, with its line in the log; only then does the run fail.
+    Before the fix the buffered orders were dropped without a line."""
+    yielded = sample_orders(3)
+    seed = 5
+    clock = FakeWallClock()
+    pb = make_playback(
+        RaisingStream(yielded), tmp_path, clock=clock, inflight=4, shuffle_window=window
+    )
+    await pb.start(seed=seed, from_day=14, to_day=14, speed=1000.0, run_id="raise", shuffle=True)
+    await drive(pb, clock)
+
+    status = pb.status()
+    assert status["state"] == "failed", where
+    assert status["orders_sent"] == len(yielded), where
+    lines = order_lines(run_log_lines(tmp_path, pb))
+    expected = [yielded[p].external_order_id for p in expected_shuffle_order(yielded, seed, window)]
+    assert [line["external_order_id"] for line in lines] == expected, where
+    assert all(line["http_status"] == 201 for line in lines), where
+
+
 # --- mode and parameter refusals -------------------------------------------
 
 

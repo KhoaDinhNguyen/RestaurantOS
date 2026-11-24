@@ -878,15 +878,42 @@ class Playback:
             stream_items = enumerate(stream)
             window = self._shuffle_window if self._shuffle_on else 1
             buffer: list[tuple[float, int, OrderRequest]] = []
-            while len(buffer) < window:
-                item = next(stream_items, None)
-                if item is None:
-                    break
-                index, request = item
-                buffer.append(
-                    (stable_float(self._seed, request.external_order_id, "shuffle"), index, request)
-                )
-            while buffer or self._heap:
+            # A stream that raises mid-pull (a corrupt cache, an I/O
+            # error) must not drop the orders it already yielded into the
+            # buffer (review round 2): the error is kept, pulling stops,
+            # the buffered orders still go out through the usual ordering
+            # and stop gates, and only then is the error raised, which
+            # fails the run as before. With window 1 this is the old
+            # behavior exactly - the yielded order is out, the next pull
+            # fails - and with shuffle on it no longer loses up to
+            # window-1 orders without a line in the log.
+            pull_error: Exception | None = None
+
+            def fill() -> None:
+                nonlocal pull_error
+                while pull_error is None and len(buffer) < window:
+                    try:
+                        item = next(stream_items, None)
+                    except Exception as error:  # noqa: BLE001 - raised after the buffer drains
+                        pull_error = error
+                        return
+                    if item is None:
+                        return
+                    index, request = item
+                    buffer.append(
+                        (
+                            stable_float(self._seed, request.external_order_id, "shuffle"),
+                            index,
+                            request,
+                        )
+                    )
+
+            fill()
+            # after a pull error, only the buffered orders (and the heap
+            # items due before them) still go out - not the rest of the
+            # heap, whose restocks could otherwise hold a failed run open
+            # to the end of the window
+            while buffer or (self._heap and pull_error is None):
                 if self._state == STOPPING:
                     stopped = True
                     break
@@ -952,20 +979,7 @@ class Playback:
                     # reorder stays local. With the window at 1 this is
                     # the old one-item pending, pull-for-pull.
                     if not buffer:
-                        while len(buffer) < window:
-                            item = next(stream_items, None)
-                            if item is None:
-                                break
-                            refill_index, refill_request = item
-                            buffer.append(
-                                (
-                                    stable_float(
-                                        self._seed, refill_request.external_order_id, "shuffle"
-                                    ),
-                                    refill_index,
-                                    refill_request,
-                                )
-                            )
+                        fill()
                 else:
                     deadline, _rank, tie_a, tie_b, kind, payload = heapq.heappop(self._heap)
                     await self._wait_until(deadline)
@@ -1063,6 +1077,11 @@ class Playback:
                 # control requests must be able to run between the
                 # items that are all due at once.
                 await asyncio.sleep(0)
+            if pull_error is not None:
+                # every order the stream yielded is out (or the run was
+                # stopped first): now the stream's failure fails the run,
+                # through the handler below, as it did before the buffer
+                raise pull_error
             if not stopped and self._state != STOPPING:
                 # Normal end: the dispatcher dispatched its last item.
                 # A stop that arrived during the yield after the last
