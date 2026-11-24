@@ -532,6 +532,11 @@ def collect(cluster: Cluster, runs: RunSet) -> ClusterFacts:
     )
 
 
+def _api_base(url: str) -> str:
+    base = url.rstrip("/")
+    return base.removesuffix("/orders")
+
+
 def refuse_edge_runs(cluster: Cluster, runs: RunSet) -> None:
     """A run that targeted a region's edge API (`--target edge`) stays
     inside its region: there is no HQ behind it to compare against, so
@@ -541,10 +546,12 @@ def refuse_edge_runs(cluster: Cluster, runs: RunSet) -> None:
     from restaurantos.sim.playback_cli import edge_target_url
 
     try:
-        edge = edge_target_url(cluster, runs.region)
+        edge = _api_base(edge_target_url(cluster, runs.region))
     except KeyError:
         return  # region_primaries names it: this region is not in the cluster
-    if edge in runs.target_urls:
+    # meta.json records the engine's ORDERS url ({api base}/orders);
+    # edge_target_url is the api base the CLI was given - compare bases
+    if edge in {_api_base(url) for url in runs.target_urls}:
         raise CheckError(
             f"the runs targeted region {runs.region}'s edge API, which has no HQ "
             "behind it: this checker compares the run log, the regions and HQ - "

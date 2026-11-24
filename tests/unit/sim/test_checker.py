@@ -351,12 +351,14 @@ def test_an_edge_run_is_refused_and_pointed_at_the_oracle(tmp_path) -> None:
     from restaurantos.sim.playback_cli import edge_target_url
 
     cluster = Cluster(regions=1)
+    # meta.json holds the engine's orders URL ({api base}/orders), not the
+    # api base the CLI was given
     write_run(
         tmp_path,
         "edge",
         [],
         region="r1",
-        target_url=edge_target_url(cluster, "r1"),
+        target_url=edge_target_url(cluster, "r1") + "/orders",
     )
     runs = read_runs(tmp_path, ["edge"], CH)
     with pytest.raises(CheckError, match="oracle compare"):
@@ -367,7 +369,7 @@ def test_an_edge_run_is_refused_and_pointed_at_the_oracle(tmp_path) -> None:
         "gateway",
         [],
         region="r1",
-        target_url="http://127.0.0.1:8000/api/v1",
+        target_url="http://127.0.0.1:8000/api/v1/orders",
     )
     refuse_edge_runs(cluster, read_runs(tmp_path, ["gateway"], CH))
 
