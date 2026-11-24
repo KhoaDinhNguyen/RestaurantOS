@@ -759,12 +759,28 @@ async def test_restore_without_a_playback_host_says_how_to_resume(world) -> None
     assert "rosctl playback start --from-day 23" in resume["warnings"][0]
 
 
-async def test_restore_warns_when_the_host_runs_other_engine_flags(world) -> None:
+async def test_restore_does_not_start_on_a_host_with_other_engine_settings(world) -> None:
     ctx, host, _, _, _ = world
     await save("snap", ctx)
-    host.engine_meta = {"target_url": "http://127.0.0.1:8000/api/v1", "sequential": True}
+    host.engine = {**host.engine, "sequential": True, "region": "r1"}
+    host.commands.clear()
     result = await restore("snap", ctx)
-    assert any("sequential" in warning for warning in result["resume"]["warnings"])
+    resume = result["resume"]
+    assert resume["started"] is False
+    assert not any(body["action"] == "start" for body in host.commands)
+    assert not (ctx.runs_dir / "run-a-r1").exists()
+    warnings = resume["warnings"]
+    assert any("sequential is True" in warning for warning in warnings)
+    assert any("region is 'r1'" in warning for warning in warnings)
+    assert any(resume["manual_command"] in warning for warning in warnings)
+
+
+async def test_a_host_with_another_inflight_still_replays(world) -> None:
+    ctx, host, _, _, _ = world
+    await save("snap", ctx)
+    host.engine = {**host.engine, "inflight": 8}
+    result = await restore("snap", ctx)
+    assert result["resume"]["started"] is True
 
 
 ENGINE = {

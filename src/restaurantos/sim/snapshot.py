@@ -704,6 +704,41 @@ async def _restore_toxiproxy(ctx: Context, cluster: Cluster, saved: list[dict]) 
     return skipped
 
 
+# the engine facts a replay must share with the run it continues; inflight
+# changes how fast the target is driven, not what is sent
+ENGINE_KEYS = (
+    "sequential",
+    "region",
+    "target_url",
+    "events",
+    "restock_every",
+    "duplicate_offset_s",
+    "shuffle_window",
+    "kitchen",
+)
+
+
+def engine_mismatches(run: dict[str, Any], host: dict[str, Any] | None) -> list[str]:
+    """One line per engine fact the playback host does not share with the
+    snapshot's run; empty when the replay can start there."""
+    if not isinstance(host, dict):
+        return ["the playback host does not report its engine settings: restart it"]
+    saved = run.get("engine")
+    keys = ENGINE_KEYS if saved else ("sequential", "region", "target_url")
+    saved = saved or run
+    lines = []
+    for key in keys:
+        want, have = saved.get(key), host.get(key)
+        if key == "sequential":
+            want, have = bool(want), bool(have)
+        elif key == "target_url":
+            want = _api_base(str(want)) if want else want
+            have = _api_base(str(have)) if have else have
+        if want != have:
+            lines.append(f"the playback host's {key} is {have!r}, the snapshot's run had {want!r}")
+    return lines
+
+
 def _num(value: Any) -> str:
     return f"{float(value):g}"
 
@@ -878,9 +913,23 @@ async def _resume(
         cluster=cluster,
     )
     resume["manual_command"] = manual
-    if await ctx.playback.status() is None:
+    host = await ctx.playback.status()
+    if host is None:
         resume["started"] = False
         resume["warnings"].append(f"no playback host at {ctx.playback.base_url}; resume with: {manual}")
+        resume["warnings"] += notes
+        return resume
+    # The host's engine settings are fixed when it starts; a start body
+    # cannot change them. Compare BEFORE the replay starts: a gateway
+    # snapshot replayed on a single-region host would send with that
+    # host's filter from its first order on.
+    mismatches = engine_mismatches(run, host.get("engine"))
+    if mismatches:
+        resume["started"] = False
+        resume["warnings"] += mismatches
+        resume["warnings"].append(
+            "the replay was not started: stop that playback host and resume with: " + manual
+        )
         resume["warnings"] += notes
         return resume
     response = await ctx.playback.command(body)
@@ -904,15 +953,6 @@ async def _resume(
             + "\n",
             encoding="utf-8",
         )
-        meta = json.loads((new_dir / "meta.json").read_text(encoding="utf-8"))
-        for key in ("sequential", "region", "target_url"):
-            host = bool(meta.get(key, False)) if key == "sequential" else meta.get(key)
-            wanted = bool(run.get(key, False)) if key == "sequential" else run.get(key)
-            if host != wanted:
-                resume["warnings"].append(
-                    f"the playback host's {key} is {meta.get(key)!r}, the snapshot's run "
-                    f"had {run.get(key)!r}: restart the playback host with the original flags"
-                )
     if catchup > saved_speed:
         switch_at = point - ctx.sim.snapshot_catchup_margin_s
         while True:
