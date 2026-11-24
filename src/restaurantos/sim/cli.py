@@ -139,6 +139,37 @@ def build_parser() -> argparse.ArgumentParser:
         "(default ROS_SIM_STOCK_RESTOCK_DAYS)",
     )
     pstart.add_argument(
+        "--duplicate-rate",
+        type=float,
+        default=None,
+        help="share of orders to resend, 0 to 1 - a hash threshold per order, so "
+        "the same seed resends the same orders; the resent share comes close to "
+        "the rate over a long run (default ROS_SIM_PLAYBACK_DUPLICATE_RATE, off)",
+    )
+    pstart.add_argument(
+        "--duplicate-offset-s",
+        type=float,
+        default=None,
+        help="a resend lands this many simulated seconds after its order, at "
+        "most - a hash-drawn offset in [0, N) (default "
+        "ROS_SIM_PLAYBACK_DUPLICATE_OFFSET_S)",
+    )
+    pstart.add_argument(
+        "--shuffle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="reorder delivery inside a bounded window - the next delivery "
+        "is the smallest shuffle key among the next N stream items "
+        "(default ROS_SIM_PLAYBACK_SHUFFLE, off; refused with --sequential)",
+    )
+    pstart.add_argument(
+        "--shuffle-window",
+        type=int,
+        default=None,
+        help="how far shuffle may reorder delivery; 1 means no reorder "
+        "(default ROS_SIM_SHUFFLE_WINDOW)",
+    )
+    pstart.add_argument(
         "--port",
         type=int,
         default=None,

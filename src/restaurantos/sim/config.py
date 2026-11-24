@@ -60,6 +60,26 @@ class SimSettings(BaseSettings):
     # repeat answers duplicate and is counted as acked. A 2xx, 404,
     # 409 or 422 is never retried.
     playback_kitchen_attempts: int = Field(default=3, ge=1)
+    # Duplicates and shuffle (architecture 7.2), one block: an order is
+    # resent when stable_float(seed, order_id, "duplicate") is below
+    # duplicate_rate - a hash threshold, not a quota: the same seed
+    # always resends the same orders, and the resent share comes close
+    # to the rate over a long stream but is not guaranteed to equal it
+    # (a short stream can be well off). The resend
+    # is the same request body, so the region's inbox answers duplicate
+    # and the idempotency is exercised; it lands at the order's own
+    # instant plus a hash-drawn offset in [0, duplicate_offset_s)
+    # simulated seconds - a small bound keeps it near-immediate.
+    # Shuffle reorders delivery in bounded batches: the next
+    # shuffle_window stream items are held as one batch and delivered
+    # in shuffle-key order before the next batch is pulled, so an
+    # item moves at most shuffle_window-1 places; a window of 1 is
+    # no shuffle at all. Never on together with sequential mode
+    # (in-order, one-at-a-time delivery is what the oracle matches).
+    playback_duplicate_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    playback_duplicate_offset_s: float = Field(default=1.0, ge=0.0)
+    playback_shuffle: bool = False
+    shuffle_window: int = Field(default=8, ge=1)
     # Where the region edge APIs listen. Playback routes the kitchen-side
     # calls (status events, restocks) to each region's own edge API -
     # port 8010 + n on this host - because the kitchen is on the region

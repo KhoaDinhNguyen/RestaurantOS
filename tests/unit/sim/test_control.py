@@ -4,11 +4,14 @@ answers, and the 409/422 errors the architecture's contract implies."""
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import httpx
 import pytest
 from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders, settle, until
+
+from restaurantos.sim.determinism import stable_float
 
 
 @pytest.fixture
@@ -586,3 +589,63 @@ async def test_speed_change_before_to_day_zero(client, pb):
     clock = (await client.get("/sim/clock")).json()
     assert clock["state"] == "paused"
     assert clock["sim_time"] == "00:00:00"
+
+
+async def test_start_carries_duplicate_rate_and_shuffle(tmp_path: Path, control_client) -> None:
+    """The duplicates PR: duplicate_rate and shuffle are part of the
+    start body, recorded in meta.json next to the seed, and the status
+    answer carries the resends as their own counter."""
+    clock = FakeWallClock()
+    pb = make_playback(
+        sample_orders(6),
+        tmp_path,
+        clock=clock,
+        inflight=2,
+        duplicate_offset_s=1.0,
+        shuffle_window=4,
+    )
+    client = control_client(pb)
+    async with client:
+        response = await client.post(
+            "/sim/playback",
+            json={
+                "action": "start",
+                "from_day": 14,
+                "to_day": 14,
+                "seed": 5,
+                "speed": 1000.0,
+                "run_id": "api-dup",
+                "duplicate_rate": 0.5,
+                "shuffle": True,
+            },
+        )
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["state"] == "running"
+        assert body["orders_resent"] == 0  # nothing resent yet
+
+    await drive(pb, clock)
+    meta = json.loads((tmp_path / "api-dup" / "meta.json").read_text(encoding="utf-8"))
+    assert meta["seed"] == 5
+    assert meta["duplicate_rate"] == 0.5
+    assert meta["duplicate_offset_s"] == 1.0
+    assert meta["shuffle"] is True
+    assert meta["shuffle_window"] == 4
+    # and the run resent exactly the hash-decided share
+    expected = sum(
+        1
+        for order in sample_orders(6)
+        if stable_float(5, order.external_order_id, "duplicate") < 0.5
+    )
+    assert pb.status()["orders_resent"] == expected
+
+
+async def test_start_refuses_a_duplicate_rate_outside_zero_to_one(client) -> None:
+    """Pydantic answers 422 before the engine sees it: the body schema
+    bounds the rate the same way the settings and the engine do."""
+    for bad in (1.5, -0.1):
+        response = await client.post(
+            "/sim/playback",
+            json={"action": "start", "from_day": 14, "to_day": 14, "duplicate_rate": bad},
+        )
+        assert response.status_code == 422, bad

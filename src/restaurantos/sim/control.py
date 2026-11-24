@@ -44,6 +44,11 @@ class PlaybackCommand(BaseModel):
     seed: int = 0
     # one path component, no traversal; the engine checks it too
     run_id: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    # Duplicates and shuffle (architecture 6.3/7.2), per run like the
+    # seed they derive from. The engine refuses shuffle in sequential
+    # mode and a rate outside [0, 1]; pydantic answers 422 first here.
+    duplicate_rate: float = Field(default=0.0, ge=0.0, le=1.0)
+    shuffle: bool = False
 
 
 class PlaybackSpeed(BaseModel):
@@ -90,6 +95,8 @@ def make_control_app(playback: Playback) -> FastAPI:
                     to_day=command.to_day,
                     speed=command.speed or playback.default_speed,
                     run_id=command.run_id,
+                    duplicate_rate=command.duplicate_rate,
+                    shuffle=command.shuffle,
                 )
                 status = playback.status()
                 if (
