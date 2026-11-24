@@ -4,10 +4,15 @@
 # environment variables at `docker run` time, never from the image.
 # Build: docker build -f infra/Dockerfile -t restaurantos-services:local .
 
-# Builder: compile psycopg-c against Debian trixie's own libpq 17 headers.
-# No PGDG repository: python:3.14-slim-trixie IS Debian 13 (trixie), which
-# ships PostgreSQL 17 (docs/setup.md, "17 or newer").
-FROM python:3.14-slim-trixie AS builder
+# Both stages must use the same base: /app/.venv/bin/python links to the
+# builder's interpreter. ARG before the first FROM is visible to every FROM.
+# python:3.14-slim-trixie IS Debian 13 (trixie), which ships PostgreSQL 17,
+# so Debian's own libpq meets the "17 or newer" rule (docs/setup.md) — no
+# PGDG repository in the image.
+ARG BASE_IMAGE=python:3.14-slim-trixie
+
+# Builder: compile psycopg-c against trixie's own libpq 17 headers.
+FROM ${BASE_IMAGE} AS builder
 
 ENV UV_PYTHON_DOWNLOADS=never \
     UV_COMPILE_BYTECODE=1 \
@@ -36,9 +41,9 @@ COPY db/ db/
 RUN uv sync --locked --no-dev
 
 # Final: runtime only. No toolchain, no -dev packages, no docs, no tests.
-# Same base tag as the builder: /app/.venv/bin/python symlinks into this
-# image's interpreter.
-FROM python:3.14-slim-trixie
+# Same base as the builder (see BASE_IMAGE above): /app/.venv/bin/python
+# symlinks into that image's interpreter.
+FROM ${BASE_IMAGE}
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libpq5 \
