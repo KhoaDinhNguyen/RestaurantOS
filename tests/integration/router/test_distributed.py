@@ -14,6 +14,7 @@ from psycopg_pool import AsyncConnectionPool
 from restaurantos.common.sqlfiles import schema_files
 from restaurantos.gateway.directory import DirectoryCache, RegionRoute
 from restaurantos.gateway.router.ingredient_usage import (
+    ingredient_usage_single,
     join_lines_with_recipes,
     merge_ingredient_usage,
     query_recipes,
@@ -38,6 +39,7 @@ class MiniCluster:
     r1: AsyncConnectionPool
     r2: AsyncConnectionPool
     baseline: AsyncConnectionPool
+    hq: AsyncConnectionPool
 
 
 class MiniRegionPools:
@@ -125,6 +127,119 @@ async def make_schema(
     return pool
 
 
+async def make_hq_schema(
+    dsn: str,
+    admin: psycopg.AsyncConnection,
+    name: str,
+    baseline_name: str,
+) -> AsyncConnectionPool:
+    """Create HQ analytics containing the same mini facts as baseline."""
+
+    await admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(name)))
+
+    setup = await psycopg.AsyncConnection.connect(
+        dsn,
+        autocommit=True,
+        options=f"-c search_path={name}",
+    )
+
+    try:
+        for path in schema_files("hq"):
+            await setup.execute(path.read_text(encoding="utf-8"))
+
+        # HQ needs the shared reference data.
+        with psycopg.connect(
+            dsn,
+            autocommit=True,
+            options=f"-c search_path={name}",
+        ) as sync_conn:
+            load_mini(
+                sync_conn,
+                with_region_data=False,
+            )
+
+        # Copy the mini region facts into HQ's analytics representation.
+        await setup.execute(
+            sql.SQL(
+                """
+                INSERT INTO analytics_orders (
+                    order_day,
+                    order_id,
+                    region_id,
+                    vendor_id,
+                    channel,
+                    external_order_id,
+                    customer_id,
+                    customer_geohash,
+                    order_time,
+                    status,
+                    menu_version,
+                    received_at,
+                    committed_at
+                )
+                SELECT
+                    order_day,
+                    order_id,
+                    CASE
+                        WHEN vendor_id IN ('v001', 'v002')
+                            THEN 'r1'
+                        ELSE 'r2'
+                    END,
+                    vendor_id,
+                    channel,
+                    external_order_id,
+                    customer_id,
+                    customer_geohash,
+                    order_time,
+                    status,
+                    menu_version,
+                    received_at,
+                    committed_at
+                FROM {}.orders
+                """
+            ).format(sql.Identifier(baseline_name))
+        )
+
+        await setup.execute(
+            sql.SQL(
+                """
+                INSERT INTO analytics_order_items (
+                    order_day,
+                    order_id,
+                    line_no,
+                    vendor_id,
+                    product_id,
+                    quantity,
+                    price_units
+                )
+                SELECT
+                    order_day,
+                    order_id,
+                    line_no,
+                    vendor_id,
+                    product_id,
+                    quantity,
+                    price_units
+                FROM {}.order_items
+                """
+            ).format(sql.Identifier(baseline_name))
+        )
+    finally:
+        await setup.close()
+
+    pool = AsyncConnectionPool(
+        dsn,
+        kwargs={
+            "autocommit": True,
+            "options": f"-c search_path={name}",
+        },
+        open=False,
+    )
+    await pool.open()
+
+    return pool
+
+
 @pytest.fixture
 async def mini_cluster():
     dsn = os.environ.get("ROS_TEST_DSN")
@@ -137,6 +252,7 @@ async def mini_cluster():
         "r1": f"ros_wp3_r1_{suffix}",
         "r2": f"ros_wp3_r2_{suffix}",
         "baseline": f"ros_wp3_base_{suffix}",
+        "hq": f"ros_wp3_hq_{suffix}",
     }
 
     admin = await psycopg.AsyncConnection.connect(
@@ -171,10 +287,19 @@ async def mini_cluster():
         )
         pools.append(baseline)
 
+        hq = await make_hq_schema(
+            dsn,
+            admin,
+            names["hq"],
+            names["baseline"],
+        )
+        pools.append(hq)
+
         yield MiniCluster(
             r1=r1,
             r2=r2,
             baseline=baseline,
+            hq=hq,
         )
     finally:
         for pool in pools:
@@ -483,3 +608,81 @@ async def test_nearby_border_contacts_two_regions(
     assert [(row["vendor_id"], row["product_id"]) for row in result.results] == [
         ("v001", "p003"),
     ]
+
+
+async def test_top_dishes_hq_matches_cluster_and_baseline(
+    mini_cluster,
+) -> None:
+    window = QueryWindow(14, 14)
+
+    r1 = await query_top_dishes_node(
+        mini_cluster.r1,
+        window,
+        region_id="r1",
+    )
+    r2 = await query_top_dishes_node(
+        mini_cluster.r2,
+        window,
+        region_id="r2",
+    )
+
+    live = merge_top_dishes(
+        [r1, r2],
+        rank_by="units",
+        limit=100,
+    )
+
+    baseline_rows = await query_top_dishes_node(
+        mini_cluster.baseline,
+        window,
+    )
+    baseline = merge_top_dishes(
+        [baseline_rows],
+        rank_by="units",
+        limit=100,
+    )
+
+    hq_rows = await query_top_dishes_node(
+        mini_cluster.hq,
+        window,
+        hq=True,
+    )
+    hq = merge_top_dishes(
+        [hq_rows],
+        rank_by="units",
+        limit=100,
+    )
+
+    assert live == baseline == hq
+
+
+async def test_ingredient_usage_hq_matches_cluster_and_baseline(
+    mini_cluster,
+) -> None:
+    window = QueryWindow(14, 14)
+
+    r1 = await query_strategy_a_region(
+        mini_cluster.r1,
+        window,
+        region_id="r1",
+    )
+    r2 = await query_strategy_a_region(
+        mini_cluster.r2,
+        window,
+        region_id="r2",
+    )
+
+    live = merge_ingredient_usage([r1, r2])
+
+    baseline = await query_strategy_a_region(
+        mini_cluster.baseline,
+        window,
+    )
+
+    hq = await ingredient_usage_single(
+        mini_cluster.hq,
+        window,
+        mode="hq",
+    )
+
+    assert live == baseline == hq.results
