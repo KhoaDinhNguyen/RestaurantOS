@@ -6,8 +6,9 @@ Acceptance lines from the brief:
 
 - same seed twice gives byte-identical run logs, mid-run speed change
   included;
-- the resent share over a synthetic stream matches the rate exactly
-  (it is hash-determined, not statistical);
+- the resent set over a synthetic stream is exactly the set the hash
+  picks (the rate is a threshold, not a quota: the share comes close to
+  the rate over a long stream but is not guaranteed to equal it);
 - shuffle changes delivery order but never drops or duplicates an
   item, and a window of 1 is no shuffle at all.
 """
@@ -15,12 +16,14 @@ Acceptance lines from the brief:
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import httpx
 import pytest
-from conftest import FakeWallClock, drive, make_playback, sample_orders
+from conftest import FakeWallClock, drive, make_order, make_playback, sample_orders
 
+from restaurantos.common.models import OrderStatus
 from restaurantos.sim.determinism import stable_float
 from restaurantos.sim.playback import Playback
 from restaurantos.sim.stub import make_stub_app
@@ -148,10 +151,11 @@ async def test_same_seed_gives_byte_identical_logs_with_duplicates_and_shuffle(
 # --- duplicates -------------------------------------------------------------
 
 
-async def test_the_resent_share_matches_the_rate_exactly(tmp_path: Path) -> None:
-    """The rate is a hash decision per order: over a synthetic stream
-    the resent count is exactly the number the hash picks - not a
-    statistical draw around it."""
+async def test_the_resent_set_is_exactly_the_hash_selection(tmp_path: Path) -> None:
+    """The rate is a hash threshold per order: over a synthetic stream
+    the resent orders are exactly the ones the hash picks - not a
+    statistical draw around them. (The share itself is only close to
+    the rate; on a 40-order stream it can be well off.)"""
     orders = sample_orders(40)
     seed, rate = 3, 0.25
     expected = expected_resent(orders, seed, rate)
@@ -198,15 +202,38 @@ async def test_duplicate_rate_boundaries(tmp_path: Path) -> None:
     assert sorted(sent) == sorted([o.external_order_id for o in orders] * 2)
 
 
+class CapturingTransport(httpx.AsyncBaseTransport):
+    """Records every POST /orders body on its way to the inner transport."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+        self.inner = inner
+        self.order_bodies: dict[str, list[dict]] = defaultdict(list)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path.endswith("/orders"):
+            body = json.loads(request.content)
+            self.order_bodies[body["external_order_id"]].append(body)
+        return await self.inner.handle_async_request(request)
+
+
 async def test_resend_lines_are_well_formed(tmp_path: Path) -> None:
     """A resend's line is an order line: same fields as the original,
     plus resend: true, its own seq, its answer's response fields - and
     it goes out after its own original, at the order's instant plus the
-    hash-drawn offset."""
+    hash-drawn offset. On the wire it is the original's request body,
+    byte for byte in content: items, vendor, customer and all."""
     orders = sample_orders(40)
     seed, rate, offset_s = 11, 0.4, 6.0
+    transport = CapturingTransport(httpx.ASGITransport(app=make_stub_app()))
     clock = FakeWallClock()
-    pb = make_playback(orders, tmp_path, clock=clock, inflight=4, duplicate_offset_s=offset_s)
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        inflight=4,
+        duplicate_offset_s=offset_s,
+        transport=transport,
+    )
     await pb.start(
         seed=seed, from_day=14, to_day=16, speed=1000.0, run_id="resend", duplicate_rate=rate
     )
@@ -241,6 +268,42 @@ async def test_resend_lines_are_well_formed(tmp_path: Path) -> None:
         assert line["sim_sent_at"] == pytest.approx(original["sim_sent_at"] + offset)
         # and dispatched after its original: a later line in the log
         assert lines.index(line) > lines.index(original)
+
+    # the wire: a resent order was POSTed exactly twice with the same whole
+    # body (a change to items, vendor_id or customer fields between the two
+    # is caught here, not only a different order_id); every other order once
+    resent_ids = {line["external_order_id"] for line in resent_lines(lines)}
+    assert resent_ids, "pick a seed that resends something"
+    assert set(transport.order_bodies) == {o.external_order_id for o in orders}
+    for oid, bodies in transport.order_bodies.items():
+        if oid in resent_ids:
+            assert len(bodies) == 2, oid
+            assert bodies[0] == bodies[1], oid
+        else:
+            assert len(bodies) == 1, oid
+
+
+async def test_a_zero_offset_resend_goes_before_the_next_same_instant_order(
+    tmp_path: Path,
+) -> None:
+    """With the offset bound at 0, every resend is due at its own
+    order's instant. Its tiebreak is the stream position, so it sorts
+    after its own original and before the next original of the same
+    simulated second - never after it. (Keyed on the dispatch sequence,
+    which runs ahead of the stream position, the resend of the first
+    order of a same-second triple went out after the other two.)"""
+    orders = sample_orders(12)  # holds same-second triples
+    clock = FakeWallClock()
+    pb = make_playback(orders, tmp_path, clock=clock, inflight=4, duplicate_offset_s=0.0)
+    await pb.start(seed=0, from_day=14, to_day=14, speed=1000.0, run_id="ties", duplicate_rate=1.0)
+    await drive(pb, clock)
+
+    delivered = [
+        (line["external_order_id"], line.get("resend") is True)
+        for line in order_lines(run_log_lines(tmp_path, pb))
+    ]
+    expected = [(o.external_order_id, resend) for o in orders for resend in (False, True)]
+    assert delivered == expected
 
 
 async def test_resends_share_the_inflight_bound(tmp_path: Path) -> None:
@@ -346,6 +409,131 @@ async def test_shuffle_survives_a_mid_run_speed_change(tmp_path: Path) -> None:
     expected_ids = [orders[position].external_order_id for position in expected]
     assert delivered == expected_ids
     assert sorted(delivered) == sorted(o.external_order_id for o in orders)
+
+
+async def test_shuffle_never_carries_an_order_across_a_restock(tmp_path: Path) -> None:
+    """One batch straddles midnight, where day 21's restock is due. The
+    previous day's orders all go out before the restock, in shuffle order
+    among themselves, and the next day's after it, in shuffle order too -
+    the shuffle reorders within each side, never across the restock."""
+    day20 = [make_order(20, 23, 59, s, f"30{i}") for i, s in enumerate((20, 30, 40, 50))]
+    day21 = [make_order(21, 0, 0, s, f"31{i}") for i, s in enumerate((10, 20, 30, 40))]
+    orders = day20 + day21
+    window = len(orders)  # one batch
+
+    def shuffle_rank(seed: int):
+        return lambda p: (stable_float(seed, orders[p].external_order_id, "shuffle"), p)
+
+    # a seed whose unbarriered batch order would cross the restock: some
+    # day-21 order ranks before some day-20 order
+    for seed in range(200):
+        naive = sorted(range(len(orders)), key=shuffle_rank(seed))
+        first_day21 = min(naive.index(p) for p in range(4, 8))
+        last_day20 = max(naive.index(p) for p in range(4))
+        if first_day21 < last_day20:
+            break
+    else:
+        pytest.fail("no seed crosses the restock")
+
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        inflight=4,
+        restock_every=7,  # W=14: the restock day is 21
+        warm_up_days=14,
+        restock_vendors=("v001",),
+        shuffle_window=window,
+    )
+    await pb.start(
+        seed=seed, from_day=20, to_day=21, speed=100_000.0, run_id="barrier", shuffle=True
+    )
+    await drive(pb, clock)
+    assert pb.status()["state"] == "done", pb.status()
+
+    lines = run_log_lines(tmp_path, pb)
+    key = shuffle_rank(seed)
+    expected = (
+        [orders[p].external_order_id for p in sorted(range(4), key=key)]
+        + ["restock"]
+        + [orders[p].external_order_id for p in sorted(range(4, 8), key=key)]
+    )
+    delivered = [
+        "restock" if line["kind"] == "restock" else line["external_order_id"] for line in lines
+    ]
+    assert delivered == expected
+    restock = lines[4]
+    assert restock["restock_day"] == 21
+    assert restock["sim_sent_at"] == 86_400.0  # midnight of day 21, from day 20
+
+
+async def test_an_event_between_two_shuffled_orders_keeps_its_instant(tmp_path: Path) -> None:
+    """Status events are not barriers for the shuffle. Window 2: the
+    second batch holds 2003 (00:02:00) and 2004 (00:03:30), and the seed
+    puts 2004 first. 2001's preparing event is due at 00:03:05, between
+    the two orders' instants: it goes out at exactly that instant, before
+    2004 (due later) and therefore before 2003 too, which the shuffle
+    holds back behind 2004 and which goes out late. 2001's ready event
+    (00:15:05) goes after both."""
+    orders = [
+        make_order(14, 0, 0, 5, "2001"),
+        make_order(14, 0, 0, 6, "2002"),
+        make_order(14, 0, 2, 0, "2003"),
+        make_order(14, 0, 3, 30, "2004"),
+    ]
+    for seed in range(200):
+        if stable_float(seed, "2004", "shuffle") < stable_float(seed, "2003", "shuffle"):
+            break
+    else:
+        pytest.fail("no seed puts 2004 first")
+
+    clock = FakeWallClock()
+    pb = make_playback(
+        orders,
+        tmp_path,
+        clock=clock,
+        inflight=4,
+        status_events=True,
+        event_jitter_s=0.0,  # exact instants: the order's instant + 60/180/900/1500 s
+        shuffle_window=2,
+    )
+    await pb.start(seed=seed, from_day=14, to_day=14, speed=1000.0, run_id="between", shuffle=True)
+    await drive(pb, clock)
+
+    lines = run_log_lines(tmp_path, pb)
+
+    def order_at(oid: str) -> int:
+        return next(
+            i
+            for i, line in enumerate(lines)
+            if line["kind"] == "order" and line["external_order_id"] == oid
+        )
+
+    def event_at(oid: str, to_status: OrderStatus) -> int:
+        return next(
+            i
+            for i, line in enumerate(lines)
+            if line["kind"] == "status_event"
+            and line["external_order_id"] == oid
+            and line["to_status"] == to_status.value
+        )
+
+    preparing = event_at("2001", OrderStatus.PREPARING)
+    ready = event_at("2001", OrderStatus.READY)
+    assert lines[preparing]["sim_sent_at"] == 185.0  # 00:00:05 + 180 s, its own instant
+    assert lines[ready]["sim_sent_at"] == 905.0
+    # the shuffle held 2003 back behind 2004
+    assert order_at("2004") < order_at("2003")
+    # the event due between the two goes before both; the later one after both
+    assert preparing < order_at("2004") < order_at("2003") < ready
+    # the orders keep their own instants on their lines, however late they left
+    assert lines[order_at("2003")]["sim_sent_at"] == 120.0
+    assert lines[order_at("2004")]["sim_sent_at"] == 210.0
+    # and the accounting is untouched: four events per accepted order
+    status = pb.status()
+    assert status["orders_sent"] == len(orders)
+    assert status["events_sent"] + status["events_skipped"] == 4 * status["orders_acked"]
 
 
 async def test_shuffle_respects_the_kitchen_timeline(tmp_path: Path) -> None:

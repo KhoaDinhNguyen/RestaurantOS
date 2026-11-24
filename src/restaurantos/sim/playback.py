@@ -891,7 +891,26 @@ class Playback:
                     stopped = True
                     break
                 heap_next = self._heap[0][:4] if self._heap else None
-                entry = min(buffer, key=lambda e: (e[0], e[1])) if buffer else None
+                # A restock is a barrier the shuffle never crosses (review
+                # round 1): while the next heap item is a restock, only the
+                # buffered orders due before it are candidates, still in
+                # shuffle-key order among themselves. Without this, the
+                # shuffle pick could be an order after the restock's
+                # instant, the restock would go out first, and an earlier
+                # buffered order (the previous day's, at midnight) would
+                # land after it - "order, then restock" is the stock rule
+                # the restock gate below exists for. Status events and
+                # resends are deliberately NOT barriers: they are about
+                # orders already dispatched, and they are about four times
+                # denser than orders, so treating them as barriers would
+                # cut almost every batch down to one order and switch the
+                # shuffle off in practice.
+                candidates = buffer
+                if heap_next is not None and heap_next[1] == RANK_RESTOCK:
+                    due = [e for e in buffer if _delivery_key(e[2], e[1]) < heap_next]
+                    if due:
+                        candidates = due
+                entry = min(candidates, key=lambda e: (e[0], e[1])) if candidates else None
                 if entry is not None and (
                     heap_next is None or _delivery_key(entry[2], entry[1]) <= heap_next
                 ):
@@ -914,7 +933,7 @@ class Playback:
                             stopped = True
                             break
                     last_dispatched_at = order_target
-                    self._dispatch_order(order_target - sim_start, request)
+                    self._dispatch_order(order_target - sim_start, request, index)
                     if self._sequential and self._send_tasks:
                         # send-after-ack: wait for this order's answer
                         # before the next order goes out. The heap still
@@ -1243,31 +1262,41 @@ class Playback:
             await self._wake_or_end()
         return self._state != STOPPING
 
-    def _dispatch_order(self, sim_offset: float, request: OrderRequest) -> None:
+    def _dispatch_order(self, sim_offset: float, request: OrderRequest, stream_index: int) -> None:
         seq = self._next_seq()
         self._sent += 1
         handle = self._schedule_events(seq, request, sim_offset)
-        self._schedule_duplicate(seq, request, sim_offset)
+        # the resend's heap tiebreak is the stream position (the same
+        # number space as the stream side's _delivery_key); seq stays
+        # the dispatch sequence, for the log
+        self._schedule_duplicate(stream_index, request, sim_offset)
         task = asyncio.create_task(self._send_one(seq, request, sim_offset, handle))
         self._send_tasks.add(task)
         task.add_done_callback(self._send_tasks.discard)
 
-    def _schedule_duplicate(self, order_seq: int, request: OrderRequest, sim_offset: float) -> None:
+    def _schedule_duplicate(
+        self, stream_index: int, request: OrderRequest, sim_offset: float
+    ) -> None:
         """Reserve this order's resend, or nothing (architecture 7.2).
 
         An order is resent when stable_float(seed, order_id, "duplicate")
-        is below the run's duplicate_rate - a hash decision, so the resent
-        share over a stream is exactly the rate, not a statistical draw,
-        and the same seed always resends the same orders. The resend goes
+        is below the run's duplicate_rate - a hash threshold, not a quota:
+        the same seed always resends the same orders, and the resent share
+        comes close to the rate over a long stream without being
+        guaranteed to equal it. The resend goes
         out at the order's own instant plus a hash-drawn offset in
         [0, duplicate_offset_s) simulated seconds, scheduled here at the
         order's dispatch like an event deadline: it depends on nothing
         but the seed, the order and the settings, never on when the
-        first answer happens to come back. The tiebreak (dispatch
-        sequence, 1) sorts a zero-offset resend after its own original -
-        the stream item's key is (..., order_seq, 0) - and before the
-        next stream order, so a same-instant resend never swaps with
-        either.
+        first answer happens to come back. The tiebreak (stream
+        position, 1) sorts a zero-offset resend after its own original -
+        the stream item's key is (..., stream_index, 0) - and before the
+        next same-instant stream order (..., stream_index + 1, 0), so a
+        same-instant resend never swaps with either. The tiebreak must
+        be the stream position, not the dispatch sequence: the sequence
+        also counts events, restocks and earlier resends, so it runs
+        ahead of the stream position and a resend keyed on it would
+        sort after later same-instant originals (review round 1).
         """
         if self._duplicate_rate <= 0.0:
             return
@@ -1283,7 +1312,7 @@ class Playback:
             (
                 sim_time + offset,
                 RANK_ORDER,
-                order_seq,
+                stream_index,
                 1,
                 "duplicate",
                 (request, offset),

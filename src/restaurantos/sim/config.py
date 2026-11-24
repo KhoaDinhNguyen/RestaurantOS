@@ -62,8 +62,10 @@ class SimSettings(BaseSettings):
     playback_kitchen_attempts: int = Field(default=3, ge=1)
     # Duplicates and shuffle (architecture 7.2), one block: an order is
     # resent when stable_float(seed, order_id, "duplicate") is below
-    # duplicate_rate - a hash decision, so the resent share over a
-    # stream is exactly the rate, never a statistical draw. The resend
+    # duplicate_rate - a hash threshold, not a quota: the same seed
+    # always resends the same orders, and the resent share comes close
+    # to the rate over a long stream but is not guaranteed to equal it
+    # (a short stream can be well off). The resend
     # is the same request body, so the region's inbox answers duplicate
     # and the idempotency is exercised; it lands at the order's own
     # instant plus a hash-drawn offset in [0, duplicate_offset_s)

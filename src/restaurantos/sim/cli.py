@@ -142,8 +142,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--duplicate-rate",
         type=float,
         default=None,
-        help="share of orders to resend, 0 to 1 - a hash decision, so the "
-        "resent share is exactly the rate (default ROS_SIM_PLAYBACK_DUPLICATE_RATE, off)",
+        help="share of orders to resend, 0 to 1 - a hash threshold per order, so "
+        "the same seed resends the same orders; the resent share comes close to "
+        "the rate over a long run (default ROS_SIM_PLAYBACK_DUPLICATE_RATE, off)",
     )
     pstart.add_argument(
         "--duplicate-offset-s",
