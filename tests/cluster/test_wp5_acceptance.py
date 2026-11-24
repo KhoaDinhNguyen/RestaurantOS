@@ -15,6 +15,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from tests.cluster.wp5_support import cleanup_acceptance, produce_orders
 
 from restaurantos.common.cluster import HQ_PRIMARY, HQ_STANDBY, Cluster, link_groups, proxy_name
 from restaurantos.common.config import Settings
@@ -22,7 +23,7 @@ from restaurantos.common.db import make_pool, node_conninfo, run_on
 from restaurantos.common.errors import RegionUnreachableError
 from restaurantos.common.hq import HQPool
 from restaurantos.coordinator.config import CoordinatorSettings
-from restaurantos.coordinator.hq_promotion import promote
+from restaurantos.coordinator.hq_promotion import HQPromotionError, inspect_container, promote
 from restaurantos.coordinator.hq_rejoin import recover as rejoin_hq
 from restaurantos.coordinator.rejoin import command
 from restaurantos.coordinator.rejoin import recover as rejoin_region
@@ -227,33 +228,13 @@ async def test_wp5_recovery_under_orders(monkeypatch, tmp_path):
                         transport=httpx.ASGITransport(app=edge), base_url="http://edge.test"
                     ) as local,
                 ):
-
-                    async def produce(client, label):
-                        nonlocal retry_count
-                        number = 0
-                        while not producers_stop.is_set():
-                            external = f"{label}-{number}"
-                            body = {
-                                "channel": "wp5-load",
-                                "external_order_id": external,
-                                "vendor_id": "v001",
-                                "order_day": 14,
-                                "order_time": "12:00:00",
-                                "items": [{"product_id": "p003", "quantity": 1}],
-                            }
-                            response = await client.post("/api/v1/orders", json=body)
-                            if response.status_code in (200, 201, 202):
-                                assert response.json().get("outcome") != "refused", response.text
-                                acknowledgements[external] = response.status_code
-                                number += 1
-                            else:
-                                assert response.status_code == 503, response.text
-                                retry_count += 1
-                            await asyncio.sleep(0.15)
-
                     producers = [
-                        asyncio.create_task(produce(api, "gateway")),
-                        asyncio.create_task(produce(local, "edge")),
+                        asyncio.create_task(
+                            produce_orders(api, "gateway", producers_stop, acknowledgements)
+                        ),
+                        asyncio.create_task(
+                            produce_orders(local, "edge", producers_stop, acknowledgements)
+                        ),
                     ]
 
                     async def progress(minimum):
@@ -414,8 +395,22 @@ async def test_wp5_recovery_under_orders(monkeypatch, tmp_path):
                             .json()
                         )
                         assert any(e["event_id"] == result["event_id"] for e in events)
+                    # A repeat with an inconclusive role probe must preserve
+                    # the now-running rejoined HQ standby.
+                    old_id = (
+                        await command([*compose, "ps", "--all", "--quiet", HQ_PRIMARY])
+                    ).strip()
+                    name = proxy_name("coordinator", HQ_PRIMARY)
+                    await cut([name], False)
+                    try:
+                        with pytest.raises(HQPromotionError, match="role is unconfirmed"):
+                            await promote(cluster, settings, config, Path(file))
+                        assert (await inspect_container(old_id))["State"]["Running"]
+                    finally:
+                        await cut([name], True)
+                    print("Unconfirmed repeat preserved the rejoined HQ standby")
                     producers_stop.set()
-                    await asyncio.gather(*producers)
+                    retry_count = sum(await asyncio.gather(*producers))
 
                     async def drained():
                         return await sql(
@@ -463,10 +458,6 @@ async def test_wp5_recovery_under_orders(monkeypatch, tmp_path):
                 await asyncio.gather(*workers)
                 await runtime.close()
         finally:
-            (await tox.post("/reset")).raise_for_status()
-            producers_stop.set()
-            workers_stop.set()
-            await asyncio.gather(*producers, *workers, return_exceptions=True)
-            await runtime.close()
-            for pool in pools.values():
-                await pool.close()
+            await cleanup_acceptance(
+                tox, producers_stop, workers_stop, producers, workers, runtime, pools
+            )

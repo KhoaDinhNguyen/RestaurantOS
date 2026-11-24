@@ -105,3 +105,22 @@ async def test_healthy_hq_replication_is_not_downgraded(fixture):
         await fallback.step_hq()
     runtime.failover.event.assert_not_awaited()
     fallback.disable.assert_not_awaited()
+
+
+async def test_database_error_keeps_pending_intent_and_later_cycle_recovers(fixture, caplog):
+    from psycopg.errors import InsufficientPrivilege
+
+    runtime, fallback, _, _ = fixture
+    await fallback.step_hq()
+    await fallback.step_hq()
+    original = fallback.disable.side_effect
+    fallback.disable.side_effect = InsufficientPrivilege("ALTER SYSTEM denied")
+    await fallback.step_hq()
+    assert "intent retained" in caplog.text
+    assert runtime.failover.event.await_count == 1
+    fallback.disable.side_effect = original
+    await fallback.step_hq()
+    assert [call.args[2] for call in runtime.failover.event.await_args_list] == [
+        "sync_downgrade_requested",
+        "sync_downgrade",
+    ]
