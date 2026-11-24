@@ -475,6 +475,17 @@ async def test_a_run_paused_before_the_save_stays_paused_on_failure(world: World
     assert host.commands == [] and host.state == "paused"
 
 
+async def test_save_gives_up_on_a_dispatch_that_does_not_move(world: World) -> None:
+    ctx, host, docker, _, _ = world
+    host.offset, host.speed_value = 600, 0.0  # 00:10, and stuck there
+    ctx.sim = SimSettings(
+        _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_drain_timeout_s=1.0
+    )
+    with pytest.raises(SnapshotError, match="has not moved"):
+        await save("stalled", ctx)
+    assert host.commands == [] and docker.calls == []
+
+
 async def test_save_refuses_a_paused_run_that_dispatched_nothing(world: World) -> None:
     ctx, host, docker, _, _ = world
     host.state, host.dispatched = "paused", False

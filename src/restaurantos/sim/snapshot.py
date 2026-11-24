@@ -361,6 +361,10 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
             f"offset plus up to {events.get('jitter_s')} s jitter), and restore replays "
             f"only the snapshot's own day: raise it to at least {floor}"
         )
+    # dispatch can stall (a target that stopped answering holds the events
+    # behind their orders): give up once it has not moved for as long as
+    # the in-flight wait would wait, instead of waiting forever
+    still = 0.0
     while True:
         frontier = frontier_seconds(status)
         if frontier is not None and frontier % SECONDS_PER_DAY >= minimum:
@@ -372,8 +376,16 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
                 f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day: the restored "
                 "day is replayed from midnight, so resume the run past that time first"
             )
+        if still >= ctx.sim.snapshot_drain_timeout_s:
+            where = "before its first item" if frontier is None else f"at {_at(frontier)}"
+            raise SnapshotError(
+                f"the run's dispatch has not moved for {still:g} s ({where}), before "
+                f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day: no snapshot "
+                "- is the target answering?"
+            )
         await ctx.sleep(0.1)
         status = await ctx.playback.status() or {}
+        still = 0.0 if frontier_seconds(status) != frontier else still + 0.1
     if was_running:
         response = await ctx.playback.command({"action": "pause"})
         if response.status_code != 200:
