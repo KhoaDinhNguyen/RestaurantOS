@@ -474,6 +474,7 @@ async def _run_start(
                 duplicate_rate=duplicate_rate,
                 shuffle=shuffle_on,
                 meta_extra=meta_extra,
+                skip_first_restock=getattr(args, "skip_first_restock", False),
             )
         except StateError:
             # A run was started through the control API in the window
