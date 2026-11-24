@@ -765,3 +765,87 @@ async def test_restore_warns_when_the_host_runs_other_engine_flags(world) -> Non
     host.engine_meta = {"target_url": "http://127.0.0.1:8000/api/v1", "sequential": True}
     result = await restore("snap", ctx)
     assert any("sequential" in warning for warning in result["resume"]["warnings"])
+
+
+ENGINE = {
+    "sequential": False,
+    "region": None,
+    "target_url": "http://127.0.0.1:8000/api/v1/orders",
+    "inflight": 64,
+    "events": {"enabled": True, "sample_rate": 1.0, "jitter_s": 60.0},
+    "restock_every": 7,
+    "duplicate_offset_s": 1.0,
+    "shuffle_window": 8,
+    "kitchen": {"mode": "edge", "urls": {"r1": "http://127.0.0.1:8011/api/v1"}},
+}
+
+
+def _command(run: dict, sim: SimSettings | None = None, **kwargs) -> tuple[str, list[str]]:
+    from restaurantos.sim.snapshot import replay_command
+
+    return replay_command(
+        {"to_day": 28, "seed": 7, **run},
+        day=23,
+        run_id="run-a-r1",
+        speed=1000.0,
+        skip_first_restock=kwargs.pop("skip", False),
+        sim=sim or SimSettings(_env_file=None),
+        cluster=CLUSTER,
+    )
+
+
+def test_a_run_on_the_current_settings_gets_the_minimal_command() -> None:
+    command, notes = _command({"duplicate_rate": 0.0, "shuffle": False, "engine": ENGINE})
+    assert command == (
+        "rosctl playback start --from-day 23 --to-day 28 --seed 7 "
+        "--run-id run-a-r1 --speed 1000"
+    )
+    assert notes == [
+        "flags left out match your current settings (ROS_SIM_*, .env); if you "
+        "change those first, add the flags back"
+    ]
+
+
+def test_a_setting_the_run_overrode_comes_back_as_a_flag() -> None:
+    """CodeRabbit's case: the env now resends and shuffles, the run did not."""
+    sim = SimSettings(_env_file=None, playback_duplicate_rate=0.3, playback_shuffle=True)
+    command, _ = _command({"duplicate_rate": 0.0, "shuffle": False, "engine": ENGINE}, sim)
+    assert "--duplicate-rate 0 " in command + " " and "--no-shuffle" in command
+    command, _ = _command({"duplicate_rate": 0.05, "shuffle": True, "engine": ENGINE}, skip=True)
+    assert "--duplicate-rate 0.05" in command and command.count("--shuffle") == 1
+    assert "--skip-first-restock" in command
+
+
+def test_the_engine_flags_of_a_sequential_edge_run() -> None:
+    from restaurantos.sim.regions import edge_target_url
+
+    engine = {
+        **ENGINE,
+        "sequential": True,
+        "region": "r1",
+        "inflight": 1,
+        "target_url": edge_target_url(CLUSTER, "r1") + "/orders",
+        "events": {"enabled": True, "sample_rate": 0.5, "jitter_s": 30.0},
+        "restock_every": 14,
+        "shuffle_window": 4,
+        "kitchen": {"mode": "override", "url": "http://127.0.0.1:8900/api/v1"},
+    }
+    command, notes = _command({"engine": engine})
+    for flag in (
+        "--sequential",
+        "--region r1",
+        "--target edge",
+        "--event-sample-rate 0.5",
+        "--restock-days 14",
+        "--shuffle-window 4",
+        "--kitchen-target http://127.0.0.1:8900/api/v1",
+    ):
+        assert flag in command
+    assert "--inflight" not in command  # sequential means 1
+    assert any("ROS_SIM_PLAYBACK_EVENT_JITTER_S=30" in note for note in notes)
+
+
+def test_a_snapshot_without_engine_facts_falls_back_to_its_three() -> None:
+    command, notes = _command({"sequential": True, "region": "r1", "target_url": None})
+    assert "--sequential --region r1" in command
+    assert any("predates" in note for note in notes)

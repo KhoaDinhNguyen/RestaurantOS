@@ -486,6 +486,8 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
                 "sequential": meta.get("sequential", False),
                 "region": meta.get("region"),
                 "target_url": meta.get("target_url"),
+                # every engine fact, from the live host (GET /sim/playback)
+                "engine": status.get("engine"),
             }
             shutil.copytree(run_dir, partial / "run" / run_id)
         shutil.copy2(ctx.cluster_file, partial / "cluster.toml")
@@ -702,7 +704,125 @@ async def _restore_toxiproxy(ctx: Context, cluster: Cluster, saved: list[dict]) 
     return skipped
 
 
-async def _resume(ctx: Context, record: dict[str, Any], snap: Path) -> dict[str, Any]:
+def _num(value: Any) -> str:
+    return f"{float(value):g}"
+
+
+def _api_base(url: str) -> str:
+    return url.rstrip("/").removesuffix("/orders")
+
+
+def replay_command(
+    run: dict[str, Any],
+    *,
+    day: int,
+    run_id: str,
+    speed: float,
+    skip_first_restock: bool,
+    sim: SimSettings,
+    cluster: Cluster,
+) -> tuple[str, list[str]]:
+    """The `rosctl playback start` that resumes a restored run by hand,
+    and notes for what no flag can set.
+
+    Minimal but exact: the flags with no meaningful default for a replay
+    are always there (the day, the window, the seed, the run id, the
+    speed, the restock skip); every other setting gets a flag only where
+    the saved run differs from what a start would pick up from the
+    current settings (ROS_SIM_*, .env) - the settings this restore just
+    loaded, the same ones the command will see when run from this
+    checkout and shell."""
+    flags = [f"--from-day {day}", f"--to-day {run['to_day']}", f"--seed {run['seed']}"]
+    flags += [f"--run-id {run_id}", f"--speed {_num(speed)}"]
+    if skip_first_restock:
+        flags.append("--skip-first-restock")
+    notes: list[str] = []
+    rate = float(run.get("duplicate_rate", 0.0))
+    if rate != sim.playback_duplicate_rate:
+        flags.append(f"--duplicate-rate {_num(rate)}")
+    shuffle = bool(run.get("shuffle", False))
+    if shuffle != sim.playback_shuffle:
+        flags.append("--shuffle" if shuffle else "--no-shuffle")
+    # a snapshot from before the engine block: the three facts meta had
+    engine = run.get("engine") or {
+        key: run.get(key) for key in ("sequential", "region", "target_url")
+    }
+    sequential = bool(engine.get("sequential"))
+    region = engine.get("region")
+    if sequential:
+        flags.append("--sequential")
+    if region is not None:
+        flags.append(f"--region {region}")
+    target = engine.get("target_url")
+    if target:
+        base = _api_base(str(target))
+        edge = None
+        if region is not None and region in cluster.region_ids:
+            from restaurantos.sim.regions import edge_target_url
+
+            edge = _api_base(edge_target_url(cluster, region))
+        if base == edge:
+            flags.append("--target edge")
+        elif base != _api_base(sim.playback_target_url):
+            flags.append(f"--target {base}")
+    inflight = engine.get("inflight")
+    if inflight is not None and not sequential and inflight != sim.playback_inflight:
+        flags.append(f"--inflight {inflight}")
+    events = engine.get("events")
+    if events:
+        if bool(events.get("enabled")) != sim.playback_status_events:
+            flags.append("--events" if events.get("enabled") else "--no-events")
+        if events.get("enabled") and events.get("sample_rate") != sim.playback_event_sample_rate:
+            flags.append(f"--event-sample-rate {_num(events.get('sample_rate'))}")
+        if events.get("enabled") and events.get("jitter_s") != sim.playback_event_jitter_s:
+            notes.append(
+                f"set ROS_SIM_PLAYBACK_EVENT_JITTER_S={_num(events.get('jitter_s'))} first "
+                "(it has no flag)"
+            )
+    if "restock_every" in engine:
+        every = engine.get("restock_every")
+        if every is None:
+            notes.append("the saved run had no restock, which rosctl playback start cannot set")
+        elif every != sim.stock_restock_days:
+            flags.append(f"--restock-days {every}")
+    offset = engine.get("duplicate_offset_s")
+    if offset is not None and offset != sim.playback_duplicate_offset_s:
+        flags.append(f"--duplicate-offset-s {_num(offset)}")
+    window = engine.get("shuffle_window")
+    if window is not None and window != sim.shuffle_window:
+        flags.append(f"--shuffle-window {window}")
+    kitchen = engine.get("kitchen") or {}
+    if kitchen.get("mode") == "override":
+        flags.append(f"--kitchen-target {kitchen.get('url')}")
+    elif kitchen.get("mode") == "edge":
+        from restaurantos.sim.playback_cli import kitchen_urls
+
+        if kitchen.get("urls") != kitchen_urls(cluster, sim.playback_edge_host):
+            notes.append(
+                f"the saved run sent kitchen calls to {kitchen.get('urls')}: set "
+                "ROS_SIM_PLAYBACK_EDGE_HOST to match first (it has no flag)"
+            )
+    elif kitchen.get("mode") == "target":
+        notes.append(
+            "the saved run sent kitchen calls to its order target, which "
+            "rosctl playback start cannot set"
+        )
+    if engine is not run.get("engine"):
+        notes.append(
+            "this snapshot predates the recorded engine settings: add any other "
+            "start flag the original run used"
+        )
+    else:
+        notes.append(
+            "flags left out match your current settings (ROS_SIM_*, .env); if you "
+            "change those first, add the flags back"
+        )
+    return "rosctl playback start " + " ".join(flags), notes
+
+
+async def _resume(
+    ctx: Context, record: dict[str, Any], snap: Path, cluster: Cluster
+) -> dict[str, Any]:
     run = record["run"]
     day = int(record["sim_day"])
     point = sim_seconds({"sim_day": record["sim_day"], "sim_time": record["sim_time"]})
@@ -748,21 +868,20 @@ async def _resume(ctx: Context, record: dict[str, Any], snap: Path) -> dict[str,
                 "skips the whole batch, as the original run went on without them "
                 "(restock_failed_vendors lists every one)"
             )
-    flags = [f"--from-day {day}", f"--to-day {run['to_day']}", f"--seed {run['seed']}"]
-    flags += [f"--run-id {new_run}", f"--speed {saved_speed:g}"]
-    if body["duplicate_rate"]:
-        flags.append(f"--duplicate-rate {body['duplicate_rate']}")
-    if body["shuffle"]:
-        flags.append("--shuffle")
-    if skip:
-        flags.append("--skip-first-restock")
-    manual = "rosctl playback start " + " ".join(flags)
+    manual, notes = replay_command(
+        run,
+        day=day,
+        run_id=new_run,
+        speed=saved_speed,
+        skip_first_restock=skip,
+        sim=ctx.sim,
+        cluster=cluster,
+    )
+    resume["manual_command"] = manual
     if await ctx.playback.status() is None:
         resume["started"] = False
-        resume["warnings"].append(
-            f"no playback host at {ctx.playback.base_url}; resume with the original "
-            f"run's engine flags (--sequential, --region, ...) added: {manual}"
-        )
+        resume["warnings"].append(f"no playback host at {ctx.playback.base_url}; resume with: {manual}")
+        resume["warnings"] += notes
         return resume
     response = await ctx.playback.command(body)
     if response.status_code != 200:
@@ -892,7 +1011,7 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
             "process that read the old one"
         )
     if record.get("run"):
-        result["resume"] = await _resume(ctx, record, snap)
+        result["resume"] = await _resume(ctx, record, snap, snapshot_cluster)
     return result
 
 
