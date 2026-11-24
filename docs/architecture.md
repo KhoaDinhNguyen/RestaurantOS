@@ -798,7 +798,13 @@ It answers `201` with the fault; `404` for an unknown link group; `409` with `{"
   "proxies": ["gateway__r1-primary", "gateway__r1-standby"], "created_at": "..." }
 ```
 
-`DELETE /sim/faults/{fault_id}` answers `200`, or `404`. `POST /sim/faults/heal-all` answers `200` with `{"healed": 3}`. `GET /sim/links` lists every link group as `{"group", "proxies", "faults"}`, each fault in the shape above.
+`DELETE /sim/faults/{fault_id}` answers `200`, or `404`. `POST /sim/faults/heal-all` answers `200` with `{"healed": 3}`. `GET /sim/links` lists every link group as `{"group", "proxies", "faults", "unexplained"}`, each fault in the shape above. `unexplained` is `{"disabled", "toxics", "missing"}`: the group's proxies that are disabled with no known `cut` holding them, its toxics no known fault added (`{"proxy", "name", "type", "stream"}`), and proxies Toxiproxy does not have at all.
+
+- Fault ids live in the control process only. After a restart the ids are gone but Toxiproxy keeps the toxics and disabled proxies; they show under `unexplained`, and `heal-all` (Toxiproxy's own reset) clears them.
+- The link groups overlap (`node:r1-primary` and `repl:r1` share `r1-standby__r1-primary`). A proxy stays disabled until the last `cut` holding it is healed, and every toxic is named after its fault (`f3-latency-up`), so a heal never undoes another fault.
+- Errors answer `{"error", "message"}`: `unknown_group`, `unknown_fault`, `unknown_node`, `unknown_job` (`404`), `fault_exists` (`409`, with the existing `fault_id`), `invalid_params` (`422`), and `toxiproxy_error` / `docker_error` (`502`) when Toxiproxy or Docker fails.
+
+**The control process.** `rosctl control` serves all of this on port 8002 and hosts playback in the same process (the same engine flags as `rosctl playback start`, fixed for every run it hosts); runs are started through `POST /sim/playback`, or `rosctl playback start --via-control --from-day N`. A standalone `rosctl playback start` still works when no control process runs; only one of the two can own the port. The `rosctl` clients are `rosctl links`, `rosctl fault add|heal|heal-all|list`, `rosctl node kill|start` and `rosctl job <job_id>`.
 
 **Nodes.** `POST /sim/nodes/{node_id}/kill` and `/start` answer `200` with `{"node_id": "r1-primary", "running": false}`, or `404` for an unknown node. Killing a stopped node or starting a running one changes nothing.
 

@@ -4,13 +4,12 @@ Section 6.3): the routes that observe and steer a live run.
 The architecture puts this API on the control process, port 8002, so
 that the UI (WP7) can drive playback and other tools can tell a run is
 live (`rosctl baseline sync` refuses while playback is running by
-reading `GET /sim/playback`). The WP6b control process does not exist
-yet, so until it does, `rosctl playback start` hosts these routes in
-the playback process itself, on 127.0.0.1 by default. When WP6b lands
-it takes the port over and fronts (or proxies) this slice.
-
-Known seam, accepted: two processes cannot both bind the same control
-port. WP6b will resolve it; the port is a setting either way.
+reading `GET /sim/playback`). Two processes can host it: `rosctl
+playback start` for one foreground run, or `rosctl control` (WP6b),
+which embeds this same factory next to its links, faults, nodes and
+jobs routes (`sim/control_api.py`) and hosts every run started through
+`POST /sim/playback`. Only one of them can own the port; the other
+reports the taken port at bind.
 """
 
 from __future__ import annotations

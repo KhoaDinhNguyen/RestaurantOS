@@ -90,9 +90,9 @@ class SimSettings(BaseSettings):
     # (http://127.0.0.1:8900) until the gateway exists.
     playback_target_url: str = "http://127.0.0.1:8000/api/v1"
     http_timeout_s: float = Field(default=5.0, gt=0)
-    # Where the /sim control routes listen while a playback run is live
-    # (architecture Section 6.3 puts them on the control process, port
-    # 8002; until WP6b exists the playback process hosts them).
+    # Where the /sim control routes listen (architecture Section 6.3):
+    # the control process (`rosctl control`, port 8002), or a standalone
+    # `rosctl playback start` while its run is live.
     control_host: str = "127.0.0.1"
     control_port: int = Field(default=8002, ge=1, le=65535)
 

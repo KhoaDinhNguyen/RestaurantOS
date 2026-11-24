@@ -30,10 +30,11 @@ HOST_BASE_PORT = 5500
 # the tests pin the literal values on purpose). The gateway, the
 # coordinator and the edge APIs have no environment-variable or
 # cluster.toml override: to move one, change it here. "control" is WP6b's
-# control service and stays reserved in the port check below; until it
-# exists, `rosctl playback start` serves its /sim routes on the same 8002
-# by default, and that listener alone can move (ROS_SIM_CONTROL_PORT, or
-# --port) - a clash there is reported by the operating system at bind.
+# control process (`rosctl control`) and stays reserved in the port check
+# below; it, or a standalone `rosctl playback start`, serves the /sim
+# routes on 8002 by default, and that listener alone can move
+# (ROS_SIM_CONTROL_PORT, or --port) - a clash there is reported by the
+# operating system at bind.
 SERVICE_PORTS = {"gateway": 8000, "coordinator": 8001, "control": 8002}
 EDGE_BASE_PORT = 8010
 HQ_PRIMARY = "hq-primary"

@@ -7,6 +7,13 @@ speed, status) are thin HTTP clients for those routes, so the terminal,
 a test script and the WP7 GUI all steer a run through the same
 contract.
 
+`rosctl control` (WP6b) is the same engine set-up kept alive with no run
+of its own: it serves the playback routes AND the control process's
+links, faults, nodes and jobs routes on port 8002, and every run on it
+is started through `POST /sim/playback` (`rosctl playback start
+--via-control`). One process owns the port either way; a standalone
+`playback start` finds it taken and says to use `--via-control`.
+
 Ctrl-C is a stop: the engine finishes what is in flight, closes the
 run log, and the process exits 0.
 """
@@ -22,6 +29,7 @@ import math
 import signal
 import sys
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +39,7 @@ from restaurantos.common.cluster import Cluster, load_cluster, service_port
 from restaurantos.common.config import get_settings
 from restaurantos.common.models import OrderRequest
 from restaurantos.sim.config import SimSettings, get_sim_settings
+from restaurantos.sim.jobs import JobRunner
 from restaurantos.sim.playback import Playback, StateError, restock_days
 from restaurantos.sim.regions import (
     edge_target_url,
@@ -46,6 +55,7 @@ from restaurantos.sim.replaydata import (
     to_order_request,
 )
 from restaurantos.sim.shard import counts_by_cell, vendor_pairs
+from restaurantos.sim.toxiproxy import Toxiproxy
 
 
 def _orders_fn(cache_file: Path, *, where: Callable[[dict], bool] | None = None):
@@ -87,7 +97,10 @@ def kitchen_urls(cluster: Cluster, edge_host: str) -> dict[str, str]:
 
 
 async def start_command(
-    args: argparse.Namespace, *, transport: httpx.AsyncBaseTransport | None = None
+    args: argparse.Namespace,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    control: bool = False,
 ) -> int:
     # The run's diagnostics (the shortening warning, a failed run) go
     # through the restaurantos.sim.playback logger; give it a plain
@@ -103,12 +116,17 @@ async def start_command(
     # included (review round 4, item 5): two starts in one process
     # must never stack handlers
     try:
-        return await _run_start(args, transport)
+        return await _run_start(args, transport, control=control)
     finally:
         _logger.removeHandler(_stderr_handler)
 
 
-async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTransport | None) -> int:
+async def _run_start(
+    args: argparse.Namespace,
+    transport: httpx.AsyncBaseTransport | None,
+    *,
+    control: bool = False,
+) -> int:
     # The CLI override skips SimSettings validation, so it is checked
     # here, before anything is built: a NaN or a share outside [0, 1]
     # would otherwise silently drop or keep every event (review item 6).
@@ -391,6 +409,13 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
     from restaurantos.sim.control import make_control_app
 
     app = make_control_app(playback)
+    extras: _ControlExtras | None = None
+    if control:
+        try:
+            extras = _add_control_extras(app, args.config or common.cluster_file)
+        except (OSError, ValueError) as error:
+            print(f"rosctl control: {error}", file=sys.stderr)
+            return 1
     import uvicorn
 
     config = uvicorn.Config(
@@ -407,12 +432,25 @@ async def _run_start(args: argparse.Namespace, transport: httpx.AsyncBaseTranspo
     if not server.started:
         server.should_exit = True
         await serve
+        if extras is not None:
+            await extras.aclose()
+            print(
+                f"rosctl control: cannot listen on {sim.control_host}:"
+                f"{args.port or sim.control_port} - is another control or playback "
+                "process running?",
+                file=sys.stderr,
+            )
+            return 1
         print(
             "rosctl playback start: cannot listen on "
-            f"{sim.control_host}:{args.port or sim.control_port}",
+            f"{sim.control_host}:{args.port or sim.control_port} - if `rosctl control` "
+            "owns the port, start the run through it: rosctl playback start "
+            "--via-control --from-day N",
             file=sys.stderr,
         )
         return 1
+    if extras is not None:
+        return await _serve_control(playback, server, serve, extras, sim, args)
 
     try:
         # The original to_day goes to the engine: it records it as
@@ -605,9 +643,141 @@ async def build_cache_command(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- the control process (WP6b) -------------------------------------------
+
+
+@dataclass
+class _ControlExtras:
+    toxiproxy: Toxiproxy
+    jobs: JobRunner
+    cluster_file: Path
+    groups: int
+
+    async def aclose(self) -> None:
+        await self.jobs.aclose()
+        await self.toxiproxy.aclose()
+
+
+def _add_control_extras(app: Any, cluster_file: Path) -> _ControlExtras:
+    """Mount the links, faults, nodes and jobs routes beside the playback
+    routes. The cluster file decides the link groups and the nodes - use
+    the file bootstrap ran with."""
+    from restaurantos.common.cluster import link_groups
+    from restaurantos.sim.control_api import add_control_routes
+    from restaurantos.sim.faults import FaultLayer
+    from restaurantos.sim.nodes import Nodes
+
+    cluster = load_cluster(cluster_file)
+    groups = link_groups(cluster)
+    toxiproxy = Toxiproxy()
+    jobs = JobRunner()
+    add_control_routes(app, faults=FaultLayer(toxiproxy, groups), nodes=Nodes(cluster), jobs=jobs)
+    return _ControlExtras(toxiproxy, jobs, cluster_file, len(groups))
+
+
+async def _wait_for_stop() -> None:
+    """Block until Ctrl-C or SIGTERM. A seam the tests replace."""
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        with contextlib.suppress(NotImplementedError):
+            loop.add_signal_handler(sig, stop.set)
+    try:
+        await stop.wait()
+    finally:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with contextlib.suppress(NotImplementedError):
+                loop.remove_signal_handler(sig)
+
+
+async def _serve_control(
+    playback: Playback,
+    server: Any,
+    serve: asyncio.Task,
+    extras: _ControlExtras,
+    sim: SimSettings,
+    args: argparse.Namespace,
+) -> int:
+    print(
+        f"control on {sim.control_host}:{args.port or sim.control_port}: playback, "
+        f"{extras.groups} link groups from {extras.cluster_file}, nodes, jobs. "
+        "Start a run with `rosctl playback start --via-control --from-day N`; "
+        "Ctrl-C stops the process (a live run is stopped first).",
+        file=sys.stderr,
+    )
+    try:
+        await _wait_for_stop()
+    finally:
+        if playback.state in ("running", "paused", "stopping"):
+            with contextlib.suppress(StateError):
+                await playback.stop()
+        await extras.aclose()
+        server.should_exit = True
+        await serve
+    print(
+        "rosctl control: stopped. Faults stay in Toxiproxy after this process "
+        "exits; `rosctl fault heal-all` from a new control process clears them.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+# the flags `rosctl control` fixes for every run it hosts: a run started
+# through it cannot change them
+_ENGINE_FLAGS = {
+    "config": None,
+    "region": None,
+    "target": None,
+    "sequential": False,
+    "kitchen_target": None,
+    "inflight": None,
+    "events": None,
+    "event_sample_rate": None,
+    "restock_days": None,
+    "duplicate_offset_s": None,
+    "shuffle_window": None,
+}
+
+
+async def start_via_control(args: argparse.Namespace) -> int:
+    """`rosctl playback start --via-control`: the start body, posted to the
+    control process. Only the run's own flags travel."""
+    given = [
+        "--" + name.replace("_", "-")
+        for name, unset in _ENGINE_FLAGS.items()
+        if getattr(args, name, unset) != unset
+    ]
+    if given:
+        print(
+            f"rosctl playback start: {', '.join(given)} belong to `rosctl control` "
+            "(they hold for every run it hosts); drop them with --via-control",
+            file=sys.stderr,
+        )
+        return 1
+    if args.from_day is None:
+        print(
+            "rosctl playback start: --via-control needs --from-day "
+            "(the control process picks no default window)",
+            file=sys.stderr,
+        )
+        return 1
+    body: dict[str, Any] = {"action": "start", "from_day": args.from_day, "seed": args.seed}
+    for key in ("to_day", "speed", "run_id", "duplicate_rate", "shuffle"):
+        value = getattr(args, key)
+        if value is not None:
+            body[key] = value
+    return await control_command(args, method="POST", body=body)
+
+
+def run_control(args: argparse.Namespace) -> int:
+    return asyncio.run(start_command(args, control=True))
+
+
 def run(args: argparse.Namespace) -> int:
     command = args.play_command
     if command == "start":
+        if getattr(args, "via_control", False):
+            return asyncio.run(start_via_control(args))
         return asyncio.run(start_command(args))
     if command == "pause":
         return asyncio.run(control_command(args, method="POST", body={"action": "pause"}))
