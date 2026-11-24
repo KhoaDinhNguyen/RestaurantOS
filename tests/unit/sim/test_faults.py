@@ -117,10 +117,31 @@ async def test_overlapping_cuts_keep_the_shared_proxy_cut_until_the_last_heal(
     assert layer.cut_count(SHARED_REPL) == 2
     await layer.heal(node.fault_id)
     assert not server.proxies[SHARED_REPL]["enabled"]  # repl:r1 still holds it
+    assert layer.cut_count(SHARED_REPL) == 1
     assert server.proxies[SHARED_GATEWAY]["enabled"]  # only node:r1-primary held this one
     await layer.heal(repl.fault_id)
     assert server.proxies[SHARED_REPL]["enabled"]
     assert layer.cut_count(SHARED_REPL) == 0
+
+
+async def test_a_failed_enable_leaves_no_stale_count_and_is_reported(layer, server) -> None:
+    """A heal whose enable fails partway: every count is already zero,
+    the proxies that could be enabled are, and the stuck one shows up
+    as unexplained in links()."""
+    members = link_groups(CLUSTER)["repl:r1"]
+    await layer.create("repl:r1", "cut")
+    # the enable for the first member fails
+    server.fail.add(("POST", f"/proxies/{members[0]}"))
+    with pytest.raises(ToxiproxyError, match="only partly healed"):
+        await layer.heal("f1")
+    assert all(layer.cut_count(proxy) == 0 for proxy in members)
+    assert server.proxies[members[0]]["enabled"] is False  # the failed enable
+    assert server.proxies[members[1]]["enabled"] is True  # still enabled
+    stuck = members[0]
+    links = {entry["group"]: entry for entry in await layer.links()}
+    for group, entry in links.items():
+        expected = stuck if stuck in link_groups(CLUSTER)[group] else None
+        assert entry["unexplained"]["disabled"] == ([expected] if expected else [])
 
 
 async def test_overlapping_toxics_do_not_collide_and_heal_separately(layer, server) -> None:

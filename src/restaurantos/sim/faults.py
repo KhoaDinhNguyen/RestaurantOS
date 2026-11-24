@@ -306,9 +306,22 @@ class FaultLayer:
             raise
 
     async def _uncut(self, proxies: Sequence[str]) -> None:
-        for proxy in proxies:
-            if self._decrement(proxy) == 0:
+        """Undo one cut. Pass 1 drops this fault's hold on every proxy
+        (local bookkeeping only); pass 2 enables the proxies whose
+        count reached zero. An enable that fails leaves the count at
+        zero - the proxy then shows up in `links()` as disabled with no
+        owner - but every proxy is still tried, and the first failure
+        surfaces after the loop."""
+        to_enable = [proxy for proxy in proxies if self._decrement(proxy) == 0]
+        failure: ToxiproxyError | None = None
+        for proxy in to_enable:
+            try:
                 await self._toxiproxy.set_enabled(proxy, True)
+            except ToxiproxyError as error:
+                if failure is None:
+                    failure = error
+        if failure is not None:
+            raise failure
 
     def _decrement(self, proxy: str) -> int:
         left = max(self.cut_count(proxy) - 1, 0)
