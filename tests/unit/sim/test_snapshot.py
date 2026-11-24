@@ -155,6 +155,11 @@ class FakeHost:
         # once set, the frontier reported after the pause (to cross midnight)
         self.frontier_after_pause: int | None = None
         self.dispatched = True
+        # failure injection: status() raises once the run is paused; a
+        # resume answers 500
+        self.fail_status_when_paused = False
+        self.fail_resume = False
+        self.status_drains = True
         # GET /sim/playback's engine block (what every run on it shares)
         self.engine: dict[str, Any] = {
             "sequential": False,
@@ -181,6 +186,8 @@ class FakeHost:
     async def status(self) -> dict | None:
         if not self.alive:
             return None
+        if self.fail_status_when_paused and self.state == "paused":
+            raise httpx.ReadTimeout("status timed out")
         day, rest = divmod(self.frontier(), 86400)
         answer = {
             "state": self.state,
@@ -198,7 +205,7 @@ class FakeHost:
             ),
             "engine": self.engine,
         }
-        if self.state == "paused" and self.inflight:
+        if self.state == "paused" and self.inflight and self.status_drains:
             self.inflight -= 1
         return answer
 
@@ -210,6 +217,8 @@ class FakeHost:
     async def command(self, body: dict) -> httpx.Response:
         self.commands.append(body)
         action = body["action"]
+        if action == "resume" and self.fail_resume:
+            return httpx.Response(500, json={"message": "resume broke"})
         if action == "pause":
             self.state = "paused"
         elif action == "resume":
@@ -398,6 +407,37 @@ async def test_save_refuses_a_minimum_below_the_engines_event_floor(world) -> No
     host.offset = 700
     record = await save("events-off", ctx)
     assert sim_seconds(record) % 86400 >= 600
+
+
+async def test_a_failure_after_the_pause_resumes_the_run(world) -> None:
+    ctx, host, docker, _, _ = world
+    host.fail_status_when_paused = True
+    with pytest.raises(httpx.ReadTimeout):
+        await save("flaky", ctx)
+    assert [body["action"] for body in host.commands] == ["pause", "resume"]
+    assert host.state == "running" and docker.calls == []
+
+
+async def test_a_failed_resume_is_reported_next_to_the_first_failure(world) -> None:
+    ctx, host, _, _, _ = world
+    host.fail_status_when_paused, host.fail_resume = True, True
+    with pytest.raises(SnapshotError) as caught:
+        await save("flaky", ctx)
+    message = str(caught.value)
+    assert message.startswith("ReadTimeout: status timed out")
+    assert "did NOT resume" in message and "resume broke" in message
+
+
+async def test_a_run_paused_before_the_save_stays_paused_on_failure(world) -> None:
+    ctx, host, _, _, _ = world
+    host.state, host.inflight = "paused", 5
+    ctx.sim = SimSettings(
+        _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_drain_timeout_s=0.2
+    )
+    host.status_drains = False
+    with pytest.raises(SnapshotError, match="still in flight"):
+        await save("stuck", ctx)
+    assert host.commands == [] and host.state == "paused"
 
 
 async def test_save_refuses_a_paused_run_that_dispatched_nothing(world) -> None:

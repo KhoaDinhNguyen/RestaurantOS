@@ -363,33 +363,61 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
         response = await ctx.playback.command({"action": "pause"})
         if response.status_code != 200:
             raise SnapshotError(f"cannot pause playback: {_message(response)}")
-    waited = 0.0
-    while True:
-        status = await ctx.playback.status() or {}
-        if not status.get("inflight"):
-            break
-        if waited >= ctx.sim.snapshot_drain_timeout_s:
-            if was_running:
-                await ctx.playback.command({"action": "resume"})
+    # From here this call owns the pause: whatever fails before save takes
+    # over (a status call that errors, the drain timeout, the frontier
+    # check) resumes a run this call paused. A run that was already
+    # paused is left as it was.
+    try:
+        waited = 0.0
+        while True:
+            status = await ctx.playback.status() or {}
+            if not status.get("inflight"):
+                break
+            if waited >= ctx.sim.snapshot_drain_timeout_s:
+                raise SnapshotError(
+                    f"{status.get('inflight')} requests still in flight after "
+                    f"{ctx.sim.snapshot_drain_timeout_s:g} s"
+                )
+            await ctx.sleep(0.2)
+            waited += 0.2
+        # the frontier is frozen now; it can only have moved forward since
+        # the read above, but forward across midnight lands before the minimum
+        frontier = frontier_seconds(status)
+        if frontier is None or frontier % SECONDS_PER_DAY < minimum:
+            where = "nothing dispatched" if frontier is None else f"at {_at(frontier)}"
             raise SnapshotError(
-                f"{status.get('inflight')} requests still in flight after "
-                f"{ctx.sim.snapshot_drain_timeout_s:g} s; playback resumed, no snapshot"
+                f"the run's dispatch stopped {where}, before "
+                f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day - try again"
             )
-        await ctx.sleep(0.2)
-        waited += 0.2
-    # the frontier is frozen now; it can only have moved forward since the
-    # read above, but forward across midnight lands before the minimum
-    frontier = frontier_seconds(status)
-    if frontier is None or frontier % SECONDS_PER_DAY < minimum:
-        if was_running:
-            await ctx.playback.command({"action": "resume"})
-        where = "nothing dispatched" if frontier is None else f"at {_at(frontier)}"
-        raise SnapshotError(
-            f"the run's dispatch stopped {where}, before "
-            f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day; playback "
-            "resumed, no snapshot - try again"
-        )
-    return status, was_running
+        return status, was_running
+    except BaseException as error:
+        if not was_running:
+            raise
+        problem = await _resume_quietly(ctx)
+        if problem is not None:
+            # both failures, the first one first: the run is left paused
+            raise SnapshotError(
+                f"{_describe(error)}; no snapshot, and playback did NOT resume "
+                f"(it is left paused): {problem}"
+            ) from error
+        if isinstance(error, SnapshotError):
+            raise SnapshotError(f"{error}; playback resumed, no snapshot") from error
+        raise
+
+
+def _describe(error: BaseException) -> str:
+    return str(error) if isinstance(error, SnapshotError) else f"{type(error).__name__}: {error}"
+
+
+async def _resume_quietly(ctx: Context) -> str | None:
+    """Resume the run; None when it resumed, else what went wrong."""
+    try:
+        response = await ctx.playback.command({"action": "resume"})
+    except Exception as error:  # noqa: BLE001 - reported next to the first failure
+        return _describe(error)
+    if response.status_code != 200:
+        return _message(response)
+    return None
 
 
 async def save(name: str, ctx: Context) -> dict[str, Any]:
