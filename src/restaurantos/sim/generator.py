@@ -56,6 +56,15 @@ file under this name, so a region-count change needs no rebuild."""
 
 CLUSTER_FILE_IN_CONTAINER = "/app/infra/cluster.toml"
 
+ROOT_ENV_FILE = "../../.env"
+"""The repository root .env, relative to the generated file's directory:
+the same file a host-mode service reads through pydantic-settings
+(common/config.py). required: false keeps a checkout without one
+working, and `environment:` wins over env_file, so the identity keys,
+ROS_NETWORK=compose and ROS_CLUSTER_FILE still decide who a container
+is. The long env_file syntax needs Compose 2.24 or newer
+(docs/setup.md)."""
+
 _PG_COMMAND = """x-pg-command: &pg-command
   - postgres
   - -c
@@ -111,6 +120,14 @@ def _service_entry(spec: ServiceSpec, deps: list[tuple[str, str]]) -> list[str]:
     ]
     for key, value in env.items():
         block.append(f"      {key}: {value}")
+    # The root .env, so a container reads the same settings a host-mode
+    # child does (DB credentials, timeouts); environment: above wins
+    # over env_file, so the entry's own keys still decide.
+    block += [
+        "    env_file:",
+        f"      - path: {ROOT_ENV_FILE}",
+        "        required: false",
+    ]
     block += [
         "    volumes:",
         f"      - {CLUSTER_MOUNT}",

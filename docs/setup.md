@@ -7,7 +7,7 @@ PostgreSQL servers and Toxiproxy run **in Docker**. You do not install them on y
 | Component | Why | Version |
 | --- | --- | --- |
 | Git | source control | any recent |
-| Docker Engine + Compose plugin | runs every PostgreSQL node, Toxiproxy and the services | Compose v2 |
+| Docker Engine + Compose plugin | runs every PostgreSQL node, Toxiproxy and the services | Compose v2.24 or newer |
 | uv | Python and Python packages | 0.13 or newer |
 | clang + libpq-dev | `psycopg[c]` compiles its C extension against libpq | **libpq 17 or newer** (from the PGDG repository; Ubuntu 24.04's own is 16) |
 | Node.js + npm | frontend, eslint, prettier | the version in `frontend/.nvmrc` |
@@ -172,6 +172,8 @@ docker run --rm \
 ### Starting the whole system in container mode
 
 `rosctl bootstrap` writes the service entries into `infra/generated/compose.yaml` too - one per service, the same names, ports and identity environment as host mode, with `ROS_NETWORK=compose` - behind the `services` profile. It also copies the cluster config it ran with to `infra/generated/cluster.toml`, which every service entry mounts, and starts no service containers itself: bootstrap's own `up -d --wait` is profile-gated to the databases and Toxiproxy, so a data load never starts them.
+
+Every entry also loads the repository root `.env` (`env_file`, `required: false`), the same file a host-mode service reads, so the two modes agree on the settings the entries do not set - the database credentials and the timeouts. That includes the identity keys: as in host mode, a key an entry does not set falls back to `.env`, so keep `ROS_CLIENT`, `ROS_MODE`, `ROS_REGION_ID` and `ROS_RELAY_ROLE` out of it. The explicit `environment:` block of an entry always wins over `.env`.
 
 ```bash
 # start every service container (after `uv run rosctl bootstrap`)

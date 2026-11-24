@@ -203,6 +203,11 @@ def test_service_entries_mirror_the_table_for_one_and_three_regions():
                 assert f"      {key}: {value}" in block, (spec.name, key)
             assert "      ROS_NETWORK: compose" in block
             assert "      ROS_CLUSTER_FILE: /app/infra/cluster.toml" in block
+            # the root .env rides along (host mode reads it too), but
+            # never as a hard requirement
+            assert "    env_file:" in block
+            assert "      - path: ../../.env" in block
+            assert "        required: false" in block
             assert "      - ./cluster.toml:/app/infra/cluster.toml:ro" in block
 
 
@@ -293,4 +298,5 @@ def test_generated_file_is_valid_yaml_with_exactly_the_table_services():
             expected_env["ROS_NETWORK"] = "compose"
             expected_env["ROS_CLUSTER_FILE"] = "/app/infra/cluster.toml"
             assert entry["environment"] == expected_env
+            assert entry["env_file"] == [{"path": "../../.env", "required": False}]
             assert entry["volumes"] == ["./cluster.toml:/app/infra/cluster.toml:ro"]
