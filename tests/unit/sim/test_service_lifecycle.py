@@ -904,6 +904,41 @@ def test_a_missing_stat_entry_is_not_proof_of_exit(
 
 
 @requires_proc
+def test_a_missing_stat_entry_with_an_unsignalable_pid_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the SECOND kill(0) in the missing-stat branch can itself raise
+    # PermissionError (another user's pid, say): that must be unknown,
+    # never dead and never a traceback that ends the whole up sweep
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    first = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(first)
+    pid = first[0].pid
+    assert pid is not None and services._alive(pid)
+
+    def vanished(*args: object, **kwargs: object) -> str:
+        raise FileNotFoundError("no stat entry")
+
+    real_kill = os.kill
+    seen: list[int] = []
+
+    def deny_second(pid_arg: int, sig: int) -> None:
+        seen.append(pid_arg)
+        if len(seen) > 1:
+            raise PermissionError("not yours")
+        real_kill(pid_arg, sig)
+
+    monkeypatch.setattr(services.Path, "read_text", vanished)
+    monkeypatch.setattr(os, "kill", deny_second)
+    assert services._liveness(pid) == "unknown"
+    assert len(seen) == 2  # asked once, then asked again
+    second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    assert second[0].outcome == "still-starting"
+    assert services.read_pid_record(runs, "sleeper") == (pid, first[0].start_ticks)  # kept
+
+
+@requires_proc
 def test_a_second_up_reports_a_running_service_that_is_not_ready(tmp_path: Path) -> None:
     # an already-running HTTP service must really answer its readiness
     # route before a second `up` calls it started: running but broken
@@ -966,6 +1001,120 @@ def test_a_record_that_cannot_be_removed_fails_the_start(
     # nothing spawned: the record still names the dead launch
     assert services.read_pid_record(runs, "sleeper") == record
     assert services.up_exit_code(second) == 1
+
+
+@requires_proc
+def test_a_pid_file_that_cannot_be_removed_does_not_end_the_down_sweep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a down of two fakes: down deals with the process and THEN
+    # removes the record, and if the removal raises the step is
+    # `record-left` (the process WAS stopped; a person must remove the
+    # file), down exits 1 - and the sweep carries on, so the second
+    # service is stopped too
+    runs = tmp_path / "runs"
+    first_spec = fake("first", ROS_CLIENT="sleeper")
+    second_spec = fake("second", ROS_CLIENT="sleeper")
+    up = up_services(
+        CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[first_spec, second_spec]
+    )
+    _track(up)
+    first_pid, second_pid = up[0].pid, up[1].pid
+    assert first_pid is not None and second_pid is not None
+    left_path = services.pid_path(runs, "first")
+    real_unlink = Path.unlink
+
+    def deny(self: Path, *, missing_ok: bool = False) -> None:
+        if self == left_path:
+            raise PermissionError("no removing")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(services.Path, "unlink", deny)
+    steps = down_services(
+        CLUSTER, runs_dir=runs, names=["first", "second"], specs=[first_spec, second_spec]
+    )
+    assert [(step.name, step.outcome) for step in steps] == [
+        ("first", "record-left"),
+        ("second", "stopped"),
+    ]
+    assert "pid" in steps[0].detail and "could not be removed" in steps[0].detail
+    assert "remove it by hand" in steps[0].detail
+    assert services.read_pid_record(runs, "first") is not None  # the record stays
+    assert services.down_exit_code(steps) == 1
+    # both processes are gone: record-left stopped its process too
+    assert _gone(first_pid)
+    assert _gone(second_pid)
+
+
+@requires_proc
+def test_a_dead_record_that_cannot_be_removed_is_record_left(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # the dead-record branch of the same guard: the pid was not
+    # running, and the pid file could not be removed - record-left
+    # says so instead of ending the sweep
+    runs = tmp_path / "runs"
+    spec = fake("sleeper", ROS_CLIENT="sleeper")
+    up = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    _track(up)
+    pid = up[0].pid
+    assert pid is not None
+    fd = os.pidfd_open(pid)
+    signal.pidfd_send_signal(fd, signal.SIGKILL)
+    os.close(fd)
+    assert _wait_gone(pid)
+    record = services.read_pid_record(runs, "sleeper")
+    assert isinstance(record, tuple)
+
+    def denied(*args: object, **kwargs: object) -> None:
+        raise PermissionError("no removing")
+
+    monkeypatch.setattr(services.Path, "unlink", denied)
+    steps = down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
+    assert steps[0].outcome == "record-left"
+    assert "was not running" in steps[0].detail
+    assert "remove it by hand" in steps[0].detail
+    assert services.read_pid_record(runs, "sleeper") == record  # kept
+    assert services.down_exit_code(steps) == 1
+
+
+@requires_proc
+def test_a_not_ready_service_whose_pid_file_cannot_be_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # on the up side the failure is already a failure: a not-ready
+    # service whose record cannot be removed is still `not-ready`,
+    # with the removal error said in the detail - and the next service
+    # still starts in the same call
+    runs = tmp_path / "runs"
+    broken_spec, _port = _http_fake("broken", health="/health", bad_health=True)
+    left_path = services.pid_path(runs, "broken")
+    real_unlink = Path.unlink
+
+    def deny(self: Path, *, missing_ok: bool = False) -> None:
+        if self == left_path:
+            raise PermissionError("no removing")
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(services.Path, "unlink", deny)
+    steps = up_services(
+        CLUSTER,
+        runs_dir=runs,
+        precheck=False,
+        grace_s=0.0,
+        ready_timeout_s=0.5,
+        specs=[broken_spec, fake("other")],
+    )
+    assert [(step.name, step.outcome) for step in steps] == [
+        ("broken", "not-ready"),
+        ("other", "started"),
+    ]
+    assert "the service was stopped" in steps[0].detail
+    assert "could not be removed" in steps[0].detail
+    assert isinstance(services.read_pid_record(runs, "broken"), tuple)  # kept
+    assert services.up_exit_code(steps) == 1
+    _track(steps[1:])
+    down_services(CLUSTER, runs_dir=runs, names=["other"], specs=[fake("other")])
 
 
 @requires_proc

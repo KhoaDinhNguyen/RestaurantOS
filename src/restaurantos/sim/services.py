@@ -522,6 +522,11 @@ def _liveness(pid: int) -> Literal["alive", "dead", "unknown"]:
             os.kill(pid, 0)
         except ProcessLookupError:
             return "dead"
+        except PermissionError:
+            # the second look raised too (another user's pid, say):
+            # unreadable is unknown, never dead - and never a
+            # traceback that would end the whole up or down sweep
+            return "unknown"
         return "unknown"
     except OSError:
         return "unknown"
@@ -746,20 +751,30 @@ def _service_lock(runs_dir: Path, name: str) -> Iterator[None]:
         os.close(fd)
 
 
+def _remove_record(runs_dir: Path, name: str) -> str | None:
+    """Remove a pid record, or return the error text when the file
+    cannot be removed. ONE place that removes records, so every
+    caller decides what a leftover file means for it: `up` turns the
+    error into `launch-failed` (or appends it to a failure it already
+    reports), and `stop_service` turns it into `record-left` - a
+    process that was dealt with, beside a file a person must remove
+    by hand."""
+    try:
+        pid_path(runs_dir, name).unlink(missing_ok=True)
+    except OSError as error:
+        return f"{pid_path(runs_dir, name)} could not be removed ({error})"
+    return None
+
+
 def _drop_record(runs_dir: Path, name: str) -> Step | None:
     """Remove a pid record `up` no longer obeys - one guard for every
     branch that drops one (malformed, dead, mismatch): a record that
     cannot be removed must stop the start (`launch-failed`, nothing
     spawns) rather than leave a new child running beside a record
     that names a dead launch. Returns None on success."""
-    try:
-        pid_path(runs_dir, name).unlink(missing_ok=True)
-    except OSError as error:
-        return Step(
-            name,
-            "launch-failed",
-            f"could not remove the record {pid_path(runs_dir, name)}: {error}",
-        )
+    error = _remove_record(runs_dir, name)
+    if error is not None:
+        return Step(name, "launch-failed", f"could not remove the record - {error}")
     return None
 
 
@@ -900,11 +915,16 @@ def start_service(
         except (OSError, IndexError, ValueError) as error:
             process.kill()
             process.wait()
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+            leftover = _remove_record(runs_dir, spec.name)
+            detail = f"could not write {pid_path(runs_dir, spec.name)}: {error}"
+            if leftover is not None:
+                # the child is dead already; the leftover file must be
+                # said, not raised - the sweep has more services to start
+                detail = f"{detail}; its pid file also {leftover}"
             return Step(
                 spec.name,
                 "launch-failed",
-                f"could not write {pid_path(runs_dir, spec.name)}: {error}",
+                detail,
                 pid=process.pid,
             )
         return Step(
@@ -928,17 +948,27 @@ def _start_failure(
     """The failure step for a service that died before becoming ready.
     The pid file is cleaned only when it still names THIS launch
     (pid and start ticks): a record that was replaced meanwhile belongs
-    to another launch and is left for it. The message carries the log
-    tail (the cause is usually the last exception in it) and says the
-    other services keep running."""
-    with _service_lock(runs_dir, spec.name):
-        record = read_pid_record(runs_dir, spec.name)
-        if pid is not None and start_ticks is not None:
-            if record == (pid, start_ticks):
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-        elif record is not None:
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
+    to another launch and is left for it. A record that cannot be
+    removed, or a lock that cannot be opened, is named in the message
+    instead of raising - this step is already a failure, and a
+    traceback would end the whole up sweep; a later up finds the
+    record and either removes it or reports `launch-failed`. The
+    message carries the log tail (the cause is usually the last
+    exception in it) and says the other services keep running."""
+    leftover: str | None = None
+    try:
+        with _service_lock(runs_dir, spec.name):
+            record = read_pid_record(runs_dir, spec.name)
+            if pid is not None and start_ticks is not None:
+                if record == (pid, start_ticks):
+                    leftover = _remove_record(runs_dir, spec.name)
+            elif record is not None:
+                leftover = _remove_record(runs_dir, spec.name)
+    except OSError as error:
+        leftover = f"the lock could not be opened ({error})"
     detail = f"{reason} - see {log_path(runs_dir, spec.name)}".lstrip(" -")
+    if leftover is not None:
+        detail = f"{detail}; its pid file was left: {leftover}"
     return Step(
         spec.name,
         outcome,
@@ -1012,6 +1042,11 @@ def _ready_step(
     base = f"still not answering {spec.ready} on port {spec.port} within {ready_timeout_s}s"
     if stop.outcome in ("stopped", "killed"):
         tail = f"{base} - the service was stopped ({stop.outcome}), pid file removed"
+    elif stop.outcome == "record-left":
+        # the process was stopped, so the port is free again - but its
+        # record stays until a person removes it, and the next up
+        # answers `launch-failed` until then
+        tail = f"{base} - the service was stopped, but its pid file was left ({stop.detail})"
     elif stop.outcome in ("not-running", "replaced"):
         tail = f"{base} - nothing to clean ({stop.outcome}: {stop.detail})"
     else:
@@ -1065,7 +1100,11 @@ def stop_service(
     a person to look at; an identity that cannot be decided (mid-exec,
     unreadable /proc) is `identity-unknown`, kept and signalled
     nothing. A process that vanishes mid-stop was the goal all along:
-    stopped. A platform without pidfds (kernels older than 5.3; WSL2 is
+    stopped. A record that cannot be removed once the process outcome
+    is decided is `record-left`: the process stands stopped (or was
+    never running), the file stays for a person to remove by hand,
+    and the sweep carries on instead of raising. A platform without
+    pidfds (kernels older than 5.3; WSL2 is
     5.15 or newer) reports `cannot-signal` and never falls back to
     os.kill - signalling a number that was only just proven is the one
     thing this design exists to prevent. The control plane on 8002 has
@@ -1083,6 +1122,24 @@ def stop_service(
             f"{error} - record kept, nothing signalled",
         )
     with stack:
+
+        def _stop_step(outcome: str, success: str, left: str | None = None) -> Step:
+            """A stop whose process outcome is already decided: remove
+            the record, and when the file cannot be removed report
+            `record-left` instead - the outcome stands (the process was
+            stopped, or was never running), but the file stays until a
+            person removes it, and the sweep carries on instead of
+            raising. `left` is how the outcome reads in the record-left
+            message when it differs from the success detail."""
+            error = _remove_record(runs_dir, spec.name)
+            if error is not None:
+                return Step(
+                    spec.name,
+                    "record-left",
+                    f"{left or success}, but its pid file {error} - remove it by hand",
+                )
+            return Step(spec.name, outcome, success)
+
         record = read_pid_record(runs_dir, spec.name)
         if expect is not None and record != expect:
             return Step(
@@ -1101,8 +1158,11 @@ def stop_service(
         pid, ticks = record
         how = _liveness(pid)
         if how == "dead":
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-            return Step(spec.name, "not-running", f"pid {pid} was not running, pid file removed")
+            return _stop_step(
+                "not-running",
+                f"pid {pid} was not running, pid file removed",
+                f"pid {pid} was not running",
+            )
         if how == "unknown":
             return Step(
                 spec.name,
@@ -1114,8 +1174,7 @@ def stop_service(
             fd = os.pidfd_open(pid)
         except ProcessLookupError:
             # vanished between the alive check and the open: gone is the goal
-            pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-            return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+            return _stop_step("stopped", f"pid {pid} exited while down was stopping it")
         except OSError as error:
             return Step(
                 spec.name,
@@ -1132,30 +1191,25 @@ def stop_service(
                     f"or /proc could not be read) - record kept, nothing signalled",
                 )
             if who == "mismatch":
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-                return Step(
-                    spec.name,
+                return _stop_step(
                     "stale-pid",
                     f"pid {pid} is not {spec.name} (exited and the pid was reused, or "
                     f"the file is wrong) - pid file removed, process left alone",
+                    f"pid {pid} is not {spec.name} (exited and the pid was reused, or "
+                    f"the file is wrong) - process left alone",
                 )
             try:
                 signal.pidfd_send_signal(fd, signal.SIGINT)
             except ProcessLookupError:
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-                return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+                return _stop_step("stopped", f"pid {pid} exited while down was stopping it")
             if _wait_pidfd(fd, stop_timeout_s):
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-                return Step(spec.name, "stopped", f"pid {pid}")
+                return _stop_step("stopped", f"pid {pid}", f"pid {pid} stopped")
             try:
                 signal.pidfd_send_signal(fd, signal.SIGKILL)
             except ProcessLookupError:
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-                return Step(spec.name, "stopped", f"pid {pid} exited while down was stopping it")
+                return _stop_step("stopped", f"pid {pid} exited while down was stopping it")
             if _wait_pidfd(fd, kill_timeout_s):
-                pid_path(runs_dir, spec.name).unlink(missing_ok=True)
-                return Step(
-                    spec.name,
+                return _stop_step(
                     "killed",
                     f"pid {pid} did not answer SIGINT within {stop_timeout_s}s, killed",
                 )
@@ -1288,7 +1342,16 @@ def down_exit_code(steps: Sequence[Step]) -> int:
     pidfd: `cannot-signal`), one it could not identify
     (`identity-unknown`: something that may be running was not
     stopped), a malformed or unreadable record it had to leave in
-    place, or a per-service lock it could not take. The sweep still
+    place, a record it could not remove after dealing with the
+    process (`record-left`: the file must be removed by hand), or a
+    per-service lock it could not take. The sweep still
     continues past each of these."""
-    bad = ("unkillable", "cannot-signal", "identity-unknown", "malformed-pid-file", "lock-failed")
+    bad = (
+        "unkillable",
+        "cannot-signal",
+        "identity-unknown",
+        "malformed-pid-file",
+        "lock-failed",
+        "record-left",
+    )
     return 1 if any(step.outcome in bad for step in steps) else 0
