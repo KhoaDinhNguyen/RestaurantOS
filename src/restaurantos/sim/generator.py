@@ -15,6 +15,7 @@ never to the committed files.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from restaurantos.common.cluster import (
@@ -119,7 +120,10 @@ def _service_entry(spec: ServiceSpec, deps: list[tuple[str, str]]) -> list[str]:
         "    environment:",
     ]
     for key, value in env.items():
-        block.append(f"      {key}: {value}")
+        # json.dumps gives a valid YAML double-quoted string, so a value
+        # like on, yes or 08 stays a string instead of becoming a
+        # boolean or a number
+        block.append(f"      {key}: {json.dumps(value)}")
     # The root .env, so a container reads the same settings a host-mode
     # child does (DB credentials, timeouts); environment: above wins
     # over env_file, so the entry's own keys still decide.

@@ -11,6 +11,7 @@ line fails by name), with one parse test that proves the whole file is
 still valid YAML.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -200,9 +201,9 @@ def test_service_entries_mirror_the_table_for_one_and_three_regions():
             # the identity environment comes from the table, plus the
             # container-mode keys
             for key, value in spec.env.items():
-                assert f"      {key}: {value}" in block, (spec.name, key)
-            assert "      ROS_NETWORK: compose" in block
-            assert "      ROS_CLUSTER_FILE: /app/infra/cluster.toml" in block
+                assert f"      {key}: {json.dumps(value)}" in block, (spec.name, key)
+            assert '      ROS_NETWORK: "compose"' in block
+            assert '      ROS_CLUSTER_FILE: "/app/infra/cluster.toml"' in block
             # the root .env rides along (host mode reads it too), but
             # never as a hard requirement
             assert "    env_file:" in block
