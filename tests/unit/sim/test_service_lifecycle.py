@@ -923,17 +923,23 @@ def test_a_missing_stat_entry_with_an_unsignalable_pid_is_unknown(
     real_kill = os.kill
     seen: list[int] = []
 
-    def deny_second(pid_arg: int, sig: int) -> None:
+    def deny_even(pid_arg: int, sig: int) -> None:
+        # deterministic PER _liveness CALL: the first check of every
+        # call answers, the second is denied, so both probes go
+        # through the branch this test is about
         seen.append(pid_arg)
-        if len(seen) > 1:
+        if len(seen) % 2 == 0:
             raise PermissionError("not yours")
         real_kill(pid_arg, sig)
 
     monkeypatch.setattr(services.Path, "read_text", vanished)
-    monkeypatch.setattr(os, "kill", deny_second)
+    monkeypatch.setattr(os, "kill", deny_even)
     assert services._liveness(pid) == "unknown"
-    assert len(seen) == 2  # asked once, then asked again
+    seen.clear()
     second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
+    # both probes went to the same pid - one answering first check,
+    # one denied second - and nothing else in that up called kill
+    assert seen == [pid, pid]
     assert second[0].outcome == "still-starting"
     assert services.read_pid_record(runs, "sleeper") == (pid, first[0].start_ticks)  # kept
 
@@ -1008,8 +1014,9 @@ def test_a_pid_file_that_cannot_be_removed_does_not_end_the_down_sweep(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # a down of two fakes: down deals with the process and THEN
-    # removes the record, and if the removal raises the step is
-    # `record-left` (the process WAS stopped; a person must remove the
+    # removes the record, and if the removal raises the outcome still
+    # says what happened to the process (stopped), with `record_error`
+    # carrying the file problem beside it (a person must remove the
     # file), down exits 1 - and the sweep carries on, so the second
     # service is stopped too
     runs = tmp_path / "runs"
@@ -1034,25 +1041,30 @@ def test_a_pid_file_that_cannot_be_removed_does_not_end_the_down_sweep(
         CLUSTER, runs_dir=runs, names=["first", "second"], specs=[first_spec, second_spec]
     )
     assert [(step.name, step.outcome) for step in steps] == [
-        ("first", "record-left"),
+        ("first", "stopped"),
         ("second", "stopped"),
     ]
+    # the outcome says what happened to the process; the file problem
+    # is its own field - and it alone flips the exit code to 1
+    assert steps[0].record_error is not None and "could not be removed" in steps[0].record_error
     assert "pid" in steps[0].detail and "could not be removed" in steps[0].detail
     assert "remove it by hand" in steps[0].detail
+    assert steps[1].record_error is None
     assert services.read_pid_record(runs, "first") is not None  # the record stays
     assert services.down_exit_code(steps) == 1
-    # both processes are gone: record-left stopped its process too
+    # both processes are gone: the outcome was real, the file just stayed
     assert _gone(first_pid)
     assert _gone(second_pid)
 
 
 @requires_proc
-def test_a_dead_record_that_cannot_be_removed_is_record_left(
+def test_a_dead_record_that_cannot_be_removed_keeps_the_real_outcome(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # the dead-record branch of the same guard: the pid was not
-    # running, and the pid file could not be removed - record-left
-    # says so instead of ending the sweep
+    # running, and the pid file could not be removed - the outcome
+    # still says `not-running`, with `record_error` beside it, instead
+    # of ending the sweep
     runs = tmp_path / "runs"
     spec = fake("sleeper", ROS_CLIENT="sleeper")
     up = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
@@ -1071,7 +1083,10 @@ def test_a_dead_record_that_cannot_be_removed_is_record_left(
 
     monkeypatch.setattr(services.Path, "unlink", denied)
     steps = down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
-    assert steps[0].outcome == "record-left"
+    # the real outcome says the pid was not running; the file problem
+    # rides along in record_error
+    assert steps[0].outcome == "not-running"
+    assert steps[0].record_error is not None and "could not be removed" in steps[0].record_error
     assert "was not running" in steps[0].detail
     assert "remove it by hand" in steps[0].detail
     assert services.read_pid_record(runs, "sleeper") == record  # kept
@@ -1105,6 +1120,7 @@ def test_a_not_ready_service_whose_pid_file_cannot_be_removed(
         ready_timeout_s=0.5,
         specs=[broken_spec, fake("other")],
     )
+    _track(steps)  # before any assertion: a failed assert must not leak `other`
     assert [(step.name, step.outcome) for step in steps] == [
         ("broken", "not-ready"),
         ("other", "started"),
@@ -1113,7 +1129,6 @@ def test_a_not_ready_service_whose_pid_file_cannot_be_removed(
     assert "could not be removed" in steps[0].detail
     assert isinstance(services.read_pid_record(runs, "broken"), tuple)  # kept
     assert services.up_exit_code(steps) == 1
-    _track(steps[1:])
     down_services(CLUSTER, runs_dir=runs, names=["other"], specs=[fake("other")])
 
 
@@ -1240,6 +1255,7 @@ def test_the_readiness_wait_gives_up_at_the_deadline_not_the_server_s(
         ready_timeout_s=3.0,
         specs=[spec],
     )
+    _track(steps)  # before any assertion: a failed assert must not leak the child
     elapsed = time.monotonic() - t0
     assert (ready_dir / "hit").exists()  # the probe really connected
     assert steps[0].outcome == "not-ready"

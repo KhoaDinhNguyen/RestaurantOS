@@ -175,13 +175,18 @@ class Step:
     these; the tests assert them. `pid` and `start_ticks` are set
     wherever a process was spawned: together they name the launch, so
     a later cleanup can act only on THAT launch even after the pid
-    file has been cleaned up or replaced."""
+    file has been cleaned up or replaced. `record_error` carries a
+    pid-file removal failure BESIDE the process's real outcome: the
+    outcome always says what happened to the process, the file
+    problem is this field's, and a set `record_error` means the file
+    stays until a person removes it."""
 
     name: str
     outcome: str
     detail: str
     pid: int | None = None
     start_ticks: int | None = None
+    record_error: str | None = None
 
 
 def _region_of(name: str) -> str | None:
@@ -756,9 +761,9 @@ def _remove_record(runs_dir: Path, name: str) -> str | None:
     cannot be removed. ONE place that removes records, so every
     caller decides what a leftover file means for it: `up` turns the
     error into `launch-failed` (or appends it to a failure it already
-    reports), and `stop_service` turns it into `record-left` - a
-    process that was dealt with, beside a file a person must remove
-    by hand."""
+    reports), and `stop_service` reports it beside the process's real
+    outcome (`record_error`) - a process that was dealt with, beside
+    a file a person must remove by hand."""
     try:
         pid_path(runs_dir, name).unlink(missing_ok=True)
     except OSError as error:
@@ -1041,16 +1046,18 @@ def _ready_step(
     stop = stop_service(spec, runs_dir=runs_dir, expect=(pid, start_ticks))
     base = f"still not answering {spec.ready} on port {spec.port} within {ready_timeout_s}s"
     if stop.outcome in ("stopped", "killed"):
-        tail = f"{base} - the service was stopped ({stop.outcome}), pid file removed"
-    elif stop.outcome == "record-left":
-        # the process was stopped, so the port is free again - but its
-        # record stays until a person removes it, and the next up
-        # answers `launch-failed` until then
-        tail = f"{base} - the service was stopped, but its pid file was left ({stop.detail})"
+        tail = f"{base} - the service was stopped ({stop.outcome})"
     elif stop.outcome in ("not-running", "replaced"):
         tail = f"{base} - nothing to clean ({stop.outcome}: {stop.detail})"
     else:
         tail = f"{base} - could not stop it ({stop.outcome}: {stop.detail}); pid file kept"
+    if stop.record_error is not None:
+        # the process outcome stands, but the record stays until a
+        # person removes it, and the next up answers `launch-failed`
+        # until then
+        tail = f"{tail}, but its pid file was left ({stop.record_error})"
+    elif stop.outcome in ("stopped", "killed"):
+        tail = f"{tail}, pid file removed"
     return Step(
         spec.name,
         "not-ready",
@@ -1101,9 +1108,10 @@ def stop_service(
     unreadable /proc) is `identity-unknown`, kept and signalled
     nothing. A process that vanishes mid-stop was the goal all along:
     stopped. A record that cannot be removed once the process outcome
-    is decided is `record-left`: the process stands stopped (or was
-    never running), the file stays for a person to remove by hand,
-    and the sweep carries on instead of raising. A platform without
+    is decided is reported beside that outcome (`record_error`): the
+    process stands stopped (or was never running), the file stays for
+    a person to remove by hand, and the sweep carries on instead of
+    raising. A platform without
     pidfds (kernels older than 5.3; WSL2 is
     5.15 or newer) reports `cannot-signal` and never falls back to
     os.kill - signalling a number that was only just proven is the one
@@ -1123,22 +1131,18 @@ def stop_service(
         )
     with stack:
 
-        def _stop_step(outcome: str, success: str, left: str | None = None) -> Step:
-            """A stop whose process outcome is already decided: remove
-            the record, and when the file cannot be removed report
-            `record-left` instead - the outcome stands (the process was
-            stopped, or was never running), but the file stays until a
-            person removes it, and the sweep carries on instead of
-            raising. `left` is how the outcome reads in the record-left
-            message when it differs from the success detail."""
+        def _stop_step(outcome: str, success: str) -> Step:
+            """A stop whose process outcome is already decided: report
+            THAT outcome, and remove the record; when the file cannot
+            be removed the outcome stands (the process was stopped, or
+            was never running) with `record_error` carrying the file
+            problem beside it - the file stays until a person removes
+            it, and the sweep carries on instead of raising."""
             error = _remove_record(runs_dir, spec.name)
+            detail = success
             if error is not None:
-                return Step(
-                    spec.name,
-                    "record-left",
-                    f"{left or success}, but its pid file {error} - remove it by hand",
-                )
-            return Step(spec.name, outcome, success)
+                detail = f"{success}, but its pid file {error} - remove it by hand"
+            return Step(spec.name, outcome, detail, record_error=error)
 
         record = read_pid_record(runs_dir, spec.name)
         if expect is not None and record != expect:
@@ -1158,11 +1162,7 @@ def stop_service(
         pid, ticks = record
         how = _liveness(pid)
         if how == "dead":
-            return _stop_step(
-                "not-running",
-                f"pid {pid} was not running, pid file removed",
-                f"pid {pid} was not running",
-            )
+            return _stop_step("not-running", f"pid {pid} was not running")
         if how == "unknown":
             return Step(
                 spec.name,
@@ -1194,8 +1194,6 @@ def stop_service(
                 return _stop_step(
                     "stale-pid",
                     f"pid {pid} is not {spec.name} (exited and the pid was reused, or "
-                    f"the file is wrong) - pid file removed, process left alone",
-                    f"pid {pid} is not {spec.name} (exited and the pid was reused, or "
                     f"the file is wrong) - process left alone",
                 )
             try:
@@ -1203,7 +1201,7 @@ def stop_service(
             except ProcessLookupError:
                 return _stop_step("stopped", f"pid {pid} exited while down was stopping it")
             if _wait_pidfd(fd, stop_timeout_s):
-                return _stop_step("stopped", f"pid {pid}", f"pid {pid} stopped")
+                return _stop_step("stopped", f"pid {pid}")
             try:
                 signal.pidfd_send_signal(fd, signal.SIGKILL)
             except ProcessLookupError:
@@ -1343,8 +1341,8 @@ def down_exit_code(steps: Sequence[Step]) -> int:
     (`identity-unknown`: something that may be running was not
     stopped), a malformed or unreadable record it had to leave in
     place, a record it could not remove after dealing with the
-    process (`record-left`: the file must be removed by hand), or a
-    per-service lock it could not take. The sweep still
+    process (`record_error` set: the file must be removed by hand), or
+    a per-service lock it could not take. The sweep still
     continues past each of these."""
     bad = (
         "unkillable",
@@ -1352,6 +1350,5 @@ def down_exit_code(steps: Sequence[Step]) -> int:
         "identity-unknown",
         "malformed-pid-file",
         "lock-failed",
-        "record-left",
     )
-    return 1 if any(step.outcome in bad for step in steps) else 0
+    return 1 if any(step.outcome in bad or step.record_error is not None for step in steps) else 0
