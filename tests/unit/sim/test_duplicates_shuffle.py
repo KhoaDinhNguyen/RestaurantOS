@@ -15,6 +15,7 @@ Acceptance lines from the brief:
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -611,6 +612,31 @@ async def test_a_stream_failure_still_sends_every_buffered_order(
     expected = [yielded[p].external_order_id for p in expected_shuffle_order(yielded, seed, window)]
     assert [line["external_order_id"] for line in lines] == expected, where
     assert all(line["http_status"] == 201 for line in lines), where
+
+
+async def test_a_stream_failure_waits_for_slow_answers_before_failing(tmp_path: Path) -> None:
+    """The buffered orders' answers are awaited in full before the stream's
+    failure fails the run: on a target slower than the drain timeout, each
+    order still logs its real 201, not "cancelled"."""
+    yielded = sample_orders(3)
+    transport = httpx.ASGITransport(app=make_stub_app(delay_seconds=0.3))
+    pb = make_playback(  # the real clock: the stub's delay is real time
+        RaisingStream(yielded),
+        tmp_path,
+        inflight=4,
+        shuffle_window=8,
+        transport=transport,
+        drain_timeout_s=0.05,  # the bounded drain alone would cancel every send
+    )
+    await pb.start(seed=5, from_day=14, to_day=14, speed=1e9, run_id="slow", shuffle=True)
+    await asyncio.wait_for(pb.wait_done(), timeout=5)
+
+    assert pb.status()["state"] == "failed"
+    lines = order_lines(run_log_lines(tmp_path, pb))
+    assert sorted(line["external_order_id"] for line in lines) == sorted(
+        o.external_order_id for o in yielded
+    )
+    assert all(line["http_status"] == 201 and "error" not in line for line in lines)
 
 
 # --- mode and parameter refusals -------------------------------------------

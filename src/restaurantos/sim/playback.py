@@ -1078,9 +1078,27 @@ class Playback:
                 # items that are all due at once.
                 await asyncio.sleep(0)
             if pull_error is not None:
-                # every order the stream yielded is out (or the run was
-                # stopped first): now the stream's failure fails the run,
-                # through the handler below, as it did before the buffer
+                # Every order the stream yielded is dispatched (or the run
+                # was stopped first). Before the stream's failure fails the
+                # run, wait for their answers the way a normal end does
+                # (review round 3): the failure path's bounded drain would
+                # otherwise cancel a slow send and log it "cancelled" rather
+                # than its real answer. Freeze the clock first, so the wait
+                # never moves the moment the replay failed at; refuse pause,
+                # resume and speed changes while waiting; a stop still ends
+                # the wait at once and falls through to the bounded drain.
+                # The raise below then goes through the handler as before,
+                # and the run ends failed whether or not a stop arrived.
+                self._freeze_clock()
+                self._dispatch_ended = True
+                if not stopped:
+                    while True:
+                        outstanding = {task for task in self._send_tasks if not task.done()}
+                        if not outstanding:
+                            break
+                        if not await self._await_or_stop(asyncio.wait(outstanding)):
+                            stopped = True
+                            break
                 raise pull_error
             if not stopped and self._state != STOPPING:
                 # Normal end: the dispatcher dispatched its last item.
