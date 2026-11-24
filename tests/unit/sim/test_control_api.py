@@ -25,8 +25,7 @@ def server() -> FakeToxiproxyServer:
     return FakeToxiproxyServer(proxy.name for proxy in proxies(CLUSTER))
 
 
-@pytest.fixture
-async def app_and_client(server):
+async def _app_and_client(server):
     toxiproxy = server.client()
     app = FastAPI()
     jobs = JobRunner()
@@ -42,6 +41,12 @@ async def app_and_client(server):
         yield app, client
     await jobs.aclose()
     await toxiproxy.aclose()
+
+
+@pytest.fixture
+async def app_and_client(server):
+    async for result in _app_and_client(server):
+        yield result
 
 
 @pytest.fixture
@@ -181,9 +186,10 @@ def fresh_sim_settings(monkeypatch):
     get_sim_settings.cache_clear()
 
 
-async def test_cross_site_markers_are_rejected(client) -> None:
+async def test_cross_site_markers_are_rejected(empty_allowlist_app_and_client) -> None:
     """Sec-Fetch-Site: cross-site or a foreign Origin rejects the
     state-changing routes: kill, start, heal-all and a JSON-body one."""
+    client = empty_allowlist_app_and_client[1]
     requests = [
         ("POST", "/sim/nodes/r1-primary/kill", None, {"Sec-Fetch-Site": "cross-site"}),
         ("POST", "/sim/nodes/r1-primary/start", None, {"Sec-Fetch-Site": "cross-site"}),
@@ -242,7 +248,7 @@ async def test_gets_with_a_foreign_origin_are_still_served(client) -> None:
     assert response.status_code == 200
 
 
-async def test_the_playback_routes_get_the_same_guard() -> None:
+async def test_the_playback_routes_get_the_same_guard(empty_allowlist) -> None:
     from restaurantos.sim.control import make_control_app
 
     calls: list[str] = []
@@ -348,8 +354,34 @@ def cors_allowlist(monkeypatch):
     get_sim_settings.cache_clear()
 
 
-async def test_a_preflight_from_a_listed_origin_is_answered(cors_allowlist, app_and_client) -> None:
-    client = app_and_client[1]
+@pytest.fixture
+async def allowlisted_app_and_client(cors_allowlist, server):
+    """The app built AFTER the allowlist env is set: explicit
+    dependency, no reliance on fixture argument order."""
+    async for result in _app_and_client(server):
+        yield result
+
+
+@pytest.fixture
+def empty_allowlist(monkeypatch):
+    """Pin the setting to empty: the app must not register CORS even if
+    a shell variable or a developer .env sets a non-empty allowlist."""
+    from restaurantos.sim.config import get_sim_settings
+
+    monkeypatch.setenv("ROS_SIM_CONTROL_ALLOWED_ORIGINS", "")
+    get_sim_settings.cache_clear()
+    yield
+    get_sim_settings.cache_clear()
+
+
+@pytest.fixture
+async def empty_allowlist_app_and_client(empty_allowlist, server):
+    async for result in _app_and_client(server):
+        yield result
+
+
+async def test_a_preflight_from_a_listed_origin_is_answered(allowlisted_app_and_client) -> None:
+    client = allowlisted_app_and_client[1]
     response = await client.options(
         "/sim/faults/heal-all",
         headers={
@@ -364,8 +396,8 @@ async def test_a_preflight_from_a_listed_origin_is_answered(cors_allowlist, app_
     assert "Access-Control-Allow-Credentials" not in response.headers
 
 
-async def test_a_preflight_from_an_unlisted_origin_fails(cors_allowlist, app_and_client) -> None:
-    response = await app_and_client[1].options(
+async def test_a_preflight_from_an_unlisted_origin_fails(allowlisted_app_and_client) -> None:
+    response = await allowlisted_app_and_client[1].options(
         "/sim/faults/heal-all",
         headers={"Origin": "http://evil.example", "Access-Control-Request-Method": "POST"},
     )
@@ -373,8 +405,8 @@ async def test_a_preflight_from_an_unlisted_origin_fails(cors_allowlist, app_and
     assert "Access-Control-Allow-Origin" not in response.headers
 
 
-async def test_a_preflight_for_an_unlisted_header_fails(cors_allowlist, app_and_client) -> None:
-    response = await app_and_client[1].options(
+async def test_a_preflight_for_an_unlisted_header_fails(allowlisted_app_and_client) -> None:
+    response = await allowlisted_app_and_client[1].options(
         "/sim/faults/heal-all",
         headers={
             "Origin": "http://localhost:5173",
@@ -385,8 +417,8 @@ async def test_a_preflight_for_an_unlisted_header_fails(cors_allowlist, app_and_
     assert response.status_code == 400
 
 
-async def test_a_listed_origin_post_carries_cors_headers(cors_allowlist, app_and_client) -> None:
-    response = await app_and_client[1].post(
+async def test_a_listed_origin_post_carries_cors_headers(allowlisted_app_and_client) -> None:
+    response = await allowlisted_app_and_client[1].post(
         "/sim/faults/heal-all",
         headers={"Origin": "http://localhost:5173", "Sec-Fetch-Site": "same-site"},
     )
@@ -395,22 +427,22 @@ async def test_a_listed_origin_post_carries_cors_headers(cors_allowlist, app_and
 
 
 async def test_an_unlisted_origin_post_reaches_the_guard_without_cors_headers(
-    cors_allowlist, app_and_client
+    allowlisted_app_and_client,
 ) -> None:
     # CORS does not block real requests: the guard does, and its 403
     # carries no CORS headers for an origin the browser must not read
-    response = await app_and_client[1].post(
+    response = await allowlisted_app_and_client[1].post(
         "/sim/faults/heal-all", headers={"Origin": "http://evil.example"}
     )
     assert response.status_code == 403
     assert "Access-Control-Allow-Origin" not in response.headers
 
 
-async def test_the_guards_403_carries_cors_headers(cors_allowlist, app_and_client) -> None:
+async def test_the_guards_403_carries_cors_headers(allowlisted_app_and_client) -> None:
     # layer ordering: CORS sits outside the guard, so a listed origin
     # can read even the rejection (the UI shows the message instead of
     # a vague "CORS error")
-    response = await app_and_client[1].post(
+    response = await allowlisted_app_and_client[1].post(
         "/sim/faults/heal-all",
         headers={"Origin": "http://localhost:5173", "Sec-Fetch-Site": "cross-site"},
     )
@@ -424,10 +456,10 @@ async def test_cli_requests_get_no_cors_headers(app_and_client) -> None:
     assert "Access-Control-Allow-Origin" not in response.headers
 
 
-async def test_an_empty_allowlist_answers_no_preflights(app_and_client) -> None:
+async def test_an_empty_allowlist_answers_no_preflights(empty_allowlist_app_and_client) -> None:
     # the default is CLI-only: no CORS middleware, so a preflight-looking
     # OPTIONS falls through to the router (405) with no CORS headers
-    response = await app_and_client[1].options(
+    response = await empty_allowlist_app_and_client[1].options(
         "/sim/faults/heal-all",
         headers={
             "Origin": "http://localhost:5173",
@@ -478,13 +510,17 @@ def ipv6_allowlist(monkeypatch):
     get_sim_settings.cache_clear()
 
 
-async def test_an_expanded_ipv6_entry_matches_the_browsers_form(
-    ipv6_allowlist, app_and_client
-) -> None:
+@pytest.fixture
+async def ipv6_app_and_client(ipv6_allowlist, server):
+    async for result in _app_and_client(server):
+        yield result
+
+
+async def test_an_expanded_ipv6_entry_matches_the_browsers_form(ipv6_app_and_client) -> None:
     """A config entry written in expanded IPv6 normalises to the
     compressed form the browser sends, so the guard and CORS both
     recognise the request."""
-    response = await app_and_client[1].post(
+    response = await ipv6_app_and_client[1].post(
         "/sim/faults/heal-all", headers={"Origin": "http://[::1]:5173"}
     )
     assert response.status_code == 200
@@ -502,16 +538,22 @@ def punycode_allowlist(monkeypatch):
     get_sim_settings.cache_clear()
 
 
-async def test_a_punycode_origin_passes_guard_and_cors(punycode_allowlist, app_and_client) -> None:
+@pytest.fixture
+async def punycode_app_and_client(punycode_allowlist, server):
+    async for result in _app_and_client(server):
+        yield result
+
+
+async def test_a_punycode_origin_passes_guard_and_cors(punycode_app_and_client) -> None:
     """Guard and CORS take their allowlist from the same normalised
     tuple: an Origin browsers actually send passes both."""
     origin = "http://xn--bcher-kva.example:5173"
-    posted = await app_and_client[1].post(
+    posted = await punycode_app_and_client[1].post(
         "/sim/faults/heal-all", headers={"Origin": origin, "Sec-Fetch-Site": "same-site"}
     )
     assert posted.status_code == 200
     assert posted.headers["Access-Control-Allow-Origin"] == origin
-    preflight = await app_and_client[1].options(
+    preflight = await punycode_app_and_client[1].options(
         "/sim/faults/heal-all",
         headers={"Origin": origin, "Access-Control-Request-Method": "POST"},
     )
