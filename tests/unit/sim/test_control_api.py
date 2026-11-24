@@ -97,7 +97,26 @@ async def test_links_list_every_group_with_faults_and_unexplained(client) -> Non
     assert {entry["group"] for entry in links} == set(link_groups(CLUSTER))
     repl = next(entry for entry in links if entry["group"] == "repl:r1")
     assert [fault["fault"] for fault in repl["faults"]] == ["silence"]
-    assert set(repl) == {"group", "proxies", "faults", "unexplained"}
+    assert set(repl) == {"group", "proxies", "faults", "preexisting_disabled", "unexplained"}
+
+
+async def test_a_cut_over_a_pre_disabled_proxy_is_left_alone(client, server) -> None:
+    shared = "r1-standby__r1-primary"
+    server.proxies[shared]["enabled"] = False  # someone else's state
+    created = await client.post("/sim/faults", json={"target": "repl:r1", "fault": "cut"})
+    assert created.json()["already_disabled"] == [shared]
+    links = next(
+        entry for entry in (await client.get("/sim/links")).json() if entry["group"] == "repl:r1"
+    )
+    assert links["preexisting_disabled"] == [shared]
+    healed = await client.delete("/sim/faults/f1")
+    assert healed.json()["left_disabled"] == [shared]
+    assert server.proxies[shared]["enabled"] is False  # untouched
+    links = next(
+        entry for entry in (await client.get("/sim/links")).json() if entry["group"] == "repl:r1"
+    )
+    assert links["preexisting_disabled"] == []
+    assert links["unexplained"]["disabled"] == [shared]
 
 
 async def test_toxiproxy_down_is_a_502(client, server) -> None:

@@ -244,3 +244,79 @@ async def test_a_new_layer_has_no_ids_but_sees_the_leftovers(server) -> None:
     assert await fresh.heal_all() == 0
     assert all(proxy["toxics"] == [] for proxy in server.proxies.values())
     await second.aclose()
+
+
+async def test_a_cut_leaves_a_previously_disabled_proxy_alone(layer, server) -> None:
+    server.proxies[SHARED_REPL]["enabled"] = False  # disabled outside the layer
+    disable_calls = server.calls.count(("POST", f"/proxies/{SHARED_REPL}"))
+    fault = await layer.create("repl:r1", "cut")
+    assert fault.preexisting == (SHARED_REPL,)
+    # no disable request was sent for the already-disabled proxy
+    assert server.calls.count(("POST", f"/proxies/{SHARED_REPL}")) == disable_calls
+    assert server.proxies[SHARED_REPL]["enabled"] is False
+    links = {entry["group"]: entry for entry in await layer.links()}
+    assert links["repl:r1"]["preexisting_disabled"] == [SHARED_REPL]
+    assert layer.cut_count(SHARED_REPL) == 1
+    healed = await layer.heal(fault.fault_id)
+    assert healed.left_disabled == (SHARED_REPL,)
+    assert server.proxies[SHARED_REPL]["enabled"] is False  # left as it was
+    links = {entry["group"]: entry for entry in await layer.links()}
+    assert links["repl:r1"]["preexisting_disabled"] == []
+    assert links["repl:r1"]["unexplained"]["disabled"] == [SHARED_REPL]
+    assert layer.cut_count(SHARED_REPL) == 0
+
+
+async def test_a_normal_cut_has_no_preexisting_proxies(layer, server) -> None:
+    fault = await layer.create("repl:r1", "cut")
+    assert fault.preexisting == ()
+    healed = await layer.heal(fault.fault_id)
+    assert healed.left_disabled == ()
+    assert server.proxies[SHARED_REPL]["enabled"] is True
+
+
+async def test_overlapping_cuts_over_a_pre_disabled_proxy_keep_it_disabled(layer, server) -> None:
+    server.proxies[SHARED_REPL]["enabled"] = False
+    await layer.create("node:r1-primary", "cut")  # flags SHARED_REPL
+    await layer.create("repl:r1", "cut")  # overlapping: count goes 1 -> 2
+    links = {entry["group"]: entry for entry in await layer.links()}
+    assert links["node:r1-primary"]["preexisting_disabled"] == [SHARED_REPL]
+    first = await layer.heal("f1")  # count 2 -> 1: too early to enable
+    assert first.left_disabled == ()
+    assert server.proxies[SHARED_REPL]["enabled"] is False
+    second = await layer.heal("f2")  # count reaches 0: stays disabled anyway
+    assert second.left_disabled == (SHARED_REPL,)
+    assert server.proxies[SHARED_REPL]["enabled"] is False
+
+
+async def test_overlapping_cuts_over_an_enabled_proxy_enable_it_at_the_end(layer, server) -> None:
+    await layer.create("node:r1-primary", "cut")
+    await layer.create("repl:r1", "cut")
+    await layer.heal("f1")
+    assert server.proxies[SHARED_REPL]["enabled"] is False
+    assert server.proxies[SHARED_GATEWAY]["enabled"] is True
+    second = await layer.heal("f2")
+    assert second.left_disabled == ()
+    assert server.proxies[SHARED_REPL]["enabled"] is True
+
+
+async def test_a_partly_failed_cut_rolls_counts_and_flags_back(layer, server) -> None:
+    server.proxies[SHARED_REPL]["enabled"] = False  # pre-disabled: would set a flag
+    members = link_groups(CLUSTER)["node:r1-primary"]
+    victim = next(proxy for proxy in members if proxy != SHARED_REPL)
+    server.fail.add(("POST", f"/proxies/{victim}"))  # the disable of a later proxy fails
+    with pytest.raises(ToxiproxyError):
+        await layer.create("node:r1-primary", "cut")
+    assert all(layer.cut_count(proxy) == 0 for proxy in members)
+    links = {entry["group"]: entry for entry in await layer.links()}
+    assert all(entry["preexisting_disabled"] == [] for entry in links.values())
+    assert layer.faults() == []
+    # the proxies before the failure were re-enabled; the flagged one keeps
+    # its own (pre-existing) state
+    assert server.proxies[SHARED_REPL]["enabled"] is False
+
+
+async def test_heal_all_enables_the_flagged_proxies_too(layer, server) -> None:
+    server.proxies[SHARED_REPL]["enabled"] = False
+    await layer.create("repl:r1", "cut")
+    assert await layer.heal_all() == 1
+    assert server.proxies[SHARED_REPL]["enabled"] is True

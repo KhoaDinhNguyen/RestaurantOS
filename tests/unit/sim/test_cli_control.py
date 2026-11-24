@@ -255,3 +255,22 @@ def test_control_serves_playback_and_control_routes(tmp_path, monkeypatch, fresh
     } <= paths
     # control starts no run of its own
     assert "start_kwargs" not in captured
+
+
+def test_cut_warnings_are_printed(capsys) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE":
+            return httpx.Response(
+                200, json={"left_disabled": ["r1-standby__r1-primary"], "fault": "cut"}
+            )
+        return httpx.Response(
+            201, json={"already_disabled": ["r1-standby__r1-primary"], "fault": "cut"}
+        )
+
+    transport = httpx.MockTransport(handler)
+    assert control_cli.run(_args(["fault", "add", "repl:r1", "cut"]), transport=transport) == 0
+    assert "already disabled before this cut" in capsys.readouterr().err
+    assert control_cli.run(_args(["fault", "heal", "f1"]), transport=transport) == 0
+    err = capsys.readouterr().err
+    assert "left disabled (already disabled before their cut)" in err
+    assert "r1-standby__r1-primary" in err

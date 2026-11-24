@@ -60,7 +60,11 @@ def add_control_routes(app: FastAPI, *, faults: FaultLayer, nodes: Nodes, jobs: 
             return error_response(error.status, error.code, str(error))
         except ToxiproxyError as error:
             return _toxiproxy_down(error)
-        return fault.as_dict()
+        response = fault.as_dict()
+        if fault.fault == "cut":
+            # proxies already disabled before the cut: not ours to re-enable
+            response["already_disabled"] = list(fault.preexisting)
+        return response
 
     # declared before the {fault_id} route: a literal path wins
     @app.post("/sim/faults/heal-all")
@@ -73,12 +77,17 @@ def add_control_routes(app: FastAPI, *, faults: FaultLayer, nodes: Nodes, jobs: 
     @app.delete("/sim/faults/{fault_id}")
     async def sim_fault_heal(fault_id: str) -> Any:
         try:
-            fault = await faults.heal(fault_id)
+            healed = await faults.heal(fault_id)
         except FaultError as error:
             return error_response(error.status, error.code, str(error))
         except ToxiproxyError as error:
             return _toxiproxy_down(error)
-        return fault.as_dict()
+        response = healed.fault.as_dict()
+        if healed.fault.fault == "cut":
+            # proxies that stay disabled: they were already disabled
+            # before their cut, and the state is not ours to change
+            response["left_disabled"] = list(healed.left_disabled)
+        return response
 
     async def _node(node_id: str, action: str) -> Any:
         try:

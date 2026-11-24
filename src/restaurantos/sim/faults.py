@@ -99,6 +99,8 @@ class Fault:
     created_at: str
     # (proxy, toxic name) for every toxic this fault added; empty for a cut
     toxics: tuple[tuple[str, str], ...] = ()
+    # proxies this cut found already disabled: not ours to re-enable
+    preexisting: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         """The fault as Section 6.3 answers it."""
@@ -110,6 +112,15 @@ class Fault:
             "proxies": list(self.proxies),
             "created_at": self.created_at,
         }
+
+
+@dataclass(frozen=True)
+class Healed:
+    """A heal's answer: the fault it undid and the proxies it left
+    disabled because they were already disabled before any cut."""
+
+    fault: Fault
+    left_disabled: tuple[str, ...]
 
 
 def normalize_params(fault: str, params: Mapping[str, Any] | None) -> dict[str, int]:
@@ -158,6 +169,9 @@ class FaultLayer:
         self._groups = {name: tuple(members) for name, members in groups.items()}
         self._faults: dict[str, Fault] = {}
         self._cut_counts: dict[str, int] = {}
+        # proxies that were already disabled when their first cut arrived:
+        # a heal must leave them disabled (the state is not ours)
+        self._pre_disabled: set[str] = set()
         self._ids = itertools.count(1)
         # one change at a time: a create and a heal must not interleave
         # their Toxiproxy calls on a shared proxy
@@ -192,8 +206,9 @@ class FaultLayer:
             fault_id = f"f{next(self._ids)}"
             proxies = self._groups[target]
             toxics: tuple[tuple[str, str], ...] = ()
+            preexisting: tuple[str, ...] = ()
             if fault == "cut":
-                await self._cut(proxies)
+                preexisting = tuple(await self._cut(proxies))
             else:
                 toxics = await self._add_toxics(fault_id, fault, normalized, proxies)
             record = Fault(
@@ -204,14 +219,17 @@ class FaultLayer:
                 proxies=proxies,
                 created_at=datetime.now(UTC).isoformat(),
                 toxics=toxics,
+                preexisting=preexisting,
             )
             self._faults[fault_id] = record
             return record
 
-    async def heal(self, fault_id: str) -> Fault:
+    async def heal(self, fault_id: str) -> Healed:
         """Undo one fault. If Toxiproxy fails halfway, the fault is still
         forgotten (a retry could otherwise undo a shared cut twice) and
-        the error says to run heal-all."""
+        the error says to run heal-all. The proxies a cut found already
+        disabled stay disabled; their names come back in
+        `Healed.left_disabled`."""
         async with self._lock:
             record = self._faults.pop(fault_id, None)
             if record is None:
@@ -221,8 +239,9 @@ class FaultLayer:
                 )
             try:
                 if record.fault == "cut":
-                    await self._uncut(record.proxies)
+                    left_disabled = await self._uncut(record.proxies)
                 else:
+                    left_disabled = ()
                     for proxy, name in record.toxics:
                         await self._toxiproxy.remove_toxic(proxy, name)
             except ToxiproxyError as error:
@@ -230,7 +249,7 @@ class FaultLayer:
                     f"fault {fault_id} is only partly healed ({error}); run heal-all",
                     status=error.status,
                 ) from error
-            return record
+            return Healed(fault=record, left_disabled=left_disabled)
 
     async def heal_all(self) -> int:
         """Toxiproxy's own reset: every proxy enabled, every toxic gone -
@@ -241,6 +260,7 @@ class FaultLayer:
             healed = len(self._faults)
             self._faults.clear()
             self._cut_counts.clear()
+            self._pre_disabled.clear()
             return healed
 
     async def links(self) -> list[dict[str, Any]]:
@@ -276,6 +296,11 @@ class FaultLayer:
                     "faults": [
                         fault.as_dict() for fault in self._faults.values() if fault.target == group
                     ],
+                    # proxies a live cut holds that were already disabled
+                    # when the cut arrived and will stay disabled on heal
+                    "preexisting_disabled": [
+                        proxy for proxy in members if proxy in self._pre_disabled
+                    ],
                     "unexplained": {
                         "disabled": disabled,
                         "toxics": stray_toxics,
@@ -287,32 +312,63 @@ class FaultLayer:
 
     # --- the Toxiproxy changes, each rolled back if it fails halfway -------
 
-    async def _cut(self, proxies: Sequence[str]) -> None:
+    async def _cut(self, proxies: Sequence[str]) -> list[str]:
+        """Disable the group's proxies. Returns the proxies that were
+        ALREADY disabled (no request is sent for them): they belong to
+        someone else - a leftover from an earlier control process, or a
+        manual change - and a heal must leave them as they are."""
+        state: dict[str, dict[str, Any]] | None = None
+        preexisting: list[str] = []
+        flagged: list[str] = []
         counted: list[str] = []
         disabled: list[str] = []
         try:
             for proxy in proxies:
                 if self.cut_count(proxy) == 0:
-                    await self._toxiproxy.set_enabled(proxy, False)
-                    disabled.append(proxy)
+                    if state is None:  # one read of the live state
+                        state = {
+                            str(entry.get("name")): entry
+                            for entry in await self._toxiproxy.list_proxies()
+                        }
+                    already = not bool(state.get(proxy, {}).get("enabled", True))
+                    if already:
+                        self._pre_disabled.add(proxy)
+                        preexisting.append(proxy)
+                        flagged.append(proxy)
+                    else:
+                        await self._toxiproxy.set_enabled(proxy, False)
+                        disabled.append(proxy)
                 self._cut_counts[proxy] = self.cut_count(proxy) + 1
                 counted.append(proxy)
         except BaseException:
             for proxy in counted:
-                self._decrement(proxy)
-            for proxy in disabled:
+                if self._decrement(proxy) == 0 and proxy in flagged:
+                    self._pre_disabled.discard(proxy)  # this call created the flag
+            for proxy in disabled:  # only what this call flipped
                 with contextlib.suppress(ToxiproxyError):
                     await self._toxiproxy.set_enabled(proxy, True)
             raise
+        return preexisting
 
-    async def _uncut(self, proxies: Sequence[str]) -> None:
+    async def _uncut(self, proxies: Sequence[str]) -> tuple[str, ...]:
         """Undo one cut. Pass 1 drops this fault's hold on every proxy
-        (local bookkeeping only); pass 2 enables the proxies whose
-        count reached zero. An enable that fails leaves the count at
-        zero - the proxy then shows up in `links()` as disabled with no
-        owner - but every proxy is still tried, and the first failure
-        surfaces after the loop."""
-        to_enable = [proxy for proxy in proxies if self._decrement(proxy) == 0]
+        (local bookkeeping only); pass 2 enables the proxies whose count
+        reached zero AND that this layer disabled itself. A proxy that
+        was already disabled before its first cut keeps its state: it
+        lands in the returned `left_disabled`. An enable that fails
+        leaves the count at zero - the proxy then shows up in `links()`
+        as disabled with no owner - but every proxy is still tried, and
+        the first failure surfaces after the loop."""
+        left_disabled: list[str] = []
+        to_enable: list[str] = []
+        for proxy in proxies:
+            if self._decrement(proxy) != 0:
+                continue  # another live cut still holds the proxy
+            if proxy in self._pre_disabled:
+                self._pre_disabled.discard(proxy)
+                left_disabled.append(proxy)
+            else:
+                to_enable.append(proxy)
         failure: ToxiproxyError | None = None
         for proxy in to_enable:
             try:
@@ -322,6 +378,7 @@ class FaultLayer:
                     failure = error
         if failure is not None:
             raise failure
+        return tuple(left_disabled)
 
     def _decrement(self, proxy: str) -> int:
         left = max(self.cut_count(proxy) - 1, 0)

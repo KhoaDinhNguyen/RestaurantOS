@@ -91,6 +91,26 @@ def _note_unexplained(links: list[dict[str, Any]]) -> None:
         )
 
 
+def _warn_cut_state(body: Any) -> None:
+    """Say when a cut found proxies already disabled (they stay that way
+    after the heal) or a heal left such proxies disabled."""
+    if not isinstance(body, dict):
+        return
+    already = body.get("already_disabled") or []
+    if already:
+        print(
+            "warning: already disabled before this cut, "
+            f"will stay disabled after heal: {', '.join(already)}",
+            file=sys.stderr,
+        )
+    left = body.get("left_disabled") or []
+    if left:
+        print(
+            f"warning: left disabled (already disabled before their cut): {', '.join(left)}",
+            file=sys.stderr,
+        )
+
+
 def run(args: argparse.Namespace, *, transport: httpx.BaseTransport | None = None) -> int:
     def call(method: str, path: str, **kwargs: Any) -> tuple[int, Any] | None:
         return _request(args, method, path, transport=transport, **kwargs)
@@ -147,6 +167,7 @@ def run(args: argparse.Namespace, *, transport: httpx.BaseTransport | None = Non
         status, body = answer
         if status != expected:
             return _fail(args, body)
+        _warn_cut_state(body)
         _print(body)
         return 0
 

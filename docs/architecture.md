@@ -798,7 +798,15 @@ It answers `201` with the fault; `404` for an unknown link group; `409` with `{"
   "proxies": ["gateway__r1-primary", "gateway__r1-standby"], "created_at": "..." }
 ```
 
-`DELETE /sim/faults/{fault_id}` answers `200`, or `404`. `POST /sim/faults/heal-all` answers `200` with `{"healed": 3}`. `GET /sim/links` lists every link group as `{"group", "proxies", "faults", "unexplained"}`, each fault in the shape above. `unexplained` is `{"disabled", "toxics", "missing"}`: the group's proxies that are disabled with no known `cut` holding them, its toxics no known fault added (`{"proxy", "name", "type", "stream"}`), and proxies Toxiproxy does not have at all.
+`DELETE /sim/faults/{fault_id}` answers `200`, or `404`. `POST /sim/faults/heal-all` answers `200` with `{"healed": 3}`. `GET /sim/links` lists every link group as `{"group", "proxies", "faults", "preexisting_disabled", "unexplained"}`, each fault in the shape above. `unexplained` is `{"disabled", "toxics", "missing"}`: the group's proxies that are disabled with no known `cut` holding them, its toxics no known fault added (`{"proxy", "name", "type", "stream"}`), and proxies Toxiproxy does not have at all.
+
+**Proxies a cut does not own.** A cut never disables a proxy that was already disabled when the cut arrived (a leftover from an earlier control process, or a manual change) and never re-enables it on heal: the state is not the cut's to change. The create answer carries it as `"already_disabled": [...]`; the heal answer for a cut carries what it left alone as `"left_disabled": [...]`; `GET /sim/links` lists the proxies a live cut holds that will stay disabled as `"preexisting_disabled"`. A heal leaves them disabled either way, so they show up under `unexplained` once no known cut owns them. Like fault ids, the already-disabled mark lives in the control process only and is lost on restart; `heal-all` (Toxiproxy's own reset) enables every proxy, including those.
+
+```json
+{ "fault_id": "f1", "target": "repl:r1", "fault": "cut", "params": {}, "proxies": ["r1-standby__r1-primary", "coordinator__r1-standby"], "created_at": "...", "already_disabled": ["r1-standby__r1-primary"] }
+```
+
+`rosctl fault add` and `rosctl fault heal` print a warning when these lists are not empty.
 
 - Fault ids live in the control process only. After a restart the ids are gone but Toxiproxy keeps the toxics and disabled proxies; they show under `unexplained`, and `heal-all` (Toxiproxy's own reset) clears them.
 - The link groups overlap (`node:r1-primary` and `repl:r1` share `r1-standby__r1-primary`). A proxy stays disabled until the last `cut` holding it is healed, and every toxic is named after its fault (`f3-latency-up`), so a heal never undoes another fault.
