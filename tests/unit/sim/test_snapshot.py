@@ -273,8 +273,13 @@ class FakeHost:
         return True
 
 
+# what the `world` fixture hands each test: the snapshot context and the
+# fakes behind it, plus the services up/down log
+World = tuple[Context, FakeHost, FakeDocker, FakeToxiproxy, list[str]]
+
+
 @pytest.fixture
-def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
     monkeypatch.chdir(tmp_path)
     runs = tmp_path / "runs"
     run_dir = runs / "run-a"
@@ -339,7 +344,7 @@ def test_next_run_id_skips_taken_ids(tmp_path: Path) -> None:
     assert next_run_id(tmp_path, "a") == "a-r2"
 
 
-async def test_save_pauses_archives_every_database_and_resumes(world) -> None:
+async def test_save_pauses_archives_every_database_and_resumes(world: World) -> None:
     ctx, host, docker, server, _ = world
     host.inflight = 2
     server.proxies[SHARED]["enabled"] = False
@@ -375,7 +380,7 @@ async def test_save_pauses_archives_every_database_and_resumes(world) -> None:
     ]
 
 
-async def test_save_waits_until_half_past_midnight(world) -> None:
+async def test_save_waits_until_half_past_midnight(world: World) -> None:
     ctx, host, _, _, _ = world
     host.offset = 600  # 00:10
     record = await save("early", ctx)
@@ -383,7 +388,7 @@ async def test_save_waits_until_half_past_midnight(world) -> None:
     assert sim_seconds(record) % 86400 >= 1800
 
 
-async def test_the_snapshot_point_is_the_dispatch_frontier_not_the_clock(world) -> None:
+async def test_the_snapshot_point_is_the_dispatch_frontier_not_the_clock(world: World) -> None:
     """The clock is at day 23 01:00, dispatch is still at day 22 23:00:
     the snapshot is a day-22 snapshot - the run log and the databases end
     there, and restore must replay day 22, not day 23."""
@@ -395,7 +400,7 @@ async def test_the_snapshot_point_is_the_dispatch_frontier_not_the_clock(world) 
     assert list_snapshots(ctx.snapshot_dir)[0]["sim_day"] == 22
 
 
-async def test_save_waits_for_dispatch_not_the_clock_to_pass_the_minimum(world) -> None:
+async def test_save_waits_for_dispatch_not_the_clock_to_pass_the_minimum(world: World) -> None:
     ctx, host, _, _, _ = world
     host.offset, host.lag = 3600, 3000  # clock 01:00, dispatch 00:10
     record = await save("trailing", ctx)
@@ -404,7 +409,7 @@ async def test_save_waits_for_dispatch_not_the_clock_to_pass_the_minimum(world) 
     assert clock == sim_seconds(record) + 3000  # the clock stays ahead; the record is dispatch
 
 
-async def test_dispatch_crossing_midnight_at_the_pause_refuses_and_resumes(world) -> None:
+async def test_dispatch_crossing_midnight_at_the_pause_refuses_and_resumes(world: World) -> None:
     ctx, host, docker, _, _ = world
     host.frontier_after_pause = 24 * 86400 + 5  # day 24 00:00:05
     with pytest.raises(SnapshotError, match="try again"):
@@ -414,7 +419,7 @@ async def test_dispatch_crossing_midnight_at_the_pause_refuses_and_resumes(world
     assert not (ctx.snapshot_dir / "crossed").exists()
 
 
-async def test_save_refuses_a_minimum_below_the_engines_event_floor(world) -> None:
+async def test_save_refuses_a_minimum_below_the_engines_event_floor(world: World) -> None:
     ctx, host, docker, _, _ = world
     ctx.sim = SimSettings(
         _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_min_day_offset_s=600
@@ -439,7 +444,7 @@ async def test_save_refuses_a_minimum_below_the_engines_event_floor(world) -> No
     assert sim_seconds(record) % 86400 >= 600
 
 
-async def test_a_failure_after_the_pause_resumes_the_run(world) -> None:
+async def test_a_failure_after_the_pause_resumes_the_run(world: World) -> None:
     ctx, host, docker, _, _ = world
     host.fail_status_when_paused = True
     with pytest.raises(httpx.ReadTimeout):
@@ -448,7 +453,7 @@ async def test_a_failure_after_the_pause_resumes_the_run(world) -> None:
     assert host.state == "running" and docker.calls == []
 
 
-async def test_a_failed_resume_is_reported_next_to_the_first_failure(world) -> None:
+async def test_a_failed_resume_is_reported_next_to_the_first_failure(world: World) -> None:
     ctx, host, _, _, _ = world
     host.fail_status_when_paused, host.fail_resume = True, True
     with pytest.raises(SnapshotError) as caught:
@@ -458,7 +463,7 @@ async def test_a_failed_resume_is_reported_next_to_the_first_failure(world) -> N
     assert "did NOT resume" in message and "resume broke" in message
 
 
-async def test_a_run_paused_before_the_save_stays_paused_on_failure(world) -> None:
+async def test_a_run_paused_before_the_save_stays_paused_on_failure(world: World) -> None:
     ctx, host, _, _, _ = world
     host.state, host.inflight = "paused", 5
     ctx.sim = SimSettings(
@@ -470,7 +475,7 @@ async def test_a_run_paused_before_the_save_stays_paused_on_failure(world) -> No
     assert host.commands == [] and host.state == "paused"
 
 
-async def test_save_refuses_a_paused_run_that_dispatched_nothing(world) -> None:
+async def test_save_refuses_a_paused_run_that_dispatched_nothing(world: World) -> None:
     ctx, host, docker, _, _ = world
     host.state, host.dispatched = "paused", False
     with pytest.raises(SnapshotError, match="nothing dispatched yet"):
@@ -478,7 +483,7 @@ async def test_save_refuses_a_paused_run_that_dispatched_nothing(world) -> None:
     assert docker.calls == []
 
 
-async def test_save_refuses_a_run_paused_before_half_past_midnight(world) -> None:
+async def test_save_refuses_a_run_paused_before_half_past_midnight(world: World) -> None:
     ctx, host, docker, _, _ = world
     host.state, host.offset = "paused", 600
     with pytest.raises(SnapshotError, match="resume the run past that time"):
@@ -487,14 +492,14 @@ async def test_save_refuses_a_run_paused_before_half_past_midnight(world) -> Non
     assert not (ctx.snapshot_dir / "early").exists()
 
 
-async def test_save_refuses_a_taken_name(world) -> None:
+async def test_save_refuses_a_taken_name(world: World) -> None:
     ctx, *_ = world
     (ctx.snapshot_dir / "taken").mkdir(parents=True)
     with pytest.raises(SnapshotExistsError):
         await save("taken", ctx)
 
 
-async def test_a_failed_snapshot_cleans_up_and_restarts_everything(world) -> None:
+async def test_a_failed_snapshot_cleans_up_and_restarts_everything(world: World) -> None:
     ctx, host, docker, _, _ = world
     docker.fail_archive = volume_name("r1-standby")
     with pytest.raises(SnapshotError, match="disk full"):
@@ -505,7 +510,7 @@ async def test_a_failed_snapshot_cleans_up_and_restarts_everything(world) -> Non
     assert host.state == "running"
 
 
-async def test_a_half_failed_stop_still_brings_the_databases_back(world) -> None:
+async def test_a_half_failed_stop_still_brings_the_databases_back(world: World) -> None:
     ctx, host, docker, _, _ = world
     docker.fail_stop = True
     with pytest.raises(SnapshotError, match="did not stop"):
@@ -516,7 +521,7 @@ async def test_a_half_failed_stop_still_brings_the_databases_back(world) -> None
     assert not (ctx.snapshot_dir / "half").exists()
 
 
-async def test_databases_that_do_not_come_back_leave_playback_paused(world) -> None:
+async def test_databases_that_do_not_come_back_leave_playback_paused(world: World) -> None:
     ctx, host, docker, _, _ = world
     docker.fail_start = True
     with pytest.raises(SnapshotError) as caught:
@@ -529,7 +534,7 @@ async def test_databases_that_do_not_come_back_leave_playback_paused(world) -> N
     assert host.state == "paused"
 
 
-async def test_a_failed_archive_and_a_failed_start_are_both_named(world) -> None:
+async def test_a_failed_archive_and_a_failed_start_are_both_named(world: World) -> None:
     ctx, host, docker, _, _ = world
     docker.fail_archive, docker.fail_start = volume_name("r1-standby"), True
     with pytest.raises(SnapshotError) as caught:
@@ -541,21 +546,21 @@ async def test_a_failed_archive_and_a_failed_start_are_both_named(world) -> None
     assert [body["action"] for body in host.commands] == ["pause"]
 
 
-async def test_save_without_a_run_records_no_run(world) -> None:
+async def test_save_without_a_run_records_no_run(world: World) -> None:
     ctx, host, _, _, _ = world
     host.alive = False
     record = await save("idle", ctx)
     assert record["run"] is None and record["sim_day"] is None
 
 
-async def test_save_records_the_image_the_databases_run(world) -> None:
+async def test_save_records_the_image_the_databases_run(world: World) -> None:
     ctx, _, docker, _, _ = world
     await save("snap", ctx)
     image = json.loads((ctx.snapshot_dir / "snap" / "image.json").read_text())
     assert image == {"id": "sha256:pg18", "name": "postgres:18-test"}
 
 
-async def test_save_without_a_cluster_is_refused(world) -> None:
+async def test_save_without_a_cluster_is_refused(world: World) -> None:
     ctx, host, docker, _, _ = world
     docker.image = None
     with pytest.raises(SnapshotError, match="no hq-primary container"):
@@ -564,7 +569,7 @@ async def test_save_without_a_cluster_is_refused(world) -> None:
     assert host.state == "running"
 
 
-async def test_restore_refuses_another_postgres_image_before_touching_anything(world) -> None:
+async def test_restore_refuses_another_postgres_image_before_touching_anything(world: World) -> None:
     ctx, host, docker, _, services = world
     await save("snap", ctx)
     docker.calls.clear()
@@ -597,7 +602,7 @@ def test_the_docker_commands_never_pull(tmp_path: Path) -> None:
     assert empty.container_image("hq-primary") is None
 
 
-async def test_restore_refuses_a_different_cluster_file_without_the_flag(world) -> None:
+async def test_restore_refuses_a_different_cluster_file_without_the_flag(world: World) -> None:
     ctx, host, docker, _, _ = world
     await save("snap", ctx)
     ctx.cluster_file.write_text("[cluster]\nregions = 2\n", encoding="utf-8")
@@ -607,7 +612,7 @@ async def test_restore_refuses_a_different_cluster_file_without_the_flag(world) 
     assert docker.calls == []
 
 
-async def test_restore_refuses_an_incomplete_snapshot_before_touching_anything(world) -> None:
+async def test_restore_refuses_an_incomplete_snapshot_before_touching_anything(world: World) -> None:
     ctx, host, docker, _, services = world
     await save("snap", ctx)
     snap = ctx.snapshot_dir / "snap"
@@ -622,13 +627,13 @@ async def test_restore_refuses_an_incomplete_snapshot_before_touching_anything(w
     assert docker.calls == [] and host.commands == [] and services == []
 
 
-async def test_restore_unknown_snapshot(world) -> None:
+async def test_restore_unknown_snapshot(world: World) -> None:
     ctx, *_ = world
     with pytest.raises(UnknownSnapshotError):
         await restore("nope", ctx)
 
 
-async def test_restore_puts_everything_back_and_replays_the_day(world) -> None:
+async def test_restore_puts_everything_back_and_replays_the_day(world: World) -> None:
     ctx, host, docker, server, services = world
     server.proxies[SHARED]["enabled"] = False
     server.proxies[SHARED]["toxics"].append(
@@ -684,7 +689,7 @@ async def test_restore_puts_everything_back_and_replays_the_day(world) -> None:
     assert result["cluster_file_replaced"] is False
 
 
-async def test_restore_skips_the_restock_of_a_day_it_already_had(world) -> None:
+async def test_restore_skips_the_restock_of_a_day_it_already_had(world: World) -> None:
     ctx, host, _, _, _ = world
     host.day = 21  # day 21's restock line is in the run log
     await save("restocked", ctx)
@@ -693,7 +698,7 @@ async def test_restore_skips_the_restock_of_a_day_it_already_had(world) -> None:
     assert start["from_day"] == 21 and start["skip_first_restock"] is True
 
 
-async def test_a_second_restore_of_the_same_day_does_not_restock_again(world) -> None:
+async def test_a_second_restore_of_the_same_day_does_not_restock_again(world: World) -> None:
     """Restore a day-21 snapshot: the resumed run skips day 21's restock,
     so its own restock days no longer hold 21. Save THAT run later on day
     21 and restore it: the restock still went out (in its parent run)."""
@@ -734,7 +739,7 @@ def test_the_restock_decision_reads_the_runs_meta_only(tmp_path: Path) -> None:
     assert _restock_done(no_restock, 21) is False
 
 
-async def test_restore_names_the_vendors_whose_skipped_restock_had_failed(world) -> None:
+async def test_restore_names_the_vendors_whose_skipped_restock_had_failed(world: World) -> None:
     ctx, host, _, _, _ = world
     host.day = 21
     log = ctx.runs_dir / "run-a" / "orders.jsonl"
@@ -756,7 +761,7 @@ async def test_restore_names_the_vendors_whose_skipped_restock_had_failed(world)
     assert "13 vendor(s)" in warning and "and 3 more" in warning and "v1," not in warning
 
 
-async def test_restore_with_the_flag_replaces_the_cluster_file(world) -> None:
+async def test_restore_with_the_flag_replaces_the_cluster_file(world: World) -> None:
     ctx, *_ = world
     await save("snap", ctx)
     ctx.cluster_file.write_text("[cluster]\nregions = 1\nstandbys = false\n", encoding="utf-8")
@@ -766,7 +771,7 @@ async def test_restore_with_the_flag_replaces_the_cluster_file(world) -> None:
     assert "restart any process" in result["warnings"][0]
 
 
-async def test_restore_without_a_playback_host_says_how_to_resume(world) -> None:
+async def test_restore_without_a_playback_host_says_how_to_resume(world: World) -> None:
     ctx, host, _, _, _ = world
     await save("snap", ctx)
     host.alive = False
@@ -776,7 +781,7 @@ async def test_restore_without_a_playback_host_says_how_to_resume(world) -> None
     assert "rosctl playback start --from-day 23" in resume["warnings"][0]
 
 
-async def test_restore_does_not_start_on_a_host_with_other_engine_settings(world) -> None:
+async def test_restore_does_not_start_on_a_host_with_other_engine_settings(world: World) -> None:
     ctx, host, _, _, _ = world
     await save("snap", ctx)
     host.engine = {**host.engine, "sequential": True, "region": "r1"}
@@ -792,7 +797,7 @@ async def test_restore_does_not_start_on_a_host_with_other_engine_settings(world
     assert any(resume["manual_command"] in warning for warning in warnings)
 
 
-async def test_a_host_with_another_inflight_still_replays(world) -> None:
+async def test_a_host_with_another_inflight_still_replays(world: World) -> None:
     ctx, host, _, _, _ = world
     await save("snap", ctx)
     host.engine = {**host.engine, "inflight": 8}
