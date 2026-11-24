@@ -1,7 +1,8 @@
 """Snapshot and restore (WP6b, architecture Section 7.4).
 
-**Save** pauses playback (after 00:30 of the simulated day), records the
-run, the simulated clock, Toxiproxy's proxies and toxics, the cluster
+**Save** pauses playback (once its dispatch frontier - the last item it
+sent, not the clock - is past 00:30 of its day), records the run, that
+point, Toxiproxy's proxies and toxics, the cluster
 file and the run log, stops ONLY the PostgreSQL services (a bare
 `docker compose stop` would stop Toxiproxy too, which reloads its config
 on start and silently heals every fault), archives every data volume
@@ -80,6 +81,20 @@ def sim_seconds(clock: dict[str, Any]) -> int | None:
         return None
     hours, minutes, seconds = (int(part) for part in str(moment).split(":"))
     return int(day) * SECONDS_PER_DAY + hours * 3600 + minutes * 60 + seconds
+
+
+def frontier_seconds(status: dict[str, Any]) -> int | None:
+    """The dispatch frontier of a `GET /sim/playback` answer, in absolute
+    simulated seconds: the last item the engine actually sent (None
+    before the run's first dispatch)."""
+    return sim_seconds(
+        {"sim_day": status.get("dispatched_sim_day"), "sim_time": status.get("dispatched_sim_time")}
+    )
+
+
+def _at(seconds: int) -> str:
+    day, rest = divmod(seconds, SECONDS_PER_DAY)
+    return f"day {day} {rest // 3600:02d}:{rest % 3600 // 60:02d}:{rest % 60:02d}"
 
 
 # --- Docker -------------------------------------------------------------------
@@ -282,25 +297,33 @@ class Context:
 
 
 async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool]:
-    """Pause a live run at a safe point. Returns (status, was_running)."""
+    """Pause a live run at a safe point. Returns (status, was_running).
+
+    The point is the DISPATCH FRONTIER (the last item the engine sent),
+    never the clock: the clock runs on wall time and runs ahead of
+    dispatch whenever an event waits for its order's answer, and a
+    snapshot whose day came from the clock could name day N+1 while
+    dispatch was still in day N - restore would replay N+1 and the rest
+    of N would never be sent. The wait and the recorded point both use
+    the frontier: it must stand at least `minimum` into its own day."""
     status = await ctx.playback.status()
     if status is None or status.get("state") not in LIVE_STATES:
         return None, False
     was_running = status["state"] == "running"
     minimum = ctx.sim.snapshot_min_day_offset_s
     while True:
-        clock = await ctx.playback.clock()
-        now = sim_seconds(clock)
-        offset = None if now is None else now % SECONDS_PER_DAY
-        if offset is None or offset >= minimum:
+        frontier = frontier_seconds(status)
+        if frontier is not None and frontier % SECONDS_PER_DAY >= minimum:
             break
-        if not was_running or clock.get("state") != "running":
+        if not was_running or status.get("state") != "running":
+            where = "nothing dispatched yet" if frontier is None else f"at {_at(frontier)}"
             raise SnapshotError(
-                f"the run stands at {clock.get('sim_time')} of day {clock.get('sim_day')}, "
-                f"before {minimum // 3600:02d}:{minimum % 3600 // 60:02d}: the restored day "
-                "is replayed from midnight, so resume the run past that time first"
+                f"the run's dispatch stands {where}, before "
+                f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day: the restored "
+                "day is replayed from midnight, so resume the run past that time first"
             )
         await ctx.sleep(0.1)
+        status = await ctx.playback.status() or {}
     if was_running:
         response = await ctx.playback.command({"action": "pause"})
         if response.status_code != 200:
@@ -309,7 +332,7 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
     while True:
         status = await ctx.playback.status() or {}
         if not status.get("inflight"):
-            return status, was_running
+            break
         if waited >= ctx.sim.snapshot_drain_timeout_s:
             if was_running:
                 await ctx.playback.command({"action": "resume"})
@@ -319,6 +342,19 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
             )
         await ctx.sleep(0.2)
         waited += 0.2
+    # the frontier is frozen now; it can only have moved forward since the
+    # read above, but forward across midnight lands before the minimum
+    frontier = frontier_seconds(status)
+    if frontier is None or frontier % SECONDS_PER_DAY < minimum:
+        if was_running:
+            await ctx.playback.command({"action": "resume"})
+        where = "nothing dispatched" if frontier is None else f"at {_at(frontier)}"
+        raise SnapshotError(
+            f"the run's dispatch stopped {where}, before "
+            f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day; playback "
+            "resumed, no snapshot - try again"
+        )
+    return status, was_running
 
 
 async def save(name: str, ctx: Context) -> dict[str, Any]:
@@ -339,6 +375,8 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
             "created_at": datetime.now(UTC).isoformat(),
             "sim_day": None,
             "sim_time": None,
+            "clock_sim_day": None,
+            "clock_sim_time": None,
             "regions": list(cluster.region_ids),
             "cluster_file": str(ctx.cluster_file),
             "run": None,
@@ -349,8 +387,13 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
             run_id = status["run_id"]
             run_dir = ctx.runs_dir / run_id
             meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
-            record["sim_day"] = clock.get("sim_day")
-            record["sim_time"] = clock.get("sim_time")
+            # the replay boundary is where dispatch stopped (what the run
+            # log and the databases hold), not where the clock stands
+            record["sim_day"] = status.get("dispatched_sim_day")
+            record["sim_time"] = status.get("dispatched_sim_time")
+            # the clock at the pause, for information only
+            record["clock_sim_day"] = clock.get("sim_day")
+            record["clock_sim_time"] = clock.get("sim_time")
             record["run"] = {
                 "run_id": run_id,
                 "seed": status.get("seed"),

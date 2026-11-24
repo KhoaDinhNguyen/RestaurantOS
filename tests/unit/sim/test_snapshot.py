@@ -149,14 +149,27 @@ class FakeHost:
         self.speeds: list[float] = []
         self.healed = False
         self.engine_meta: dict[str, Any] = {"target_url": "http://127.0.0.1:8000/api/v1"}
+        # how far dispatch trails the clock, in simulated seconds (the
+        # clock runs on wall time; an event waits for its order's answer)
+        self.lag = 0
+        # once set, the frontier reported after the pause (to cross midnight)
+        self.frontier_after_pause: int | None = None
+        self.dispatched = True
 
     def advance(self, wall_s: float) -> None:
         if self.state == "running":
             self.offset += wall_s * self.speed_value
 
+    def frontier(self) -> int:
+        """Absolute simulated seconds of the last dispatched item."""
+        if self.state == "paused" and self.frontier_after_pause is not None:
+            return self.frontier_after_pause
+        return self.day * 86400 + int(self.offset) - self.lag
+
     async def status(self) -> dict | None:
         if not self.alive:
             return None
+        day, rest = divmod(self.frontier(), 86400)
         answer = {
             "state": self.state,
             "run_id": self.run_id,
@@ -165,6 +178,12 @@ class FakeHost:
             "from_day": 21,
             "to_day": 28,
             "inflight": self.inflight,
+            "dispatched_sim_day": day if self.dispatched else None,
+            "dispatched_sim_time": (
+                f"{rest // 3600:02d}:{rest % 3600 // 60:02d}:{rest % 60:02d}"
+                if self.dispatched
+                else None
+            ),
         }
         if self.state == "paused" and self.inflight:
             self.inflight -= 1
@@ -310,6 +329,45 @@ async def test_save_waits_until_half_past_midnight(world) -> None:
     record = await save("early", ctx)
     assert host.commands[0] == {"action": "pause"}
     assert sim_seconds(record) % 86400 >= 1800
+
+
+async def test_the_snapshot_point_is_the_dispatch_frontier_not_the_clock(world) -> None:
+    """The clock is at day 23 01:00, dispatch is still at day 22 23:00:
+    the snapshot is a day-22 snapshot - the run log and the databases end
+    there, and restore must replay day 22, not day 23."""
+    ctx, host, _, _, _ = world
+    host.lag = 2 * 3600
+    record = await save("lagging", ctx)
+    assert (record["sim_day"], record["sim_time"]) == (22, "23:00:00")
+    assert (record["clock_sim_day"], record["clock_sim_time"]) == (23, "01:00:00")
+    assert list_snapshots(ctx.snapshot_dir)[0]["sim_day"] == 22
+
+
+async def test_save_waits_for_dispatch_not_the_clock_to_pass_the_minimum(world) -> None:
+    ctx, host, _, _, _ = world
+    host.offset, host.lag = 3600, 3000  # clock 01:00, dispatch 00:10
+    record = await save("trailing", ctx)
+    assert record["sim_day"] == 23 and sim_seconds(record) % 86400 >= 1800
+    clock = sim_seconds({"sim_day": record["clock_sim_day"], "sim_time": record["clock_sim_time"]})
+    assert clock == sim_seconds(record) + 3000  # the clock stays ahead; the record is dispatch
+
+
+async def test_dispatch_crossing_midnight_at_the_pause_refuses_and_resumes(world) -> None:
+    ctx, host, docker, _, _ = world
+    host.frontier_after_pause = 24 * 86400 + 5  # day 24 00:00:05
+    with pytest.raises(SnapshotError, match="try again"):
+        await save("crossed", ctx)
+    assert [body["action"] for body in host.commands] == ["pause", "resume"]
+    assert docker.calls == []
+    assert not (ctx.snapshot_dir / "crossed").exists()
+
+
+async def test_save_refuses_a_paused_run_that_dispatched_nothing(world) -> None:
+    ctx, host, docker, _, _ = world
+    host.state, host.dispatched = "paused", False
+    with pytest.raises(SnapshotError, match="nothing dispatched yet"):
+        await save("empty", ctx)
+    assert docker.calls == []
 
 
 async def test_save_refuses_a_run_paused_before_half_past_midnight(world) -> None:
