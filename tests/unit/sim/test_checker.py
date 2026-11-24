@@ -175,6 +175,24 @@ def test_a_failover_before_the_ack_does_not_explain_a_missing_order(tmp_path) ->
     assert result["unaccounted"][0]["reason"] == "acked_not_stored"
 
 
+def test_the_latest_ack_bounds_a_loss(tmp_path) -> None:
+    """Acked at 0 and again at 10 (a resend): the second answer proves the
+    region still had the order after a failover at 5, so that failover
+    cannot explain it going missing later."""
+    lines = [accepted("1", minute=0), accepted("1", minute=10, resend=True)]
+    result = check(tmp_path, lines, facts({"r1": []}, [("1", "r1")], failovers=[("r1", at(5))]))
+    assert result["passed"] is False
+    assert result["unaccounted"][0]["reason"] == "acked_not_stored"
+    assert result["acked"] == 1  # still one order
+
+
+def test_a_failover_after_the_latest_ack_still_explains_a_loss(tmp_path) -> None:
+    lines = [accepted("1", minute=10, resend=True), accepted("1", minute=0)]
+    result = check(tmp_path, lines, facts({"r1": []}, [("1", "r1")], failovers=[("r1", at(15))]))
+    assert result["passed"] is True
+    assert result["lost_at_failover"]["order_ids"] == ["1"]
+
+
 def test_a_failover_of_another_region_does_not_explain_it(tmp_path) -> None:
     result = check(
         tmp_path,

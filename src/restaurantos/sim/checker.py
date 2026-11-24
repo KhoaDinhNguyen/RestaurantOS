@@ -111,6 +111,17 @@ def _wall_acked_at(line: dict[str, Any], meta: dict[str, Any]) -> datetime | Non
     return datetime.fromtimestamp(start_epoch + (acked - start_mono), tz=UTC)
 
 
+def _later_ack(seen: OrderOutcome, outcome: str, acked_at: datetime | None) -> bool:
+    """Whether an equal-ranked line replaces the one kept so far: only a
+    later ack of an accepted order does. The latest ack is what bounds a
+    loss - an order answered after a failover survived that failover,
+    so only a failover after its LAST ack can explain it going missing
+    (a resend, or a restored day's replay, acks an order again)."""
+    if outcome != ACCEPTED or acked_at is None:
+        return False
+    return seen.acked_at is None or acked_at > seen.acked_at
+
+
 def run_chain(runs_dir: Path, run_ids: Sequence[str]) -> list[str]:
     """The given runs plus every run they continue (a restored run names
     its parent in resumed_from.json), oldest first, each once."""
@@ -166,11 +177,14 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
             key = (channel, str(line["external_order_id"]))
             outcome = classify_line(line)
             seen = orders.get(key)
-            if seen is not None and _RANK[seen.outcome] >= _RANK[outcome]:
-                continue
             acked_at = None
             if outcome == ACCEPTED:
                 acked_at = _parse_time(line.get("acked_at")) or _wall_acked_at(line, meta)
+            if seen is not None:
+                if _RANK[seen.outcome] > _RANK[outcome]:
+                    continue
+                if seen.outcome == outcome and not _later_ack(seen, outcome, acked_at):
+                    continue
             orders[key] = OrderOutcome(outcome, line.get("region_id"), acked_at)
     if len(regions) > 1:
         raise CheckError(
