@@ -127,6 +127,12 @@ def _teardown() -> None:
     """Remove the running cluster and every project volume, with the
     Compose files that are on disk right now.
 
+    Both `down` calls pass --profile services: the generated file's
+    service entries are gated behind that profile, and without the flag
+    a leftover service container survives the teardown as an orphan.
+    On the committed baseline file the flag is inert (it has no service
+    entries), but it keeps both calls consistent.
+
     The previously generated file goes first: switching from more
     regions to fewer must remove the services and volumes that the new
     file will not name, and only the old file still names them. The
@@ -139,7 +145,7 @@ def _teardown() -> None:
     """
     for path in (COMPOSE_FILE, COMMITTED_COMPOSE):
         if path.is_file():
-            _compose("down", "-v", "--remove-orphans", compose_file=path)
+            _compose("--profile", "services", "down", "-v", "--remove-orphans", compose_file=path)
     _remove_volumes(_existing_volumes())
 
 
@@ -160,16 +166,24 @@ def _confirm_volume_deletion(volumes: list[str]) -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def _stage_generated(compose: str, proxy_list: str) -> list[tuple[Path, Path]]:
-    """Write both rendered files to temporary names, so a write failure
+def _stage_generated(compose: str, proxy_list: str, cluster_toml: str) -> list[tuple[Path, Path]]:
+    """Write the rendered files to temporary names, so a write failure
     (full disk, permissions) happens before anything is torn down. The
     temporary names differ from the real ones, so the teardown keeps
-    reading the old compose.yaml."""
+    reading the old compose.yaml. The third file is the copy of the
+    config bootstrap ran with: the generated Compose file mounts it as
+    cluster.toml, so the service containers agree with the shape that
+    was built (and a stale file from a previous shape cannot be
+    mounted)."""
     directory = COMPOSE_FILE.parent
     directory.mkdir(parents=True, exist_ok=True)
     staged: list[tuple[Path, Path]] = []
     try:
-        for name, text in (("compose.yaml", compose), ("proxies.json", proxy_list)):
+        for name, text in (
+            ("compose.yaml", compose),
+            ("proxies.json", proxy_list),
+            ("cluster.toml", cluster_toml),
+        ):
             tmp = directory / f"{name}.tmp"
             tmp.write_text(text, encoding="utf-8")
             staged.append((tmp, directory / name))
@@ -180,10 +194,16 @@ def _stage_generated(compose: str, proxy_list: str) -> list[tuple[Path, Path]]:
     return staged
 
 
-def _rebuild(*, yes: bool, compose: str, proxy_list: str) -> bool:
+def _rebuild(*, yes: bool, compose: str, proxy_list: str, cluster_toml: str) -> bool:
     """Prompt about the volumes, stage the rendered Compose files, tear
     the old cluster down, move the staged files into place and start the
     cluster.
+
+    The plain `up -d --wait` deliberately starts WITHOUT --profile
+    services: the service entries are profile-gated, so a data load
+    never starts the containers (they need the image, and the data is
+    not in the databases yet); starting the services is the documented
+    `docker compose ... --profile services up` (docs/setup.md).
 
     Returns False when the user refused. A staging failure happens
     before the teardown, so nothing has been torn down; a teardown
@@ -193,7 +213,7 @@ def _rebuild(*, yes: bool, compose: str, proxy_list: str) -> bool:
     volumes = _existing_volumes()
     if volumes and not yes and not _confirm_volume_deletion(volumes):
         return False
-    staged = _stage_generated(compose, proxy_list)
+    staged = _stage_generated(compose, proxy_list, cluster_toml)
     try:
         _teardown()
     except BaseException:
@@ -319,6 +339,10 @@ async def bootstrap(*, yes: bool = False, config: Path = Path("infra/cluster.tom
     to delete the existing volumes.
     """
     cluster = load_cluster(config)
+    # The service entries in the generated Compose file mount this copy
+    # of the config bootstrap actually ran with, so container mode
+    # always agrees with the shape that was built (--config included).
+    cluster_toml = config.read_text(encoding="utf-8")
     try:
         prepared = _prepare(cluster, get_settings().data_dir, get_sim_settings())
     except (ValueError, NotImplementedError) as error:
@@ -326,9 +350,11 @@ async def bootstrap(*, yes: bool = False, config: Path = Path("infra/cluster.tom
         # and nothing has been destroyed yet
         raise BootstrapError(str(error)) from error
 
-    if not _rebuild(yes=yes, compose=prepared.compose, proxy_list=prepared.proxy_list):
+    if not _rebuild(
+        yes=yes, compose=prepared.compose, proxy_list=prepared.proxy_list, cluster_toml=cluster_toml
+    ):
         return 1
-    print(f"wrote {COMPOSE_FILE} and infra/generated/proxies.json")
+    print(f"wrote {COMPOSE_FILE}, infra/generated/proxies.json and infra/generated/cluster.toml")
     print("every node is healthy")
 
     try:

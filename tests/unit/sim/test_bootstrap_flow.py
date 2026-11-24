@@ -78,7 +78,7 @@ def test_refusal_tears_down_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(bootstrap, "_confirm_volume_deletion", lambda volumes: False)
     monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
 
-    assert bootstrap._rebuild(yes=False, compose="x", proxy_list="y") is False
+    assert bootstrap._rebuild(yes=False, compose="x", proxy_list="y", cluster_toml="z") is False
     assert events == []
     assert not list(tmp_path.glob("*.tmp"))  # not even staged
 
@@ -99,7 +99,7 @@ def test_a_failed_teardown_stops_bootstrap_and_cleans_the_staged_files(monkeypat
 
     monkeypatch.setattr(bootstrap, "_compose", failing_down)
     with pytest.raises(bootstrap.BootstrapError, match="docker is grumpy"):
-        bootstrap._rebuild(yes=True, compose="x", proxy_list="y")
+        bootstrap._rebuild(yes=True, compose="x", proxy_list="y", cluster_toml="z")
     assert events == [f"down:{old_file}"]
     # the old generated file is as it was, and no .tmp survives
     assert old_file.read_text(encoding="utf-8") == "OLD"
@@ -121,10 +121,16 @@ def test_teardown_uses_the_old_file_then_replace_then_up(monkeypatch, tmp_path):
             assert old_file.read_text(encoding="utf-8") == "OLD"
             assert "--remove-orphans" in argv
             assert "-v" in argv
+            # the service entries are profile-gated, and the teardown
+            # must sweep them away too, not orphan them
+            assert argv[argv.index("--profile") + 1] == "services"
             events.append(f"down:{argv[argv.index('-f') + 1]}")
         elif "rm" in argv:
             events.append(f"rm:{argv[-1]}")
         elif "up" in argv:
+            # the cluster starts WITHOUT the services profile: a data
+            # load must never start the service containers
+            assert "--profile" not in argv
             # and the cluster is started from the file that was staged
             # and moved into place
             assert old_file.read_text(encoding="utf-8") == "NEW"
@@ -134,7 +140,7 @@ def test_teardown_uses_the_old_file_then_replace_then_up(monkeypatch, tmp_path):
 
     monkeypatch.setattr(bootstrap.subprocess, "run", fake_run)
 
-    assert bootstrap._rebuild(yes=True, compose="NEW", proxy_list="{}") is True
+    assert bootstrap._rebuild(yes=True, compose="NEW", proxy_list="{}", cluster_toml="z") is True
     # the old generated file first, then the committed baseline, then the
     # leftover sweep, then the start — never up before teardown
     assert events[0] == f"down:{old_file}"
@@ -153,10 +159,26 @@ def test_no_volumes_no_prompt(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
 
-    assert bootstrap._rebuild(yes=False, compose="x", proxy_list="y") is True
+    assert bootstrap._rebuild(yes=False, compose="x", proxy_list="y", cluster_toml="z") is True
     assert asked == []  # nothing to ask about
     assert events[-1] == "up"
     assert not list(tmp_path.glob("*.tmp"))  # staged then replaced
+
+
+def test_the_staged_files_include_the_cluster_config(monkeypatch, tmp_path):
+    # the service entries mount ./cluster.toml, so bootstrap must stage
+    # the copy of the config it ran with beside the Compose file, with
+    # the same staging (a failure leaves no half-copied config)
+    monkeypatch.setattr(bootstrap, "COMPOSE_FILE", tmp_path / "compose.yaml")
+    monkeypatch.setattr(bootstrap, "_existing_volumes", lambda: [])
+    events: list[str] = []
+    monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
+
+    assert bootstrap._rebuild(yes=True, compose="C", proxy_list="P", cluster_toml="T") is True
+    assert (tmp_path / "compose.yaml").read_text(encoding="utf-8") == "C"
+    assert (tmp_path / "proxies.json").read_text(encoding="utf-8") == "P"
+    assert (tmp_path / "cluster.toml").read_text(encoding="utf-8") == "T"
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 # ---- volumes the teardown files cannot name (round 2, item 2) --------------------
@@ -175,7 +197,7 @@ def test_leftover_volumes_are_removed_by_name(monkeypatch, tmp_path):
         ),
     )
 
-    assert bootstrap._rebuild(yes=True, compose="x", proxy_list="y") is True
+    assert bootstrap._rebuild(yes=True, compose="x", proxy_list="y", cluster_toml="z") is True
     # after the downs, the leftovers were removed by name, before the up
     assert events.index("rm:restaurantos_baseline-data") < events.index("up")
     assert "rm:restaurantos_r2-primary-data" in events
@@ -193,7 +215,7 @@ def test_a_failed_volume_removal_stops_bootstrap(monkeypatch, tmp_path):
     )
 
     with pytest.raises(bootstrap.BootstrapError, match="volume is in use"):
-        bootstrap._rebuild(yes=True, compose="x", proxy_list="y")
+        bootstrap._rebuild(yes=True, compose="x", proxy_list="y", cluster_toml="z")
     assert "up" not in events
     # the staged files were removed with the failed teardown
     assert not list(tmp_path.glob("*.tmp"))
@@ -362,13 +384,13 @@ def test_a_staging_failure_tears_down_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(bootstrap, "COMPOSE_FILE", tmp_path / "compose.yaml")
     monkeypatch.setattr(bootstrap, "_existing_volumes", lambda: ["restaurantos_x-data"])
 
-    def failing_stage(compose, proxy_list):
+    def failing_stage(compose, proxy_list, cluster_toml):  # noqa: ANN001
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(bootstrap, "_stage_generated", failing_stage)
     monkeypatch.setattr(bootstrap.subprocess, "run", _fake_docker(events))
     with pytest.raises(OSError, match="No space left"):
-        bootstrap._rebuild(yes=True, compose="x", proxy_list="y")
+        bootstrap._rebuild(yes=True, compose="x", proxy_list="y", cluster_toml="z")
     assert events == []  # no down, no up: the old cluster is untouched
 
 
@@ -385,7 +407,7 @@ def test_a_partial_staging_failure_removes_what_was_staged(monkeypatch, tmp_path
 
     monkeypatch.setattr(Path, "write_text", failing_write)
     with pytest.raises(OSError, match="No space left"):
-        bootstrap._stage_generated("x", "y")
+        bootstrap._stage_generated("x", "y", "z")
     # the file that did stage was removed again
     assert not (tmp_path / "compose.yaml.tmp").exists()
 
