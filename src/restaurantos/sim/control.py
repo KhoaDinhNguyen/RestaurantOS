@@ -48,6 +48,10 @@ class PlaybackCommand(BaseModel):
     # mode and a rate outside [0, 1]; pydantic answers 422 first here.
     duplicate_rate: float = Field(default=0.0, ge=0.0, le=1.0)
     shuffle: bool = False
+    # Drop the restock at 00:00 of from_day: a snapshot restore replays
+    # the snapshot's day and sets this when that day's restock already
+    # went out (architecture 7.4).
+    skip_first_restock: bool = False
 
 
 class PlaybackSpeed(BaseModel):
@@ -101,6 +105,7 @@ def make_control_app(playback: Playback) -> FastAPI:
                     run_id=command.run_id,
                     duplicate_rate=command.duplicate_rate,
                     shuffle=command.shuffle,
+                    skip_first_restock=command.skip_first_restock,
                 )
                 status = playback.status()
                 if (

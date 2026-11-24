@@ -524,8 +524,15 @@ class Playback:
         duplicate_rate: float = 0.0,
         shuffle: bool = False,
         meta_extra: dict[str, Any] | None = None,
+        skip_first_restock: bool = False,
     ) -> str:
-        """Begin a run from `from_day` to `to_day` (None: to the end)."""
+        """Begin a run from `from_day` to `to_day` (None: to the end).
+
+        `skip_first_restock` drops the restock at 00:00:00 of `from_day`
+        (if that day is a restock day). A snapshot restore sets it when it
+        replays a day whose restock had already gone out: restock tops
+        every counter up to par, so a second one would refill what was
+        sold between midnight and the snapshot (architecture 7.4)."""
         if to_day is not None and to_day < from_day:
             raise ValueError(f"to_day {to_day} is before from_day {from_day}")
         # The duplicates/shuffle parameters are part of the run (the start
@@ -567,6 +574,8 @@ class Playback:
             run_restock_days = restock_days(
                 self._warm_up_days, self._restock_every, from_day, to_day
             )
+            if skip_first_restock:
+                run_restock_days = [day for day in run_restock_days if day != from_day]
         else:
             run_restock_days = []
 
@@ -625,6 +634,8 @@ class Playback:
                 # R itself, so `rosctl oracle compare` can print the
                 # exact `oracle run` for this run
                 "every": self._restock_every,
+                # a restored day replayed without its midnight restock
+                "skipped_first": skip_first_restock,
             },
             # where the kitchen-side calls (events, restocks) went:
             # the region edges, one override URL, or the target itself
