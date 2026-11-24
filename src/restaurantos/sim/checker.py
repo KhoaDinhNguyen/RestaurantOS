@@ -421,12 +421,24 @@ def wait_for_drain(
 ) -> None:
     """Wait until no outbox row is unrelayed on any region's current
     primary and no holding-queue row is undelivered. A real condition,
-    never a fixed sleep; gives up with what is left."""
+    never a fixed sleep; gives up with what is left.
+
+    The holding queue is read FIRST in each poll: a delivery places the
+    order in its region (order + outbox row) before it marks the holding
+    row delivered, so once the holding count reads 0 every delivery's
+    outbox row is already committed and the outbox counts read after it
+    include it. In the other order a delivery that commits between the
+    two reads leaves an unrelayed outbox row behind a poll that says
+    drained."""
     deadline = clock() + timeout_s
     while True:
         hq = hq_primary(cluster)
         primaries = region_primaries(cluster, hq, scope)
         left: dict[str, int] = {}
+        with _connect(cluster, hq) as conn:
+            (held,) = conn.execute(
+                "SELECT count(*) FROM holding_queue WHERE delivered_at IS NULL"
+            ).fetchone()
         for region, node in primaries.items():
             with _connect(cluster, node) as conn:
                 (count,) = conn.execute(
@@ -434,10 +446,6 @@ def wait_for_drain(
                 ).fetchone()
             if count:
                 left[f"outbox on {node} ({region})"] = count
-        with _connect(cluster, hq) as conn:
-            (held,) = conn.execute(
-                "SELECT count(*) FROM holding_queue WHERE delivered_at IS NULL"
-            ).fetchone()
         if held:
             left[f"holding_queue on {hq}"] = held
         if not left:

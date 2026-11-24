@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from restaurantos.common.cluster import Cluster
+from restaurantos.sim import checker
 from restaurantos.sim.checker import (
     RESUMED_FROM,
     CheckError,
@@ -387,3 +388,51 @@ def test_the_report_names_every_difference(tmp_path) -> None:
     assert "2 acked_not_stored (r1)" in report
     assert "1 (regions: ['r1', 'r1'])" in report
     assert "stored but never answered: 1" in report
+
+
+class _DrainWorld:
+    """HQ's holding queue and r1's outbox, with one holding delivery that
+    commits right after the poll's FIRST count query - the gap between
+    the two reads. A delivery places the order in the region (outbox row
+    +1) before it marks the holding row delivered (-1); a sleep lets the
+    relay ship the outbox."""
+
+    def __init__(self) -> None:
+        self.held = 1
+        self.outbox = 0
+        self.queries = 0
+
+    def connect(self, cluster, node):
+        world = self
+
+        class Conn:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql: str):
+                value = world.held if "holding_queue" in sql else world.outbox
+                world.queries += 1
+                if world.queries == 1 and world.held:
+                    world.outbox, world.held = world.outbox + 1, 0
+                return type("Row", (), {"fetchone": lambda _self: (value,)})()
+
+        return Conn()
+
+    def sleep(self, _seconds: float) -> None:
+        self.outbox = 0
+
+
+def test_the_drain_does_not_return_with_a_delivery_in_between(monkeypatch) -> None:
+    world = _DrainWorld()
+    monkeypatch.setattr(checker, "_connect", world.connect)
+    monkeypatch.setattr(checker, "hq_primary", lambda cluster: "hq-primary")
+    monkeypatch.setattr(checker, "region_primaries", lambda c, hq, s: {"r1": "r1-primary"})
+    checker.wait_for_drain(
+        Cluster(regions=1), timeout_s=10, poll_s=0.1, sleep=world.sleep, clock=lambda: 0.0
+    )
+    # returned only once the delivered order's outbox row was relayed
+    assert world.outbox == 0 and world.held == 0
+    assert world.queries == 4  # two polls
