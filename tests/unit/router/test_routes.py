@@ -7,6 +7,7 @@ from restaurantos.common.config import Settings
 from restaurantos.common.models import QueryMeta
 from restaurantos.gateway import app as gateway_app
 from restaurantos.gateway.directory import DirectoryCache
+from restaurantos.gateway.router.ingredient_usage import IngredientUsageResult
 from restaurantos.gateway.router.nearby import NearbyResult
 
 
@@ -141,3 +142,138 @@ def test_nearby_route_unknown_dish_returns_404(monkeypatch) -> None:
 
     assert response.status_code == 404
     assert response.json() == {"error": "not_found"}
+
+
+def test_ingredient_usage_live_strategy_c(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        gateway_settings,
+    )
+
+    c_query = AsyncMock(
+        return_value=IngredientUsageResult(
+            results=[
+                {
+                    "ingredient_id": "rice",
+                    "amount": 1500,
+                    "unit": "gram",
+                }
+            ],
+            meta=QueryMeta(
+                mode="live",
+                nodes_contacted=["r1-primary"],
+                missing_regions=[],
+                rows_transferred=3,
+                data_as_of=datetime.now(UTC),
+                elapsed_ms=1.0,
+            ),
+        )
+    )
+
+    monkeypatch.setattr(
+        gateway_app,
+        "ingredient_usage_c_live",
+        c_query,
+    )
+
+    app = gateway_app.create_app()
+    app.state.directory = DirectoryCache(
+        vendor_cells={},
+        cell_routes={},
+        region_routes={},
+    )
+    app.state.region_pools = AsyncMock()
+    app.state.hq_pool = object()
+
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/v1/query/ingredient-usage",
+        params={
+            "day": 14,
+            "strategy": "C",
+            "mode": "live",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["results"][0]["amount"] == 1500
+    assert response.json()["meta"]["mode"] == "live"
+
+    c_query.assert_awaited_once()
+
+
+def test_ingredient_usage_hq_ignores_strategy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        gateway_settings,
+    )
+
+    single = AsyncMock(
+        return_value=IngredientUsageResult(
+            results=[],
+            meta=QueryMeta(
+                mode="hq",
+                nodes_contacted=["hq-primary"],
+                missing_regions=[],
+                rows_transferred=0,
+                data_as_of=datetime.now(UTC),
+                elapsed_ms=1.0,
+            ),
+        )
+    )
+    c_query = AsyncMock()
+
+    monkeypatch.setattr(
+        gateway_app,
+        "ingredient_usage_single",
+        single,
+    )
+    monkeypatch.setattr(
+        gateway_app,
+        "ingredient_usage_c_live",
+        c_query,
+    )
+
+    app = gateway_app.create_app()
+    app.state.hq_pool = object()
+
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/v1/query/ingredient-usage",
+        params={
+            "day": 14,
+            "strategy": "C",
+            "mode": "hq",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["meta"]["mode"] == "hq"
+
+    single.assert_awaited_once()
+    c_query.assert_not_awaited()
+
+
+def test_ingredient_usage_requires_query_window(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        gateway_settings,
+    )
+
+    app = gateway_app.create_app()
+    client = TestClient(app)
+
+    response = client.get(
+        "/api/v1/query/ingredient-usage",
+        params={
+            "strategy": "A",
+            "mode": "live",
+        },
+    )
+
+    assert response.status_code == 422

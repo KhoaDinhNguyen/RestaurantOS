@@ -57,6 +57,12 @@ from restaurantos.gateway.orders import (
 )
 from restaurantos.gateway.pools import RegionPools
 from restaurantos.gateway.restock import restock_region_vendor
+from restaurantos.gateway.router.ingredient_usage import (
+    ingredient_usage_a_live,
+    ingredient_usage_b_live,
+    ingredient_usage_c_live,
+    ingredient_usage_single,
+)
 from restaurantos.gateway.router.nearby import nearby_live
 from restaurantos.gateway.router.top_dishes import (
     RankBy,
@@ -519,6 +525,74 @@ def create_app() -> FastAPI:
             "to_time": (window.to_time.isoformat() if window.to_time is not None else None),
             "limit": limit,
             "rank_by": rank_by,
+            "results": result.results,
+            "meta": result.meta.model_dump(mode="json"),
+        }
+
+    @gateway.get("/query/ingredient-usage")
+    async def query_ingredient_usage(
+        request: Request,
+        day: int | None = Query(default=None, ge=0),
+        from_day: int | None = Query(default=None, ge=0),
+        to_day: int | None = Query(default=None, ge=0),
+        from_time: time | None = None,
+        to_time: time | None = None,
+        strategy: Literal["A", "B", "C"] = "A",
+        mode: Literal["live", "hq", "baseline"] = "live",
+    ):
+        try:
+            window = normalize_window(
+                day=day,
+                from_day=from_day,
+                to_day=to_day,
+                from_time=from_time,
+                to_time=to_time,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(exc),
+            ) from exc
+
+        if mode == "hq":
+            result = await ingredient_usage_single(
+                request.app.state.hq_pool,
+                window,
+                mode="hq",
+            )
+        elif mode == "baseline":
+            result = await ingredient_usage_single(
+                request.app.state.baseline_pool,
+                window,
+                mode="baseline",
+            )
+        elif strategy == "A":
+            result = await ingredient_usage_a_live(
+                window,
+                directory=request.app.state.directory,
+                pools=request.app.state.region_pools,
+            )
+        elif strategy == "B":
+            result = await ingredient_usage_b_live(
+                window,
+                directory=request.app.state.directory,
+                pools=request.app.state.region_pools,
+                hq_pool=request.app.state.hq_pool,
+            )
+        else:
+            result = await ingredient_usage_c_live(
+                window,
+                directory=request.app.state.directory,
+                pools=request.app.state.region_pools,
+                hq_pool=request.app.state.hq_pool,
+            )
+
+        return {
+            "from_day": window.from_day,
+            "to_day": window.to_day,
+            "from_time": (window.from_time.isoformat() if window.from_time is not None else None),
+            "to_time": (window.to_time.isoformat() if window.to_time is not None else None),
+            "strategy": strategy,
             "results": result.results,
             "meta": result.meta.model_dump(mode="json"),
         }
