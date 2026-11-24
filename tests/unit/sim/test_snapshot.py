@@ -607,6 +607,21 @@ async def test_restore_refuses_a_different_cluster_file_without_the_flag(world) 
     assert docker.calls == []
 
 
+async def test_restore_refuses_an_incomplete_snapshot_before_touching_anything(world) -> None:
+    ctx, host, docker, _, services = world
+    await save("snap", ctx)
+    snap = ctx.snapshot_dir / "snap"
+    (snap / f"{volume_name('r1-standby')}.tar.gz").unlink()
+    (snap / f"{volume_name(BASELINE)}.tar.gz").write_bytes(b"")
+    docker.calls.clear()
+    host.commands.clear()
+    with pytest.raises(SnapshotError, match="incomplete, nothing was changed") as caught:
+        await restore("snap", ctx)
+    assert volume_name("r1-standby") in str(caught.value)
+    assert volume_name(BASELINE) in str(caught.value)
+    assert docker.calls == [] and host.commands == [] and services == []
+
+
 async def test_restore_unknown_snapshot(world) -> None:
     ctx, *_ = world
     with pytest.raises(UnknownSnapshotError):

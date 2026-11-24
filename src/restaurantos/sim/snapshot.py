@@ -651,6 +651,32 @@ def next_run_id(runs_dir: Path, run_id: str) -> str:
     return f"{base}-r{n}"
 
 
+def _check_complete(name: str, snap: Path, record: dict[str, Any], cluster: Cluster) -> None:
+    """Everything restore will read must be there before it touches the
+    cluster: every volume archive it unpacks (not empty), Toxiproxy's
+    state, and the saved run. Restore replaces the cluster on purpose,
+    and it does not stage the volumes (Docker cannot rename a volume, so
+    staging would copy every volume twice on every restore): after this
+    check only an I/O error mid-unpack can stop it half way, and the
+    snapshot itself is untouched, so running the restore again is the
+    recovery."""
+    missing: list[str] = []
+    for node in database_services(cluster):
+        archive = snap / f"{volume_name(node)}.tar.gz"
+        if not archive.is_file() or archive.stat().st_size == 0:
+            missing.append(archive.name)
+    if not (snap / "toxiproxy.json").is_file():
+        missing.append("toxiproxy.json")
+    run = record.get("run")
+    if run and not (snap / "run" / run["run_id"] / "meta.json").is_file():
+        missing.append(f"run/{run['run_id']}/meta.json")
+    if missing:
+        raise SnapshotError(
+            f"snapshot {name!r} is incomplete, nothing was changed: missing or empty "
+            + ", ".join(missing)
+        )
+
+
 def _saved_image(snap: Path) -> dict[str, str] | None:
     image_file = snap / "image.json"
     if not image_file.is_file():
@@ -977,6 +1003,8 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     if not record_file.is_file():
         raise UnknownSnapshotError(f"no snapshot {name!r} in {ctx.snapshot_dir}")
     record = json.loads(record_file.read_text(encoding="utf-8"))
+    if not (snap / "cluster.toml").is_file():
+        raise SnapshotError(f"snapshot {name!r} is incomplete (no cluster.toml); nothing was changed")
     snapshot_toml = (snap / "cluster.toml").read_text(encoding="utf-8")
     current_toml = (
         ctx.cluster_file.read_text(encoding="utf-8") if ctx.cluster_file.is_file() else None
@@ -989,6 +1017,7 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
             "snapshot's copy over it"
         )
     snapshot_cluster = load_cluster(snap / "cluster.toml")
+    _check_complete(name, snap, record, snapshot_cluster)
     current_cluster = load_cluster(ctx.cluster_file) if current_toml is not None else None
     docker = ctx.docker
     assert docker is not None
