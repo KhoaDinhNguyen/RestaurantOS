@@ -12,7 +12,9 @@ def main() -> None:
         raise ValueError("the coordinator requires ROS_CLIENT=coordinator")
     uvicorn.run(
         "restaurantos.coordinator.app:app",
-        host="0.0.0.0",
+        # loopback in host mode (architecture Section 4 / decision D16),
+        # 0.0.0.0 inside compose so the published port reaches it
+        host="127.0.0.1" if settings.network == "host" else "0.0.0.0",
         port=service_port(load_cluster(settings.cluster_file), "coordinator"),
     )
 

@@ -1,8 +1,8 @@
 """The rosctl command line (WP6a). pyproject.toml points the `rosctl`
 script at app().
 
-`bootstrap`, `playback` and `baseline sync` exist; the other
-subcommands are the rest of WP6a and are registered so that
+`bootstrap`, `playback`, `baseline sync`, `up` and `down` exist; the
+other subcommands are the rest of WP6a/WP6b and are registered so that
 `rosctl --help` shows the full shape of the tool while it is being
 built.
 """
@@ -16,8 +16,6 @@ from collections.abc import Sequence
 from pathlib import Path
 
 NOT_BUILT = {
-    "up": "start the services (WP6a, later)",
-    "down": "stop the services (WP6a, later)",
     "control": "the control API for the fault tests (WP6b)",
 }
 
@@ -281,6 +279,52 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("infra/cluster.toml"),
         help="cluster description to copy from (default: infra/cluster.toml)",
     )
+    # --- services (up/down) ---------------------------------------------
+    # The service table and the start/stop machinery live in
+    # restaurantos.sim.services; this block only wires them up.
+    up = sub.add_parser(
+        "up",
+        help="start the services on the host (ROS_NETWORK=host), detached, "
+        "logs in runs/services/<name>.log",
+    )
+    up.add_argument(
+        "names",
+        nargs="*",
+        help="start only these services; default: all of them. To run one "
+        "under a debugger: rosctl up, rosctl down <name>, then start it by "
+        "hand with its command from architecture Section 4",
+    )
+    up.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="cluster description to build the service list from - use the "
+        "file bootstrap ran with (default: ROS_CLUSTER_FILE setting, "
+        "infra/cluster.toml)",
+    )
+    up.add_argument(
+        "--no-precheck",
+        action="store_true",
+        help="start without checking the cluster is reachable first (the "
+        "services will then fail on their own connection errors)",
+    )
+    down = sub.add_parser(
+        "down",
+        help="stop the services started by up (SIGINT, then SIGKILL)",
+    )
+    down.add_argument(
+        "names",
+        nargs="*",
+        help="stop only these services; default: everything with a pid file "
+        "(whatever cluster file up was given)",
+    )
+    down.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="accepted for symmetry with up and not needed: down works "
+        "from the pid files and the names, so it never reads a cluster file",
+    )
 
     # D10 is implemented by WP5; rosctl only registers the command.
     hq = sub.add_parser("hq", help="HQ database operator commands (WP5)")
@@ -369,5 +413,62 @@ def app(argv: Sequence[str] | None = None) -> int:
             print(warning, file=sys.stderr)
         print(format_report(counts))
         return 0
+    if args.command in ("up", "down"):
+        from restaurantos.common.cluster import load_cluster
+        from restaurantos.common.config import get_settings
+        from restaurantos.sim.services import (
+            RUNS_DIR,
+            PlatformError,
+            PrecheckError,
+            dotenv_identity_warnings,
+            down_exit_code,
+            down_services,
+            require_proc,
+            up_exit_code,
+            up_services,
+        )
+
+        names = list(args.names) or None
+        try:
+            # the platform check first: everything below touches /proc
+            require_proc()
+            if args.command == "down":
+                # down needs no cluster file at all: a plain down takes
+                # its work list from the pid files, a named down builds
+                # each spec from its name (every name is checked before
+                # anything stops), so a broken or missing cluster.toml
+                # must not stop it from cleaning up
+                steps = down_services(runs_dir=RUNS_DIR, names=names)
+            else:
+                # an explicit --config needs no settings; the default
+                # comes from settings (a bad .env value is a
+                # pydantic ValidationError, a ValueError - the user
+                # sees a message, not a traceback)
+                config = args.config or get_settings().cluster_file
+                # a .env key the table does not set falls through to the
+                # child (it reads .env too); name the lines so nobody has
+                # to hunt for why edge-r1 calls itself coordinator
+                for line in dotenv_identity_warnings():
+                    print(
+                        f"warning: .env sets {line}; rosctl up overrides these "
+                        f"only where the service table gives a value",
+                        file=sys.stderr,
+                    )
+                steps = up_services(
+                    load_cluster(config),
+                    runs_dir=RUNS_DIR,
+                    names=names,
+                    cluster_file=config,
+                    precheck=not args.no_precheck,
+                )
+        except (PrecheckError, PlatformError, ValueError, OSError) as error:
+            # a silent cluster, a platform without /proc, an unknown
+            # name, a bad cluster file or .env value: the user should
+            # see the message, not a traceback
+            print(f"rosctl {args.command}: {error}", file=sys.stderr)
+            return 1
+        for step in steps:
+            print(f"{step.name}: {step.outcome} - {step.detail}")
+        return up_exit_code(steps) if args.command == "up" else down_exit_code(steps)
     print(f"rosctl {args.command}: not built yet ({NOT_BUILT[args.command]})", file=sys.stderr)
     return 2

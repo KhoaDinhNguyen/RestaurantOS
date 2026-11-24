@@ -224,4 +224,89 @@ def test_proxy_ports_must_stay_below_the_highest_tcp_port():
 
 
 def test_the_default_base_port_fits_many_regions():
-    assert Cluster(regions=1000, proxy_base_port=21000).regions == 1000
+    # the range checks alone would still allow 1000 regions, but the
+    # general collision check stops the shape far earlier - at 250
+    # regions r250-primary's host port is already the gateway's 8000,
+    # and at 464 edge-r464 is the Toxiproxy API (the collision tests
+    # cover those). 200 is the honest "many regions": every derived
+    # port distinct, everything in range
+    assert Cluster(regions=200, proxy_base_port=21000).regions == 200
+
+
+def test_absurd_region_counts_cannot_push_a_node_port_out_of_range():
+    # the proxy check alone cannot catch every shape: with a low proxy
+    # base, the node host ports (5500 + 10n, standby one higher) can
+    # overflow while the proxy ports still fit - Cluster rejects the
+    # shape at the source, so no port a consumer derives from the
+    # cluster can be out of TCP range. (The edge guard - 8010 + n - is
+    # unreachable while the host guard runs first: host ports grow ten
+    # times faster; it stays as defense in depth.)
+    with pytest.raises(ValueError, match="node host ports"):
+        Cluster(regions=6100, proxy_base_port=1)
+
+
+def test_no_two_derived_ports_may_collide():
+    # in range is not enough: at 250 regions r250-primary's host port
+    # IS the gateway's 8000 (the standby is the coordinator's 8001),
+    # and every range check above passes. One general check names the
+    # port and both owners, so a person can see which knob to turn
+    with pytest.raises(
+        ValueError, match="port 8000 is both r250-primary's host port and the gateway's"
+    ):
+        Cluster(regions=250)
+
+
+def test_a_proxy_base_port_on_a_service_port_is_rejected():
+    # the same check from the other side: a proxy base sitting on the
+    # gateway's port. The first proxy owns the port, the gateway is
+    # named as the second owner
+    with pytest.raises(
+        ValueError,
+        match="port 8000 is both proxy gateway__hq-primary's and the gateway's",
+    ):
+        Cluster(proxy_base_port=8000)
+
+
+def test_the_derived_ports_of_three_regions_do_not_collide():
+    # the walk runs clean on the shape everything actually uses
+    assert Cluster(regions=3).region_ids == ["r1", "r2", "r3"]
+
+
+# ---- cluster file shape --------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "key"),
+    [
+        ("cluster = 3", "cluster"),
+        ("toxiproxy = 5", "toxiproxy"),
+        ('[cluster]\nregions = "3"', "regions"),
+        ("[cluster]\nregions = true", "regions"),  # bool before int: True is an int
+        ('[toxiproxy]\nbase_port = "21000"', "base_port"),
+        ("[toxiproxy]\nbase_port = false", "base_port"),
+        ("[cluster]\nstandbys = 1", "standbys"),
+        ('[cluster]\nsynchronous = "no"', "synchronous"),
+    ],
+)
+def test_load_cluster_names_the_key_a_wrong_shape_is_found_under(tmp_path, text, key):
+    # a wrong value in the cluster file is a ValueError naming its
+    # key (which the CLI handlers catch), not a TypeError traceback
+    # from Cluster's own checks
+    path = tmp_path / "cluster.toml"
+    path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match=key):
+        load_cluster(path)
+
+
+def test_load_cluster_still_takes_the_committed_shape(tmp_path):
+    path = tmp_path / "cluster.toml"
+    path.write_text(
+        "[cluster]\nregions = 3\nstandbys = false\nsynchronous = true\n"
+        "[toxiproxy]\nbase_port = 21000\n",
+        encoding="utf-8",
+    )
+    cluster = load_cluster(path)
+    assert cluster.regions == 3
+    assert cluster.standbys is False
+    assert cluster.synchronous is True
+    assert cluster.proxy_base_port == 21000

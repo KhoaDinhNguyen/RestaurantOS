@@ -113,7 +113,7 @@ uv run rosctl up                              # gateway, coordinator, HQ worker,
 cd frontend && npm run dev
 ```
 
-`README.md` in this folder ("Running things") and `docs/setup.md` have the ports and what must be free. Until `rosctl up` exists, each backend brief shows the one command that starts its service.
+`README.md` in this folder ("Running things") and `docs/setup.md` have the ports and what must be free. `rosctl up` starts every backend service at once; it does **not** serve the `/sim` routes. Until WP6b's control process exists, `rosctl playback start` serves only `/sim/clock` and `/sim/playback` on 8002, and only while a run is live. The other `/sim` routes (`/sim/links`, `/sim/faults`, `/sim/nodes`, and the optional `/sim/scenarios`, `/sim/snapshots`, `/sim/checker`) come with WP6b (architecture Section 6.3); each backend brief also shows the one command that starts its service alone.
 
 ## Done when
 

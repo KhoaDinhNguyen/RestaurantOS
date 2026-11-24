@@ -24,6 +24,16 @@ TOXIPROXY_HOST = "toxiproxy"
 HOST_ADDRESS = "127.0.0.1"
 POSTGRES_PORT = 5432
 HOST_BASE_PORT = 5500
+# The single source of truth for the application service ports: every
+# consumer reads it, directly or through service_port() (the services'
+# __main__ and rosctl up call service_port, spec_for_name reads the dict,
+# the tests pin the literal values on purpose). The gateway, the
+# coordinator and the edge APIs have no environment-variable or
+# cluster.toml override: to move one, change it here. "control" is WP6b's
+# control service and stays reserved in the port check below; until it
+# exists, `rosctl playback start` serves its /sim routes on the same 8002
+# by default, and that listener alone can move (ROS_SIM_CONTROL_PORT, or
+# --port) - a clash there is reported by the operating system at bind.
 SERVICE_PORTS = {"gateway": 8000, "coordinator": 8001, "control": 8002}
 EDGE_BASE_PORT = 8010
 HQ_PRIMARY = "hq-primary"
@@ -56,6 +66,43 @@ class Cluster:
                 f"lower proxy_base_port ({self.proxy_base_port}) or use fewer regions "
                 f"({self.regions})"
             )
+        # The same check for the other two port families, so no port any
+        # consumer derives from the cluster can be out of range: the
+        # nodes' published ports (region n primary at 5500 + 10n, its
+        # standby one higher) and the edge APIs (8010 + n).
+        highest_host = HOST_BASE_PORT + 10 * self.regions + 1
+        if highest_host > 65535:
+            raise ValueError(
+                f"node host ports would reach {highest_host}, above the highest TCP "
+                f"port 65535; use fewer regions ({self.regions})"
+            )
+        highest_edge = EDGE_BASE_PORT + self.regions
+        if highest_edge > 65535:
+            raise ValueError(
+                f"edge API ports would reach {highest_edge}, above the highest TCP "
+                f"port 65535; use fewer regions ({self.regions})"
+            )
+        # Last and most general: no two ports the cluster derives may
+        # be the same, whatever shape caused it - at about 250 regions
+        # a node's host port walks into the gateway's 8000, and a low
+        # proxy base walks a proxy into any of them. One list of every
+        # derived port with its owner, and a duplicate raises naming
+        # the port and both owners, so a person can see which knob to
+        # turn. proxies(), host_port() and service_port() are module
+        # functions, so they can be called on self here.
+        derived: list[tuple[int, str]] = [
+            (TOXIPROXY_API_PORT, "the Toxiproxy API's"),
+            *[(proxy.port, f"proxy {proxy.name}'s") for proxy in proxies(self)],
+            *[(host_port(self, node), f"{node}'s host port") for node in self.nodes],
+            (host_port(self, BASELINE), "baseline's host port"),
+            *[(port, f"the {name}'s") for name, port in SERVICE_PORTS.items()],
+            *[(service_port(self, f"edge-{rid}"), f"edge-{rid}'s") for rid in self.region_ids],
+        ]
+        taken: dict[int, str] = {}
+        for port, owner in derived:
+            if port in taken:
+                raise ValueError(f"port {port} is both {taken[port]} and {owner}")
+            taken[port] = owner
 
     @property
     def region_ids(self) -> list[str]:
@@ -75,14 +122,37 @@ class Cluster:
 
 
 def load_cluster(path: Path | str = "infra/cluster.toml") -> Cluster:
+    """Load the cluster description. The file's SHAPE is checked here,
+    naming the offending key in a ValueError (which the CLI handlers
+    already catch), so a wrong value is a message - not a TypeError
+    traceback from Cluster's own checks."""
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
     section = raw.get("cluster", {})
+    toxiproxy = raw.get("toxiproxy", {})
+    if not isinstance(section, dict):
+        raise ValueError(f"cluster file: [cluster] must be a table, got {section!r}")
+    if not isinstance(toxiproxy, dict):
+        raise ValueError(f"cluster file: [toxiproxy] must be a table, got {toxiproxy!r}")
+    regions = section.get("regions", 1)
+    # bool before int: True is an int, so the int check alone would let
+    # regions = true through
+    if isinstance(regions, bool) or not isinstance(regions, int):
+        raise ValueError(f"cluster file: regions must be an int, got {regions!r}")
+    base_port = toxiproxy.get("base_port", 21000)
+    if isinstance(base_port, bool) or not isinstance(base_port, int):
+        raise ValueError(f"cluster file: base_port must be an int, got {base_port!r}")
+    standbys = section.get("standbys", True)
+    if not isinstance(standbys, bool):
+        raise ValueError(f"cluster file: standbys must be a bool, got {standbys!r}")
+    synchronous = section.get("synchronous", False)
+    if not isinstance(synchronous, bool):
+        raise ValueError(f"cluster file: synchronous must be a bool, got {synchronous!r}")
     return Cluster(
-        regions=section.get("regions", 1),
-        standbys=section.get("standbys", True),
-        synchronous=section.get("synchronous", False),
-        proxy_base_port=raw.get("toxiproxy", {}).get("base_port", 21000),
+        regions=regions,
+        standbys=standbys,
+        synchronous=synchronous,
+        proxy_base_port=base_port,
     )
 
 
