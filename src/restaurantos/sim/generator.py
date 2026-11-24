@@ -91,10 +91,11 @@ def _start_rank(name: str) -> int:
     return 0
 
 
-def _service_entry(spec: ServiceSpec, deps: list[ServiceSpec]) -> list[str]:
+def _service_entry(spec: ServiceSpec, deps: list[tuple[str, str]]) -> list[str]:
     """One Compose service entry, from the same table `rosctl up` reads
     (sim.services): the name, command, identity environment and port
-    all come from the spec, never typed here."""
+    all come from the spec, never typed here. `deps` is the depends_on
+    list as (name, condition) pairs."""
     command = "[" + ", ".join(['"python"', *(f'"{arg}"' for arg in spec.args)]) + "]"
     env = dict(spec.env)
     env["ROS_NETWORK"] = "compose"
@@ -131,9 +132,8 @@ def _service_entry(spec: ServiceSpec, deps: list[ServiceSpec]) -> list[str]:
         ]
     if deps:
         block.append("    depends_on:")
-        for dep in deps:
-            condition = "service_healthy" if dep.ready is not None else "service_started"
-            block += [f"      {dep.name}:", f"        condition: {condition}"]
+        for name, condition in deps:
+            block += [f"      {name}:", f"        condition: {condition}"]
     if spec.port is not None:
         block += [
             "    ports:",
@@ -144,19 +144,29 @@ def _service_entry(spec: ServiceSpec, deps: list[ServiceSpec]) -> list[str]:
 
 def _service_entries(cluster: Cluster) -> list[str]:
     """Every service entry for this cluster, one per `service_specs`
-    row, in start order. Each entry depends on the previous rank: the
-    gateway and the HQ worker wait for the region side, the coordinator
-    waits for both - `service_healthy` where the depended-on service
-    has a ready route, `service_started` for the relays and the HQ
-    worker, which have no port."""
+    row, in start order. Every entry waits for Toxiproxy and every
+    database node (baseline excepted: no service dials it) before it
+    starts: the gateway's startup directory refresh has no retry - it
+    exits if HQ is unreachable - and the entries carry no restart
+    policy, so a service must not start while the databases are still
+    coming up. On top of that, each entry depends on the previous
+    rank: the gateway and the HQ worker wait for the region side, the
+    coordinator waits for both - `service_healthy` where the
+    depended-on service has a ready route, `service_started` for the
+    relays and the HQ worker, which have no port."""
+    infra: list[tuple[str, str]] = [("toxiproxy", "service_started")]
+    infra += [(node, "service_healthy") for node in cluster.nodes]
     by_rank: dict[int, list[ServiceSpec]] = {}
     for spec in service_specs(cluster):
         by_rank.setdefault(_start_rank(spec.name), []).append(spec)
     lines: list[str] = []
     for rank in sorted(by_rank):
-        deps = by_rank.get(rank - 1, [])
+        rank_deps: list[tuple[str, str]] = []
+        for dep in by_rank.get(rank - 1, []):
+            condition = "service_healthy" if dep.ready is not None else "service_started"
+            rank_deps.append((dep.name, condition))
         for spec in by_rank[rank]:
-            lines += _service_entry(spec, deps)
+            lines += _service_entry(spec, [*infra, *rank_deps])
     return lines
 
 

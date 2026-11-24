@@ -228,15 +228,35 @@ def test_service_ports_and_healthchecks_come_from_the_table():
                 ), spec.name
 
 
+def test_every_service_waits_for_the_databases_and_toxiproxy():
+    # the gateway's startup directory refresh has no retry and the
+    # entries carry no restart policy, so a service must not start
+    # while the databases are still coming up; baseline is never a
+    # dependency (no service dials it)
+    for regions in (1, 3):
+        cluster = Cluster(regions=regions)
+        doc = yaml.safe_load(compose_text(cluster))
+        for spec in service_specs(cluster):
+            deps = doc["services"][spec.name]["depends_on"]
+            assert deps["toxiproxy"] == {"condition": "service_started"}, spec.name
+            for node in cluster.nodes:
+                assert deps[node] == {"condition": "service_healthy"}, (spec.name, node)
+            assert "baseline" not in deps
+
+
 def test_depends_on_edges_mirror_the_start_order():
-    # the region side first, the gateway and the HQ worker after it, the
+    # the region side first (it waits for nothing but the
+    # infrastructure), then the gateway and the HQ worker, the
     # coordinator last; service_healthy where the depended-on service
     # has a ready route, service_started for the relays and the HQ worker
     cluster = Cluster(regions=3)
     generated = compose_text(cluster)
+    service_names = [spec.name for spec in service_specs(cluster)]
     for rid in cluster.region_ids:
-        assert "    depends_on:" not in service_block(generated, f"relay-{rid}")
-        assert "    depends_on:" not in service_block(generated, f"edge-{rid}")
+        for name in (f"relay-{rid}", f"edge-{rid}"):
+            block = service_block(generated, name)
+            for other in service_names:
+                assert f"      {other}:\n" not in block, (name, other)
     for name in ("gateway", "hq-worker"):
         block = service_block(generated, name)
         for rid in cluster.region_ids:
