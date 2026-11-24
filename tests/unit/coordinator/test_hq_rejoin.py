@@ -53,7 +53,14 @@ def fixture(monkeypatch):
     monkeypatch.setattr(rejoin, "make_pool", lambda *a: pool)
     cursor = AsyncMock()
     cursor.fetchone.return_value = (True,)
-    conn = SimpleNamespace(execute=AsyncMock(return_value=cursor))
+    policy = AsyncMock()
+    policy.fetchone.return_value = ("",)
+    cursor.policy = policy
+
+    async def execute(sql, params=None):
+        return policy if "synchronous_standby_names" in sql else cursor
+
+    conn = SimpleNamespace(execute=AsyncMock(side_effect=execute))
 
     async def run(pool, work, **kwargs):
         return await work(conn)
@@ -143,3 +150,20 @@ def test_rosctl_rejoin_delegates_to_recovery(fixture, monkeypatch, capsys):
     assert app(["hq", "rejoin", "--compose-file", "scratch.yaml", "--yes"]) == 0
     assert json.loads(capsys.readouterr().out)["rejoined"] is True
     recovered.assert_awaited_once()
+
+
+async def test_retained_sync_policy_refuses_before_touching_target(fixture):
+    _, docker, cursor = fixture
+    cursor.policy.fetchone.return_value = ("FIRST 1 (hq_standby)",)
+    with pytest.raises(RecoveryError, match="synchronous policy"):
+        await recover()
+    assert not any(
+        "run" in call.args[0] or "start" in call.args[0] for call in docker.await_args_list
+    )
+
+
+async def test_policy_change_before_success_does_not_report_rejoin_success(fixture):
+    _, _, cursor = fixture
+    cursor.policy.fetchone.side_effect = [("",), ("",), ("FIRST 1 (hq_primary)",)]
+    with pytest.raises(RecoveryError, match="synchronous policy"):
+        await recover()

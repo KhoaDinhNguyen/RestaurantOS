@@ -201,8 +201,11 @@ Promotion validates the containers' project, separate named data volumes,
 PostgreSQL image, HQ schema and physical database identity. It disables the
 old primary's restart policy, stops it and verifies the fence before
 `pg_promote(false)`. Only then does it commit a deduplicated failover event.
-A retry can finish a partially completed promotion. HQ has no regional epoch
-or directory row; none is invented. Promotion leaves HQ asynchronous until
+A retry can finish a partially completed promotion. If the candidate is already
+writable and the old running node's role cannot be confirmed, a repeat refuses
+without stopping that node; inspect it before retrying. First promotion still
+requires the physical fence. HQ has no regional epoch or directory row; none
+is invented. Promotion leaves HQ asynchronous until
 an operator explicitly enables synchronous replication again.
 
 Gateway, coordinator, regional relays and the HQ worker use `common.hq.HQPool`.
@@ -222,7 +225,9 @@ candidate operation lock with promotion. The existing offline recovery script
 uses `pg_rewind`, or rebuilds with `pg_basebackup` if rewind prerequisites or
 WAL are missing. For HQ it validates system identity, timeline and recovery
 role instead of a regional epoch. Only the old node's volume can be replaced.
-It then follows the promoted node through `hq-primary__hq-standby` and is
+Rejoin also confirms the source's synchronous standby names are empty before
+recovery work, before startup, and before success, since a promotion event
+can precede completion of the policy change. It then follows the promoted node through `hq-primary__hq-standby` and is
 reported ready only after it is in recovery and streaming. Rejoin does not
 switch the primary back or automatically re-enable synchronous replication.
 Keep lifecycle commands from running concurrently with promotion/rejoin.

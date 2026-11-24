@@ -67,6 +67,18 @@ from restaurantos.region import (
 )
 
 
+async def wait_for_refresh(interval_s: float, stop_event: asyncio.Event | None) -> bool:
+    """Wake shutdown promptly; this timeout wraps only an Event, never SQL."""
+    if stop_event is None:
+        await asyncio.sleep(interval_s)
+        return True
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+    except TimeoutError:
+        return not stop_event.is_set()
+    return False
+
+
 async def refresh_directory_periodically(
     directory: DirectoryCache,
     hq_pool,
@@ -75,11 +87,7 @@ async def refresh_directory_periodically(
     stop_event: asyncio.Event | None = None,
 ) -> None:
     """Refresh the Gateway shard directory on its configured interval."""
-    while stop_event is None or not stop_event.is_set():
-        await asyncio.sleep(interval_s)
-        if stop_event is not None and stop_event.is_set():
-            break
-
+    while await wait_for_refresh(interval_s, stop_event):
         try:
             await directory.refresh(hq_pool)
         except RegionUnreachableError:
@@ -93,10 +101,7 @@ async def refresh_edge_primary_periodically(
     stop_event: asyncio.Event | None = None,
 ) -> None:
     """Refresh the edge API's local primary on its configured interval."""
-    while stop_event is None or not stop_event.is_set():
-        await asyncio.sleep(interval_s)
-        if stop_event is not None and stop_event.is_set():
-            break
+    while await wait_for_refresh(interval_s, stop_event):
         await primary.refresh()
 
 

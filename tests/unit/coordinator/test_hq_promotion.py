@@ -187,6 +187,24 @@ async def test_restart_after_promotion_records_without_promoting_again(operation
     assert state.promoted == 0
 
 
+async def test_repeat_with_unconfirmed_running_old_node_never_stops_it(operation, monkeypatch):
+    state, _, containers = operation
+    state.recovery = False
+    original = hq.run_on
+
+    async def failed_probe(pool, work, **kwargs):
+        if work is hq.role:
+            raise RegionUnreachableError("old role probe cut", region_id="hq")
+        return await original(pool, work, **kwargs)
+
+    monkeypatch.setattr(hq, "run_on", failed_probe)
+    with pytest.raises(hq.HQPromotionError, match="role is unconfirmed"):
+        await attempt()
+    assert containers[HQ_PRIMARY]["State"]["Running"]
+    assert not any(call.args[0][1] in ("stop", "update") for call in hq.command.await_args_list)
+    assert state.promoted == 0
+
+
 async def test_commit_failure_does_not_report_success(operation, monkeypatch):
     original = hq.run_on
 

@@ -163,9 +163,17 @@ async def promote(
                 ) as old_pool:
                     try:
                         old_role = await run_on(old_pool, role, settings=settings)
-                    except RegionUnreachableError:
-                        old_role = None
-                    if old_role and old_role[0] and old_role[1] == identifier:
+                    except RegionUnreachableError as error:
+                        # A repeat must not stop a healthy rejoined standby
+                        # just because its coordinator proxy is unavailable.
+                        # No new promotion is needed: inspect the old node
+                        # before choosing whether it needs physical fencing.
+                        raise HQPromotionError(
+                            "old HQ role is unconfirmed; inspect it before retrying promotion"
+                        ) from error
+                    if not old_role or old_role[1] != identifier:
+                        raise HQPromotionError("old HQ identity or role is unconfirmed")
+                    if old_role[0]:
                         raise HQPromotionError(
                             "HQ is already promoted and its old primary has rejoined"
                         )

@@ -142,6 +142,8 @@ class ReplicationFallback:
             )
         except RegionUnreachableError:
             logger.warning("HQ synchronous fallback deferred")
+        except Error:
+            logger.exception("HQ synchronous fallback failed; intent retained for retry")
 
     async def step(self, region_id: str) -> None:
         runtime = self.runtime

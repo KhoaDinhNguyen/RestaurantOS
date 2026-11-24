@@ -24,6 +24,15 @@ from restaurantos.coordinator.hq_promotion import (
 from restaurantos.coordinator.rejoin import ROOT, RecoveryError, command
 
 
+async def require_async(conn) -> None:
+    """A promotion event is durable before its policy change is complete."""
+    names = await (await conn.execute(load_query("coordinator/sync_names"))).fetchone()
+    if names != ("",):
+        raise RecoveryError(
+            "HQ synchronous policy is still enabled; finish promotion before rejoin"
+        )
+
+
 async def recover(
     cluster: Cluster, settings: Settings, config: CoordinatorSettings, compose_file: Path
 ) -> str:
@@ -66,6 +75,7 @@ async def recover(
                 is None
             ):
                 raise RecoveryError("finish HQ promotion event recording before rejoin")
+            await require_async(conn)
             # Recheck the physical fence inside the shared operation lock.
             stopped = await inspect_container(target["Id"])
             if stopped["State"]["Running"]:
@@ -113,6 +123,7 @@ async def recover(
             )
             if await role(conn) != state:
                 raise RecoveryError("HQ source changed; target remains stopped")
+            await require_async(conn)
             await command([*compose, "start", HQ_PRIMARY])
             return output, state
 
@@ -142,6 +153,7 @@ async def recover(
                         and current[1] == state[1]
                         and await run_on(source, streaming, settings=settings) == (True,)
                     ):
+                        await run_on(source, require_async, region_id="hq", settings=settings)
                         return output + "hq-primary rejoined as standby of hq-standby\n"
                 except RegionUnreachableError:
                     pass
