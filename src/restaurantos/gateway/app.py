@@ -2,16 +2,17 @@
 
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
+from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from restaurantos.common.cluster import load_cluster
+from restaurantos.common.cluster import BASELINE, load_cluster
 from restaurantos.common.config import get_settings
-from restaurantos.common.db import node_conninfo, probe_node
+from restaurantos.common.db import make_pool, node_conninfo, probe_node
 from restaurantos.common.errors import (
     RegionUnreachableError,
     StaleEpochError,
@@ -56,6 +57,13 @@ from restaurantos.gateway.orders import (
 )
 from restaurantos.gateway.pools import RegionPools
 from restaurantos.gateway.restock import restock_region_vendor
+from restaurantos.gateway.router.nearby import nearby_live
+from restaurantos.gateway.router.top_dishes import (
+    RankBy,
+    top_dishes_live,
+    top_dishes_single,
+)
+from restaurantos.gateway.router.window import normalize_window
 from restaurantos.gateway.stock import get_vendor_stock
 from restaurantos.gateway.summary import get_region_summary
 from restaurantos.gateway.vendors import search_vendors
@@ -163,6 +171,18 @@ def create_app() -> FastAPI:
             await hq_pool.open()
             app.state.hq_pool = hq_pool
 
+            baseline_pool = make_pool(
+                node_conninfo(
+                    cluster,
+                    BASELINE,
+                    direct=True,
+                    settings=settings,
+                ),
+                settings,
+            )
+            await baseline_pool.open()
+            app.state.baseline_pool = baseline_pool
+
             directory = DirectoryCache(
                 vendor_cells={},
                 cell_routes={},
@@ -206,6 +226,7 @@ def create_app() -> FastAPI:
             if settings.mode == "gateway":
                 await directory_refresh_task
 
+                await app.state.baseline_pool.close()
                 await app.state.hq_pool.close()
             else:
                 await edge_primary_task
@@ -395,6 +416,112 @@ def create_app() -> FastAPI:
             )
 
         return dish
+
+    @gateway.get("/query/nearby")
+    async def query_nearby(
+        request: Request,
+        geohash: str = Query(
+            ...,
+            min_length=5,
+            max_length=5,
+        ),
+        dish: str = Query(...),
+        limit: int = Query(10, ge=1, le=100),
+    ):
+        async def dish_work():
+            return await get_dish(
+                request.app.state.hq_pool,
+                dish,
+            )
+
+        dish_row = await run_hq(dish_work)
+
+        if dish_row is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": "not_found"},
+            )
+
+        result = await nearby_live(
+            geohash,
+            dish,
+            limit,
+            request.app.state.directory,
+            request.app.state.region_pools,
+        )
+
+        return {
+            "geohash": geohash,
+            "dish_id": dish,
+            "dish_name": dish_row["dish_name"],
+            "example_name": dish_row["example_name"],
+            "limit": limit,
+            "results": result.results,
+            "meta": result.meta.model_dump(mode="json"),
+        }
+
+    @gateway.get("/query/top-dishes")
+    async def query_top_dishes(
+        request: Request,
+        day: int | None = Query(default=None, ge=0),
+        from_day: int | None = Query(default=None, ge=0),
+        to_day: int | None = Query(default=None, ge=0),
+        from_time: time | None = None,
+        to_time: time | None = None,
+        limit: int = Query(default=10, ge=1, le=100),
+        rank_by: RankBy = "units",
+        mode: Literal["live", "hq", "baseline"] = "live",
+    ):
+
+        try:
+            window = normalize_window(
+                day=day,
+                from_day=from_day,
+                to_day=to_day,
+                from_time=from_time,
+                to_time=to_time,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=str(exc),
+            ) from exc
+
+        if mode == "live":
+            result = await top_dishes_live(
+                window,
+                rank_by=rank_by,
+                limit=limit,
+                directory=request.app.state.directory,
+                pools=request.app.state.region_pools,
+            )
+        elif mode == "hq":
+            result = await top_dishes_single(
+                request.app.state.hq_pool,
+                window,
+                mode="hq",
+                rank_by=rank_by,
+                limit=limit,
+            )
+        else:
+            result = await top_dishes_single(
+                request.app.state.baseline_pool,
+                window,
+                mode="baseline",
+                rank_by=rank_by,
+                limit=limit,
+            )
+
+        return {
+            "from_day": window.from_day,
+            "to_day": window.to_day,
+            "from_time": (window.from_time.isoformat() if window.from_time is not None else None),
+            "to_time": (window.to_time.isoformat() if window.to_time is not None else None),
+            "limit": limit,
+            "rank_by": rank_by,
+            "results": result.results,
+            "meta": result.meta.model_dump(mode="json"),
+        }
 
     @edge.get("/dishes")
     async def edge_dish_search(
