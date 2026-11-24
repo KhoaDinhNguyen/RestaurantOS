@@ -1,0 +1,13 @@
+# Ignore everything, then re-include only what the image needs.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+!db/
+# Re-included folders still must not bring junk in.
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+**/.ruff_cache

@@ -139,3 +139,31 @@ uv run pytest -m cluster tests/cluster/test_deadline.py    # checks the path end
 - These ports must be free for the dev baseline: 8474; 5500, 5501, 5510 and 5511; 21000 to 21005 and 21010 to 21019. Each extra region adds ten proxy ports and two database ports.
 - Service ports are fixed: gateway 8000, coordinator 8001, control 8002, the edge API of region n on 8010 + n.
 - Host mode is for developing and debugging. Do not report performance numbers from it: every query takes an extra hop through Docker's port forwarding. Measured runs use container mode (`docs/architecture.md` Section 4).
+
+## The service image (container mode)
+
+One image runs every Python service (gateway, edge, coordinator, relay, HQ worker); which one it is comes from environment variables at `docker run` time, never from the image.
+
+```bash
+# from the repository root
+docker build -f infra/Dockerfile -t restaurantos-services:local .
+```
+
+Inside the image: the virtualenv at `/app/.venv` (on `PATH`), `src/` and `db/`; nothing else. No `.env`, no dataset: settings come only from the environment (`--env-file`), and the dataset never enters an image (`.dockerignore` is an allowlist).
+
+The image uses Debian trixie's own `libpq5` 17, while the host builds `psycopg[c]` against PGDG's libpq (see "libpq 17 or newer" above). Both meet the 17-or-newer rule: below 17, psycopg cancels a query with a blocking `PQcancel` that freezes a whole process on a link a fault test has silenced.
+
+The cluster definition is **mounted, not copied**: a region-count change needs no rebuild.
+
+A service container joins the cluster's Compose network (named after the Compose project; `restaurantos_default` for the default project name) and publishes its HTTP port on the loopback interface only:
+
+```bash
+docker run --rm \
+  --network restaurantos_default \
+  --env-file .env.example \
+  -e ROS_NETWORK=compose \
+  -e ROS_CLUSTER_FILE=/app/infra/cluster.toml \
+  -v "$PWD/infra/cluster.toml:/app/infra/cluster.toml:ro" \
+  -p 127.0.0.1:8000:8000 \
+  restaurantos-services:local python -m restaurantos.gateway
+```
