@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
-import importlib
 import os
 import signal
 import socket
@@ -41,9 +40,19 @@ from restaurantos.sim.services import (
 
 CLUSTER = Cluster(regions=1)
 
+# After installing its SIGINT handler, a -c fake drops a marker file
+# named by its pid into ROS_TEST_READY_DIR (when set): a SIGINT that
+# reaches a python child during interpreter start-up is swallowed by
+# the default handler inside import machinery, so the stop tests wait
+# for this marker before they signal (see _wait_ready).
+READY_MARK = (
+    "_d = os.environ.get('ROS_TEST_READY_DIR'); "
+    "open(os.path.join(_d, str(os.getpid())), 'w') if _d else None; "
+)
+
 SLEEPER = (
-    "import signal, sys, time; "
-    "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); time.sleep(300)"
+    "import os, signal, sys, time; "
+    "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); " + READY_MARK + "time.sleep(300)"
 )
 IGNORER = (
     "import signal, sys, time; "
@@ -53,16 +62,22 @@ IGNORER = (
 PRINTER = (
     "import os, signal, sys, time; "
     "print('ROS_MODE=' + os.environ.get('ROS_MODE', '')); sys.stdout.flush(); "
-    "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); time.sleep(300)"
+    "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); " + READY_MARK + "time.sleep(300)"
 )
 
 # A minimal HTTP server on PORT that answers 200 on the health path it
-# was given and 404 everywhere else, optionally after a start delay
-# (before it binds).
-HTTP_SERVER = """import time
+# was given and 404 everywhere else. It records the first request
+# arrival as a 'hit' file (so a test can prove the probe really
+# connected), then optionally sleeps before answering, and optionally
+# sleeps before it binds.
+HTTP_SERVER = """import os, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 class H(BaseHTTPRequestHandler):
     def do_GET(self):
+        _d = os.environ.get('ROS_TEST_READY_DIR')
+        if _d:
+            open(os.path.join(_d, 'hit'), 'w')
+        {answer_delay}
         if self.path == {health!r}:
             self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
         else:
@@ -76,8 +91,12 @@ HTTPServer(("127.0.0.1", {port}), H).serve_forever()"""
 # Used to prove the pid-file-driven `down`, which rebuilds specs from
 # names and so checks the canonical argv.
 SHADOW_MODULE = (
-    "import signal, sys, time; "
-    "signal.signal(signal.SIGINT, lambda *_: sys.exit(0)); time.sleep(300)\n"
+    "import os, signal, sys, time\n"
+    "signal.signal(signal.SIGINT, lambda *_: sys.exit(0))\n"
+    "_d = os.environ.get('ROS_TEST_READY_DIR')\n"
+    "if _d:\n"
+    "    open(os.path.join(_d, str(os.getpid())), 'w')\n"
+    "time.sleep(300)\n"
 )
 
 requires_proc = pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs Linux /proc")
@@ -121,9 +140,25 @@ def _no_orphans() -> Iterator[None]:
 
 
 @pytest.fixture
-def shadow_services(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def ready_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The folder -c fakes drop their ready marker in once their SIGINT
+    handler is installed. The stop tests wait for it: a SIGINT that
+    reaches a python child during interpreter start-up is swallowed by
+    the default handler inside import machinery, the child then
+    installs its handler and never sees another signal - and the test
+    would see `killed` after a 10 s escalation instead of `stopped`
+    (this is the CI failure of round 4)."""
+    folder = tmp_path / "ready"
+    folder.mkdir()
+    monkeypatch.setenv("ROS_TEST_READY_DIR", str(folder))
+    return folder
+
+
+@pytest.fixture
+def shadow_services(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_dir: Path) -> None:
     """A restaurantos package on PYTHONPATH that shadows the real one:
-    the canonical `-m restaurantos.<component>` argv runs a sleeper."""
+    the canonical `-m restaurantos.<component>` argv runs a sleeper.
+    The fake also drops a ready marker (see `ready_dir`)."""
     pkg = tmp_path / "shadow"
     (pkg / "restaurantos").mkdir(parents=True)
     (pkg / "restaurantos" / "__init__.py").write_text("", encoding="utf-8")
@@ -191,6 +226,22 @@ def _wait_logged(runs_dir: Path, name: str, text: str, timeout_s: float = 5.0) -
     raise AssertionError(f"{text!r} never appeared in {log}")
 
 
+def _wait_ready(steps: list[Step], ready: Path, timeout_s: float = 10.0) -> None:
+    """Block until every fake this test started has dropped its ready
+    marker (its SIGINT handler is installed); fail naming the services
+    still missing if it never happens."""
+    wanted = {step.pid: step.name for step in steps if step.outcome == "started" and step.pid}
+    deadline = time.monotonic() + timeout_s
+    missing: list[str] = []
+    while time.monotonic() < deadline:
+        found = {int(path.name) for path in ready.glob("*") if path.name.isdigit()}
+        missing = [name for pid, name in wanted.items() if pid not in found]
+        if not missing:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"never became ready: {', '.join(missing)}")
+
+
 def _spawn_raw(code: str) -> int:
     """A live process that is NOT one of our services - what a reused
     pid looks like to `down`."""
@@ -205,15 +256,23 @@ def _write_pid_file(runs: Path, name: str, pid: int, ticks: int) -> None:
 
 
 def _http_fake(
-    name: str, *, health: str, delay_s: float = 0.0, bad_health: bool = False
+    name: str,
+    *,
+    health: str,
+    delay_s: float = 0.0,
+    bad_health: bool = False,
+    answer_delay_s: float = 0.0,
 ) -> tuple[ServiceSpec, int]:
     """A fake HTTP service: answers 200 on HEALTH (or on /other when
-    bad_health, so /health gets its 404), after DELAY_S."""
+    bad_health, so /health gets its 404). DELAY_S sleeps before the
+    bind; ANSWER_DELAY_S sleeps after a request arrives, before it is
+    answered - the slow-answer case."""
     port = _free_port()
     served = "/other" if bad_health else health
     code = HTTP_SERVER.format(
         health=served,
         delay=f"time.sleep({delay_s})" if delay_s else "pass",
+        answer_delay=f"time.sleep({answer_delay_s})" if answer_delay_s else "pass",
         port=port,
     )
     return fake(name, port=port, ready=health, code=code), port
@@ -223,12 +282,13 @@ def _http_fake(
 
 
 @requires_proc
-def test_up_starts_a_detached_child_and_down_stops_it(tmp_path: Path) -> None:
+def test_up_starts_a_detached_child_and_down_stops_it(tmp_path: Path, ready_dir: Path) -> None:
     runs = tmp_path / "runs"
     steps = up_services(
         CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[fake("sleeper")]
     )
     _track(steps)
+    _wait_ready(steps, ready_dir)
     assert [step.outcome for step in steps] == ["started"]
     pid = steps[0].pid
     assert pid is not None
@@ -243,11 +303,12 @@ def test_up_starts_a_detached_child_and_down_stops_it(tmp_path: Path) -> None:
 
 
 @requires_proc
-def test_the_log_carries_one_header_line_per_start(tmp_path: Path) -> None:
+def test_the_log_carries_one_header_line_per_start(tmp_path: Path, ready_dir: Path) -> None:
     runs = tmp_path / "runs"
     spec = fake("sleeper", ROS_MODE="gateway")
     steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     _track(steps)
+    _wait_ready(steps, ready_dir)
     header = services.log_path(runs, "sleeper").read_text(encoding="utf-8").splitlines()[0]
     assert header.startswith("# ")
     assert "start sleeper" in header
@@ -257,7 +318,7 @@ def test_the_log_carries_one_header_line_per_start(tmp_path: Path) -> None:
 
 @requires_proc
 def test_child_environment_overrides_leftover_shell_variables(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_dir: Path
 ) -> None:
     # a leftover ROS_MODE in the shell must not leak into the child:
     # the table's identity is the only truth
@@ -266,6 +327,7 @@ def test_child_environment_overrides_leftover_shell_variables(
     spec = fake("printer", code=PRINTER, ROS_MODE="gateway", ROS_CLIENT="gateway")
     steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     _track(steps)
+    _wait_ready(steps, ready_dir)
     log = services.log_path(runs, "printer")
     deadline = time.monotonic() + 5.0
     body = ""
@@ -288,11 +350,12 @@ def test_child_environment_overrides_leftover_shell_variables(
 
 
 @requires_proc
-def test_second_up_is_idempotent(tmp_path: Path) -> None:
+def test_second_up_is_idempotent(tmp_path: Path, ready_dir: Path) -> None:
     runs = tmp_path / "runs"
     spec = fake("sleeper")
     first = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     _track(first)
+    _wait_ready(first, ready_dir)
     second = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     assert [step.outcome for step in second] == ["already-running"]
     assert (
@@ -317,7 +380,7 @@ def test_a_port_someone_else_holds_is_reported_not_fought_over(tmp_path: Path) -
 
 
 @requires_proc
-def test_two_starts_of_one_name_start_one_process(tmp_path: Path) -> None:
+def test_two_starts_of_one_name_start_one_process(tmp_path: Path, ready_dir: Path) -> None:
     # the lock file serializes two rosctl ups racing on one name: the
     # second waits and then sees the first's pid file
     runs = tmp_path / "runs"
@@ -333,6 +396,7 @@ def test_two_starts_of_one_name_start_one_process(tmp_path: Path) -> None:
     for thread in threads:
         thread.join()
     _track(results)
+    _wait_ready(results, ready_dir)
     assert sorted(step.outcome for step in results) == ["already-running", "started"]
     assert isinstance(services.read_pid_record(runs, "sleeper"), tuple)
     down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])
@@ -457,7 +521,9 @@ def test_a_service_that_dies_at_once_is_named_with_its_log(tmp_path: Path) -> No
 
 
 @requires_proc
-def test_an_unwritable_log_is_launch_failed_and_the_rest_still_start(tmp_path: Path) -> None:
+def test_an_unwritable_log_is_launch_failed_and_the_rest_still_start(
+    tmp_path: Path, ready_dir: Path
+) -> None:
     # one service's log cannot be opened: that service reports
     # launch-failed and the sweep carries on to the next one
     runs = tmp_path / "runs"
@@ -471,6 +537,7 @@ def test_an_unwritable_log_is_launch_failed_and_the_rest_still_start(tmp_path: P
         specs=[fake("slow"), fake("next")],
     )
     _track(steps)
+    _wait_ready(steps, ready_dir)
     assert steps[0].outcome == "launch-failed"
     assert "could not write the service log" in steps[0].detail
     assert steps[1].outcome == "started"
@@ -504,7 +571,7 @@ def test_a_failed_pid_write_kills_the_child(
 
 
 @requires_proc
-def test_up_starts_only_the_named_services(tmp_path: Path) -> None:
+def test_up_starts_only_the_named_services(tmp_path: Path, ready_dir: Path) -> None:
     runs = tmp_path / "runs"
     specs = [fake("solo"), fake("other")]
     steps = up_services(
@@ -516,12 +583,16 @@ def test_up_starts_only_the_named_services(tmp_path: Path) -> None:
         names=["solo"],
     )
     _track(steps)
+    _wait_ready(steps, ready_dir)
     assert [step.name for step in steps] == ["solo"]
     assert services.read_pid_record(runs, "other") is None
     down_services(CLUSTER, runs_dir=runs, names=["solo"], specs=specs)
 
 
-def test_unknown_name_lists_the_valid_ones() -> None:
+def test_unknown_name_lists_the_valid_ones(monkeypatch: pytest.MonkeyPatch) -> None:
+    # the platform check is patched so the name check is what runs,
+    # on any platform
+    monkeypatch.setattr(services, "_has_proc", lambda: True)
     with pytest.raises(ValueError, match="valid names"):
         up_services(
             CLUSTER,
@@ -557,7 +628,7 @@ def test_sigint_ignored_service_is_killed(tmp_path: Path) -> None:
 
 
 @requires_proc
-def test_a_start_ticks_mismatch_is_never_signalled(tmp_path: Path) -> None:
+def test_a_start_ticks_mismatch_is_never_signalled(tmp_path: Path, ready_dir: Path) -> None:
     # the pid, argv and environment all match the service - but the
     # recorded start time is one tick off, which is what a REUSED pid
     # looks like: the first proof fails and the process is left alone
@@ -565,6 +636,7 @@ def test_a_start_ticks_mismatch_is_never_signalled(tmp_path: Path) -> None:
     spec = fake("sleeper", ROS_CLIENT="sleeper")
     steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     _track(steps)
+    _wait_ready(steps, ready_dir)
     pid = steps[0].pid
     assert pid is not None
     services._write_pid_file(
@@ -590,13 +662,14 @@ def test_a_reused_pid_is_never_killed(tmp_path: Path) -> None:
 
 
 @requires_proc
-def test_a_sibling_with_the_same_argv_is_not_confused(tmp_path: Path) -> None:
+def test_a_sibling_with_the_same_argv_is_not_confused(tmp_path: Path, ready_dir: Path) -> None:
     runs = tmp_path / "runs"
     relay_a = fake("relay-a", ROS_CLIENT="relay-a", ROS_RELAY_ROLE="region")
     relay_b = fake("relay-b", ROS_CLIENT="relay-b", ROS_RELAY_ROLE="region")
     specs = [relay_a, relay_b]
     steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=specs)
     _track(steps)
+    _wait_ready(steps, ready_dir)
     assert [step.outcome for step in steps] == ["started", "started"]
     pid_a = steps[0].pid
     pid_b = steps[1].pid
@@ -636,7 +709,7 @@ def test_down_after_a_crash_reports_the_stale_pid_file(tmp_path: Path) -> None:
 
 @requires_proc
 def test_a_malformed_pid_file_is_reported_and_the_sweep_continues(
-    tmp_path: Path, shadow_services: None
+    tmp_path: Path, shadow_services: None, ready_dir: Path
 ) -> None:
     # a binary pid file once crashed the whole down sweep with a
     # UnicodeDecodeError; now it is one reported step, the file stays
@@ -652,6 +725,7 @@ def test_a_malformed_pid_file_is_reported_and_the_sweep_continues(
         specs=[services.spec_for_name("relay-r2")],
     )
     _track(steps)
+    _wait_ready(steps, ready_dir)
     bad = services.pid_path(runs, "relay-r1")
     bad.parent.mkdir(parents=True, exist_ok=True)
     bad.write_bytes(b"\xff\xfe not a pid file")
@@ -812,13 +886,15 @@ def test_a_concurrent_start_waits_for_the_stop_to_release_the_lock(
 
 @requires_proc
 def test_the_readiness_wait_gives_up_at_the_deadline_not_the_server_s(
-    tmp_path: Path,
+    tmp_path: Path, ready_dir: Path
 ) -> None:
-    # a server that sleeps 5 s before answering, with a 0.5 s
-    # readiness budget: the probe's timeout is the time REMAINING, so
-    # up gives up within about a second - not after the server's 5
+    # a server that ACCEPTS the connection and then sleeps 5 s before
+    # answering (the slow-answer case, not a refused connection), with
+    # a 0.5 s readiness budget: the probe's timeout is the time
+    # REMAINING, so up gives up within about a second - not after the
+    # server's 5
     runs = tmp_path / "runs"
-    spec, _port = _http_fake("slow", health="/health", delay_s=5.0)
+    spec, _port = _http_fake("slow", health="/health", answer_delay_s=5.0)
     t0 = time.monotonic()
     steps = up_services(
         CLUSTER,
@@ -829,6 +905,7 @@ def test_the_readiness_wait_gives_up_at_the_deadline_not_the_server_s(
         specs=[spec],
     )
     elapsed = time.monotonic() - t0
+    assert (ready_dir / "hit").exists()  # the probe really connected
     assert steps[0].outcome == "not-ready"
     assert "the service was stopped" in steps[0].detail
     assert elapsed < 2.5
@@ -846,34 +923,42 @@ def test_log_tail_survives_bytes_that_are_not_utf8(tmp_path: Path) -> None:
     assert "\ufffd" in tail  # replacement characters, not an exception
 
 
-def test_services_imports_where_fcntl_does_not_exist(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_services_imports_where_fcntl_does_not_exist() -> None:
     # native Windows has no fcntl: the module must still import there
     # (fcntl is imported inside _service_lock, not at module top), so
     # rosctl prints its Linux/WSL2 message instead of an ImportError
-    # traceback
-    monkeypatch.setitem(sys.modules, "fcntl", None)
-    importlib.reload(services)
-    try:
-        monkeypatch.setattr(services, "_has_proc", lambda: False)
-        with pytest.raises(services.PlatformError, match="Linux or WSL2"):
-            services.up_services(
-                CLUSTER, runs_dir=tmp_path / "runs", precheck=False, specs=[fake("sleeper")]
-            )
-    finally:
-        monkeypatch.undo()
-        importlib.reload(services)
+    # traceback. A FRESH interpreter, not a reload: no importlib.reload
+    # anywhere in the test files
+    code = (
+        "import sys; sys.modules['fcntl'] = None\n"
+        "from pathlib import Path\n"
+        "from restaurantos.common.cluster import Cluster\n"
+        "from restaurantos.sim import services\n"
+        "services._has_proc = lambda: False\n"
+        "try:\n"
+        "    services.up_services(\n"
+        "        Cluster(regions=1), runs_dir=Path('runs'), precheck=False,\n"
+        "        specs=[services.ServiceSpec(name='s', args=('-c', 'pass'), env={})],\n"
+        "    )\n"
+        "except services.PlatformError:\n"
+        "    sys.exit(0)\n"
+        "sys.exit(1)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @requires_proc
-def test_a_bad_name_stops_nothing(tmp_path: Path) -> None:
+def test_a_bad_name_stops_nothing(tmp_path: Path, ready_dir: Path) -> None:
     # every name is resolved before the first stop: an invalid name
     # anywhere in the list means nothing is stopped at all
     runs = tmp_path / "runs"
     spec = fake("sleeper")
     steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     _track(steps)
+    _wait_ready(steps, ready_dir)
     with pytest.raises(ValueError, match="no service nope"):
         down_services(CLUSTER, runs_dir=runs, names=["sleeper", "nope"], specs=[spec])
     assert isinstance(services.read_pid_record(runs, "sleeper"), tuple)  # untouched
@@ -883,7 +968,7 @@ def test_a_bad_name_stops_nothing(tmp_path: Path) -> None:
 
 @requires_proc
 def test_down_without_names_stops_what_up_started_across_cluster_files(
-    tmp_path: Path, shadow_services: None
+    tmp_path: Path, shadow_services: None, ready_dir: Path
 ) -> None:
     # the review's case: up with a 3-region table, then a plain `down`
     # while reading a 1-region cluster file - the pid files, not the
@@ -893,26 +978,20 @@ def test_down_without_names_stops_what_up_started_across_cluster_files(
     specs = [services.spec_for_name(name) for name in names]
     steps = up_services(Cluster(regions=3), runs_dir=runs, precheck=False, grace_s=0.0, specs=specs)
     _track(steps)
+    _wait_ready(steps, ready_dir)
     assert [step.outcome for step in steps] == ["started"] * 6
 
     steps = down_services(Cluster(regions=1), runs_dir=runs)
-    # down order: the region side last, relays before edges
-    assert [step.name for step in steps] == [
-        "relay-r1",
-        "relay-r2",
-        "relay-r3",
-        "edge-r1",
-        "edge-r2",
-        "edge-r3",
-    ]
-    assert all(step.outcome == "stopped" for step in steps)
+    # down order: the region side last, relays before edges. Whole-list
+    # compare, so a failure names the service and the wrong outcome
+    assert [(step.name, step.outcome) for step in steps] == [(name, "stopped") for name in names]
     for name in names:
         assert not services.pid_path(runs, name).exists()
 
 
 @requires_proc
 def test_an_out_of_cluster_pid_file_is_stopped_and_a_non_region_one_is_left_alone(
-    tmp_path: Path, shadow_services: None
+    tmp_path: Path, shadow_services: None, ready_dir: Path
 ) -> None:
     # relay-r9 is a canonical patterned name, so its pid file is
     # managed after the cluster shrinks; relay-not-a-region is not a
@@ -921,6 +1000,7 @@ def test_an_out_of_cluster_pid_file_is_stopped_and_a_non_region_one_is_left_alon
     spec = services.spec_for_name("relay-r9")
     steps = up_services(CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[spec])
     _track(steps)
+    _wait_ready(steps, ready_dir)
     decoy = _spawn_raw("import time; time.sleep(300)")
     _write_pid_file(runs, "relay-not-a-region", decoy, services._start_ticks(decoy))
     steps = down_services(runs_dir=runs)
@@ -948,7 +1028,7 @@ def test_a_pid_file_matching_no_pattern_is_reported_and_left_alone(
 
 @requires_proc
 def test_named_down_stops_the_coordinator_before_the_gateway(
-    tmp_path: Path, shadow_services: None
+    tmp_path: Path, shadow_services: None, ready_dir: Path
 ) -> None:
     runs = tmp_path / "runs"
     # the shadow sleeper never serves /health, so start the fakes as
@@ -959,10 +1039,14 @@ def test_named_down_stops_the_coordinator_before_the_gateway(
     ]
     steps = up_services(Cluster(regions=1), runs_dir=runs, precheck=False, grace_s=0.0, specs=specs)
     _track(steps)
-    # asked for in table order; stopped in down order
+    _wait_ready(steps, ready_dir)
+    # asked for in table order; stopped in down order. Whole-list
+    # compare, so a failure names the service and the wrong outcome
     steps = down_services(Cluster(regions=1), runs_dir=runs, names=["gateway", "coordinator"])
-    assert [step.name for step in steps] == ["coordinator", "gateway"]
-    assert all(step.outcome == "stopped" for step in steps)
+    assert [(step.name, step.outcome) for step in steps] == [
+        ("coordinator", "stopped"),
+        ("gateway", "stopped"),
+    ]
 
 
 # --- precheck and platform ----------------------------------------------
@@ -1001,7 +1085,9 @@ def test_up_refuses_when_the_cluster_is_silent(
 
 
 @requires_proc
-def test_no_precheck_spawns_anyway(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_precheck_spawns_anyway(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_dir: Path
+) -> None:
     free = _free_port()
     monkeypatch.setattr(services, "dials", lambda spec, cluster: [free])
     runs = tmp_path / "runs"
@@ -1009,13 +1095,14 @@ def test_no_precheck_spawns_anyway(tmp_path: Path, monkeypatch: pytest.MonkeyPat
         CLUSTER, runs_dir=runs, precheck=False, grace_s=0.0, specs=[fake("sleeper")]
     )
     _track(steps)
-    assert all(step.outcome == "started" for step in steps)
+    _wait_ready(steps, ready_dir)
+    assert [step.outcome for step in steps] == ["started"]
     down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[fake("sleeper")])
 
 
 @requires_proc
 def test_up_of_one_service_prechecks_only_its_own_dials(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_dir: Path
 ) -> None:
     # up edge-r1 (of a 3-region cluster) checks r1's node ports and
     # nothing else: not r2's or r3's, and none of the proxies no edge
@@ -1038,6 +1125,7 @@ def test_up_of_one_service_prechecks_only_its_own_dials(
         specs=[spec],
     )
     _track(steps)
+    _wait_ready(steps, ready_dir)
     assert seen == [[5510, 5511]]
     down_services(cluster, runs_dir=tmp_path / "runs", names=["edge-r1"], specs=[spec])
 
