@@ -91,7 +91,13 @@ def _compose(*args: str, compose_file: Path = COMPOSE_FILE) -> subprocess.Comple
     if Path(".env").is_file():
         command += ["--env-file", ".env"]
     command += ["-f", str(compose_file), *args]
-    result = subprocess.run(command, capture_output=True, text=True)
+    # An inherited COMPOSE_PROFILES=services would activate the profile
+    # on bootstrap's own calls too and start the service containers
+    # during a data load - exactly what the profile gating exists to
+    # prevent - so it is stripped from every call. The teardown's
+    # explicit --profile services is unaffected.
+    env = {k: v for k, v in os.environ.items() if k != "COMPOSE_PROFILES"}
+    result = subprocess.run(command, capture_output=True, text=True, env=env)
     if result.returncode != 0:
         raise BootstrapError(
             f"{' '.join(command)} failed ({result.returncode}):\n{result.stdout}{result.stderr}"

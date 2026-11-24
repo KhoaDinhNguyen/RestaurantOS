@@ -181,6 +181,28 @@ def test_the_staged_files_include_the_cluster_config(monkeypatch, tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
+def test_an_inherited_compose_profiles_never_starts_the_services(monkeypatch, tmp_path):
+    # COMPOSE_PROFILES=services in the shell would activate the profile on
+    # bootstrap's plain up and start the service containers during a data
+    # load; _compose strips it from every call, everything else inherited
+    monkeypatch.setenv("COMPOSE_PROFILES", "services")
+    monkeypatch.setattr(bootstrap, "COMPOSE_FILE", tmp_path / "compose.yaml")
+    monkeypatch.setattr(bootstrap, "_existing_volumes", lambda: [])
+    calls: list[dict] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append({"argv": list(argv), **kwargs})
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_run)
+
+    assert bootstrap._rebuild(yes=True, compose="x", proxy_list="y", cluster_toml="z") is True
+    ups = [call for call in calls if "up" in call["argv"]]
+    assert ups, "bootstrap never called compose up"
+    assert "COMPOSE_PROFILES" not in ups[0]["env"]
+    assert "PATH" in ups[0]["env"]
+
+
 # ---- volumes the teardown files cannot name (round 2, item 2) --------------------
 
 
