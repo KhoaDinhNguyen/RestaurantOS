@@ -6,7 +6,7 @@ point, Toxiproxy's proxies and toxics, the cluster
 file and the run log, stops ONLY the PostgreSQL services (a bare
 `docker compose stop` would stop Toxiproxy too, which reloads its config
 on start and silently heals every fault), archives every data volume
-with the PostgreSQL image already on the machine, starts the databases
+with the image the databases run (never pulled), starts the databases
 again and resumes playback. It builds into `snapshots/.<name>.partial/`
 and renames at the end, so a failed snapshot leaves nothing behind.
 
@@ -40,7 +40,7 @@ from typing import Any
 
 import httpx
 
-from restaurantos.common.cluster import BASELINE, Cluster, load_cluster
+from restaurantos.common.cluster import BASELINE, HQ_PRIMARY, Cluster, load_cluster
 from restaurantos.common.simclock import SECONDS_PER_DAY
 from restaurantos.sim.checker import RESUMED_FROM
 from restaurantos.sim.config import SimSettings
@@ -171,12 +171,21 @@ class Docker:
         # Compose, without starting anything
         self.compose("up", "--no-start", *services)
 
-    def postgres_image(self) -> str:
-        images = self.compose("config", "--images").stdout.split()
-        for image in images:
-            if "toxiproxy" not in image:
-                return image
-        raise SnapshotError("no PostgreSQL image in the generated Compose file")
+    def container_image(self, node: str) -> tuple[str, str] | None:
+        """(image id, image name) the node's container was created from,
+        or None when it has no container. The id is what the database
+        actually runs - exact, and local by definition, so a `docker run`
+        on it never needs to pull. Not the Compose file's image: that
+        follows ROS_POSTGRES_IMAGE as it is NOW, and once the service
+        image is in the generated file too, "the first image that is not
+        toxiproxy" can be the Python one."""
+        ids = self.compose("ps", "-a", "-q", node).stdout.split()
+        if not ids:
+            return None
+        found = self.run(
+            ["docker", "inspect", "-f", "{{.Image}} {{.Config.Image}}", ids[0]]
+        ).stdout.split()
+        return found[0], found[1] if len(found) > 1 else found[0]
 
     def archive(self, volume: str, out_dir: Path, image: str) -> None:
         owner = f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "0:0"
@@ -185,6 +194,8 @@ class Docker:
                 "docker",
                 "run",
                 "--rm",
+                # never pull mid-snapshot: the databases are stopped
+                "--pull=never",
                 "--entrypoint",
                 "sh",
                 "-v",
@@ -204,6 +215,8 @@ class Docker:
                 "docker",
                 "run",
                 "--rm",
+                # never pull mid-snapshot: the databases are stopped
+                "--pull=never",
                 "--entrypoint",
                 "sh",
                 "-v",
@@ -499,7 +512,14 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
         services = database_services(cluster)
         docker = ctx.docker
         assert docker is not None
-        image = await asyncio.to_thread(docker.postgres_image)
+        found = await asyncio.to_thread(docker.container_image, HQ_PRIMARY)
+        if found is None:
+            raise SnapshotError(f"no {HQ_PRIMARY} container: there is no cluster to snapshot")
+        image = found[0]
+        # restore refuses to unpack these volumes under another PostgreSQL
+        (partial / "image.json").write_text(
+            json.dumps({"id": found[0], "name": found[1]}) + "\n", encoding="utf-8"
+        )
         stop_begun = True
         first_error: BaseException | None = None
         try:
@@ -587,6 +607,23 @@ def next_run_id(runs_dir: Path, run_id: str) -> str:
     while (runs_dir / f"{base}-r{n}").exists():
         n += 1
     return f"{base}-r{n}"
+
+
+def _saved_image(snap: Path) -> dict[str, str] | None:
+    image_file = snap / "image.json"
+    if not image_file.is_file():
+        return None  # a snapshot from before the image was recorded
+    return json.loads(image_file.read_text(encoding="utf-8"))
+
+
+def _check_image(saved: dict[str, str] | None, found: tuple[str, str], state: str) -> None:
+    if saved is not None and saved.get("id") != found[0]:
+        raise SnapshotError(
+            f"the snapshot was taken with PostgreSQL image {saved.get('name')} "
+            f"({saved.get('id')}), but the databases now use {found[1]} ({found[0]}); "
+            "a data directory only starts under the PostgreSQL it was written by. "
+            f"Set ROS_POSTGRES_IMAGE back and recreate the containers ({state})"
+        )
 
 
 async def _stop_live_run(ctx: Context) -> None:
@@ -740,6 +777,13 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     docker = ctx.docker
     assert docker is not None
 
+    # the volumes only start under the PostgreSQL they were saved with:
+    # refuse a mismatch before anything is stopped (and again after
+    # create_missing, for a cluster that had no containers yet)
+    saved_image = _saved_image(snap)
+    running = await asyncio.to_thread(docker.container_image, HQ_PRIMARY)
+    if running is not None:
+        _check_image(saved_image, running, "nothing was changed")
     await _stop_live_run(ctx)
     if ctx.services_down is not None:
         await asyncio.to_thread(ctx.services_down)
@@ -755,7 +799,11 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     generate(snapshot_cluster, ctx.generated_dir, snapshot_toml)
     services = database_services(snapshot_cluster)
     await asyncio.to_thread(docker.create_missing, services)
-    image = await asyncio.to_thread(docker.postgres_image)
+    found = await asyncio.to_thread(docker.container_image, HQ_PRIMARY)
+    if found is None:
+        raise SnapshotError(f"no {HQ_PRIMARY} container after compose up --no-start")
+    _check_image(saved_image, found, "nothing is unpacked yet; the databases are stopped")
+    image = found[0]
     for node in services:
         await asyncio.to_thread(docker.unpack, volume_name(node), snap, image)
     if record.get("run"):

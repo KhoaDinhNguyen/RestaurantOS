@@ -6,6 +6,7 @@ skip a restock that already went out, catch up, switch speed back)."""
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -109,6 +110,8 @@ class FakeDocker:
         self.fail_archive: str | None = None
         self.fail_stop = False
         self.fail_start = False
+        # (image id, name) of hq-primary's container; None: no container
+        self.image: tuple[str, str] | None = ("sha256:pg18", "postgres:18-test")
 
     def stop(self, services: list[str]) -> None:
         self.calls.append(("stop", tuple(services)))
@@ -123,16 +126,19 @@ class FakeDocker:
     def create_missing(self, services: list[str]) -> None:
         self.calls.append(("create_missing", tuple(services)))
 
-    def postgres_image(self) -> str:
-        return "postgres:18-test"
+    def container_image(self, node: str) -> tuple[str, str] | None:
+        assert node == "hq-primary"
+        return self.image
 
     def archive(self, volume: str, out_dir: Path, image: str) -> None:
+        assert self.image is not None and image == self.image[0]
         if volume == self.fail_archive:
             raise SnapshotError("disk full")
         (out_dir / f"{volume}.tar.gz").write_text("archive", encoding="utf-8")
         self.calls.append(("archive", volume))
 
     def unpack(self, volume: str, in_dir: Path, image: str) -> None:
+        assert self.image is not None and image == self.image[0]
         assert (in_dir / f"{volume}.tar.gz").is_file()
         self.calls.append(("unpack", volume))
 
@@ -522,6 +528,55 @@ async def test_save_without_a_run_records_no_run(world) -> None:
     host.alive = False
     record = await save("idle", ctx)
     assert record["run"] is None and record["sim_day"] is None
+
+
+async def test_save_records_the_image_the_databases_run(world) -> None:
+    ctx, _, docker, _, _ = world
+    await save("snap", ctx)
+    image = json.loads((ctx.snapshot_dir / "snap" / "image.json").read_text())
+    assert image == {"id": "sha256:pg18", "name": "postgres:18-test"}
+
+
+async def test_save_without_a_cluster_is_refused(world) -> None:
+    ctx, host, docker, _, _ = world
+    docker.image = None
+    with pytest.raises(SnapshotError, match="no hq-primary container"):
+        await save("nothing", ctx)
+    assert ("stop", DATABASES) not in docker.calls
+    assert host.state == "running"
+
+
+async def test_restore_refuses_another_postgres_image_before_touching_anything(world) -> None:
+    ctx, host, docker, _, services = world
+    await save("snap", ctx)
+    docker.calls.clear()
+    host.commands.clear()
+    docker.image = ("sha256:pg17", "postgres:17")
+    with pytest.raises(SnapshotError, match="only starts under the PostgreSQL"):
+        await restore("snap", ctx)
+    assert docker.calls == [] and host.commands == [] and services == []
+
+
+def test_the_docker_commands_never_pull(tmp_path: Path) -> None:
+    from restaurantos.sim.snapshot import Docker
+
+    commands: list[list[str]] = []
+
+    def run(command: list[str]):
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, "sha256:abc postgres:18\n", "")
+
+    def compose(*args: str):
+        return subprocess.CompletedProcess(list(args), 0, "c0ffee\n" if "ps" in args else "", "")
+
+    docker = Docker(compose=compose, run=run)
+    assert docker.container_image("hq-primary") == ("sha256:abc", "postgres:18")
+    assert commands[-1][:3] == ["docker", "inspect", "-f"] and commands[-1][-1] == "c0ffee"
+    docker.archive("v", tmp_path, "sha256:abc")
+    docker.unpack("v", tmp_path, "sha256:abc")
+    assert all("--pull=never" in command for command in commands[1:])
+    empty = Docker(compose=lambda *a: subprocess.CompletedProcess(list(a), 0, "", ""), run=run)
+    assert empty.container_image("hq-primary") is None
 
 
 async def test_restore_refuses_a_different_cluster_file_without_the_flag(world) -> None:
