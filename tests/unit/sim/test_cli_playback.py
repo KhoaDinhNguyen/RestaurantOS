@@ -451,6 +451,41 @@ def test_start_shortens_a_to_day_past_the_data(tmp_path, monkeypatch, capsys, fr
         get_sim_settings.cache_clear()
 
 
+def test_the_banner_leaves_out_a_skipped_first_restock(
+    tmp_path, monkeypatch, capsys, fresh_settings
+) -> None:
+    """PR #33 review: with --skip-first-restock the engine schedules no
+    restock on from_day, and the banner's count says so too; later
+    restock days still count."""
+    from restaurantos.sim.config import get_sim_settings
+
+    get_sim_settings.cache_clear()
+    monkeypatch.setenv("ROS_SIM_STOCK_WARM_UP_DAYS", "14")
+    try:
+        orders = [
+            ["1", "c1", "v1", "w21z7", "3", 14, "12:00:00"],
+            ["2", "c1", "v1", "w21z7", "3", 15, "12:00:00"],
+            ["3", "c1", "v1", "w21z7", "3", 16, "12:00:00"],
+        ]
+        data = _make_data_with_vendors(
+            tmp_path,
+            orders,
+            [["1", "p1", 1], ["2", "p1", 1], ["3", "p1", 1]],
+            "vendor_id,chain_id,geohash,primary_cuisine\nv1,,w21z7,x\n",
+        )
+        monkeypatch.setenv("ROS_DATA_DIR", str(data))
+        base = ["playback", "start", "--from-day", "15", "--to-day", "16", "--restock-days", "1"]
+        base += ["--kitchen-target", "http://127.0.0.1:8900/api/v1", "--port", "1"]
+        _install_fake_start(monkeypatch, {})
+        assert app(base) == 0
+        assert "restock on 2 day(s)" in capsys.readouterr().err  # days 15 and 16
+        _install_fake_start(monkeypatch, {})
+        assert app([*base, "--skip-first-restock"]) == 0
+        assert "restock on 1 day(s)" in capsys.readouterr().err  # day 16 only
+    finally:
+        get_sim_settings.cache_clear()
+
+
 def _install_fake_start(monkeypatch, captured: dict) -> None:
     """The engine boundary faked: the CLI's own wiring (routing
     arguments, meta, exit codes) is what is under test. FakePlayback

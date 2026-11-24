@@ -271,6 +271,9 @@ async def _run_start(
         # the banner's days come from the effective window, so a
         # shortened to_day never announces restocks outside the data
         banner_days = restock_days(meta.warm_up_days, restock_every, window.from_day, window.to_day)
+        if getattr(args, "skip_first_restock", False):
+            # the engine drops the from_day restock the same way
+            banner_days = [day for day in banner_days if day != window.from_day]
         pairs = restock_vendors(data_dir)
         vendors = [vendor for vendor, _geohash in pairs]
         # the region map shards these same rows, not a second read
