@@ -1,0 +1,699 @@
+"""Snapshot and restore (WP6b, architecture Section 7.4).
+
+**Save** pauses playback (after 00:30 of the simulated day), records the
+run, the simulated clock, Toxiproxy's proxies and toxics, the cluster
+file and the run log, stops ONLY the PostgreSQL services (a bare
+`docker compose stop` would stop Toxiproxy too, which reloads its config
+on start and silently heals every fault), archives every data volume
+with the PostgreSQL image already on the machine, starts the databases
+again and resumes playback. It builds into `snapshots/.<name>.partial/`
+and renames at the end, so a failed snapshot leaves nothing behind.
+
+**Restore** puts it all back - the cluster file first, then the
+generated Compose file regenerated from it, BEFORE any container starts -
+restarts every service (they cache epochs and primaries that the restore
+makes stale), and resumes playback by **replaying the snapshot's whole
+day** as a new run (option C): orders and status events sent before the
+snapshot point are answered as duplicates and change nothing, and the
+day's midnight restock is skipped if it already went out (restock tops
+up to par, so a second one would refill what was sold since midnight).
+The limitations of this choice are in architecture Section 7.4.
+
+Never `docker compose down -v` here: it destroys the cluster.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import shutil
+import subprocess
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from restaurantos.common.cluster import BASELINE, Cluster, load_cluster
+from restaurantos.common.simclock import SECONDS_PER_DAY
+from restaurantos.sim.checker import RESUMED_FROM
+from restaurantos.sim.config import SimSettings
+from restaurantos.sim.toxiproxy import Toxiproxy
+
+_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SNAPSHOT_FILE = "snapshot.json"
+LIVE_STATES = ("running", "paused")
+
+
+class SnapshotError(RuntimeError):
+    status = 400
+    code = "snapshot_error"
+
+
+class SnapshotExistsError(SnapshotError):
+    status = 409
+    code = "snapshot_exists"
+
+
+class UnknownSnapshotError(SnapshotError):
+    status = 404
+    code = "unknown_snapshot"
+
+
+def check_name(name: str) -> str:
+    if not _NAME.fullmatch(name):
+        raise SnapshotError(
+            f"snapshot name {name!r} must be one path component: letters, digits, "
+            "'.', '_' or '-', 1 to 64 characters, not starting with '.'"
+        )
+    return name
+
+
+def sim_seconds(clock: dict[str, Any]) -> int | None:
+    """Absolute simulated seconds of a `GET /sim/clock` answer."""
+    day, moment = clock.get("sim_day"), clock.get("sim_time")
+    if day is None or not moment:
+        return None
+    hours, minutes, seconds = (int(part) for part in str(moment).split(":"))
+    return int(day) * SECONDS_PER_DAY + hours * 3600 + minutes * 60 + seconds
+
+
+# --- Docker -------------------------------------------------------------------
+
+Compose = Callable[..., subprocess.CompletedProcess]
+Runner = Callable[[list[str]], subprocess.CompletedProcess]
+
+
+def _bootstrap_compose(*args: str) -> subprocess.CompletedProcess:
+    from restaurantos.sim.bootstrap import _compose
+
+    return _compose(*args)
+
+
+def _run(command: list[str]) -> subprocess.CompletedProcess:
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise SnapshotError(
+            f"{' '.join(command)} failed ({result.returncode}):\n{result.stdout}{result.stderr}"
+        )
+    return result
+
+
+def volume_name(node: str) -> str:
+    """Compose names a service's volume <project>_<volume>."""
+    from restaurantos.sim.bootstrap import PROJECT
+
+    return f"{PROJECT}_{node}-data"
+
+
+def database_services(cluster: Cluster) -> list[str]:
+    """Every PostgreSQL service of the generated Compose file, baseline included."""
+    return [*cluster.nodes, BASELINE]
+
+
+@dataclass
+class Docker:
+    """The Docker side of a snapshot, as blocking calls (run them in a
+    thread). Tests pass fakes."""
+
+    compose: Compose = _bootstrap_compose
+    run: Runner = _run
+
+    def stop(self, services: list[str]) -> None:
+        self.compose("stop", *services)
+
+    def start(self, services: list[str]) -> None:
+        # `up --wait` on the named services: starts them in dependency
+        # order (a standby waits for its primary) and returns when healthy
+        self.compose("up", "-d", "--wait", *services)
+
+    def create_missing(self, services: list[str]) -> None:
+        # containers and volumes for the named services, labelled by
+        # Compose, without starting anything
+        self.compose("up", "--no-start", *services)
+
+    def postgres_image(self) -> str:
+        images = self.compose("config", "--images").stdout.split()
+        for image in images:
+            if "toxiproxy" not in image:
+                return image
+        raise SnapshotError("no PostgreSQL image in the generated Compose file")
+
+    def archive(self, volume: str, out_dir: Path, image: str) -> None:
+        owner = f"{os.getuid()}:{os.getgid()}" if hasattr(os, "getuid") else "0:0"
+        self.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "sh",
+                "-v",
+                f"{volume}:/data",
+                "-v",
+                f"{out_dir.resolve()}:/out",
+                image,
+                "-c",
+                f"tar --numeric-owner -czf /out/{volume}.tar.gz -C /data . "
+                f"&& chown {owner} /out/{volume}.tar.gz",
+            ]
+        )
+
+    def unpack(self, volume: str, in_dir: Path, image: str) -> None:
+        self.run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--entrypoint",
+                "sh",
+                "-v",
+                f"{volume}:/data",
+                "-v",
+                f"{in_dir.resolve()}:/in:ro",
+                image,
+                "-c",
+                "find /data -mindepth 1 -delete && "
+                f"tar --numeric-owner -xzf /in/{volume}.tar.gz -C /data",
+            ]
+        )
+
+
+# --- playback, over the control port -------------------------------------------
+
+
+class PlaybackClient:
+    """The process that hosts playback (`rosctl control`, or a standalone
+    `rosctl playback start`), over HTTP. `status()` answers None when no
+    such process listens: there is no run to pause or resume."""
+
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout_s: float = 10.0,
+        stop_timeout_s: float = 60.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self.base_url = base_url
+        self._timeout_s = timeout_s
+        self._stop_timeout_s = stop_timeout_s
+        self._transport = transport
+
+    async def _call(
+        self, method: str, path: str, body: dict | None = None, timeout_s: float | None = None
+    ) -> httpx.Response:
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            timeout=timeout_s or self._timeout_s,
+            transport=self._transport,
+        ) as client:
+            return await client.request(method, path, json=body)
+
+    async def status(self) -> dict[str, Any] | None:
+        try:
+            response = await self._call("GET", "/sim/playback")
+        except httpx.ConnectError:
+            return None
+        response.raise_for_status()
+        return response.json()
+
+    async def clock(self) -> dict[str, Any]:
+        response = await self._call("GET", "/sim/clock")
+        response.raise_for_status()
+        return response.json()
+
+    async def command(self, body: dict[str, Any]) -> httpx.Response:
+        stop = body.get("action") == "stop"
+        return await self._call(
+            "POST", "/sim/playback", body, timeout_s=self._stop_timeout_s if stop else None
+        )
+
+    async def speed(self, value: float) -> httpx.Response:
+        return await self._call("PATCH", "/sim/playback", {"speed": value})
+
+    async def heal_all(self) -> bool:
+        """Heal-all through the control process (so its fault map is
+        cleared too); False when the host is a standalone playback."""
+        try:
+            response = await self._call("POST", "/sim/faults/heal-all")
+        except httpx.ConnectError:
+            return False
+        return response.status_code == 200
+
+
+def _message(response: httpx.Response) -> str:
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text
+    return str(body.get("message") or body.get("detail") or body)
+
+
+# --- save -------------------------------------------------------------------------
+
+
+@dataclass
+class Context:
+    """Everything save and restore touch, injectable for tests."""
+
+    cluster_file: Path
+    sim: SimSettings
+    playback: PlaybackClient
+    toxiproxy_factory: Callable[[], Toxiproxy] = Toxiproxy
+    docker: Docker | None = None
+    runs_dir: Path = Path("runs")
+    generated_dir: Path = Path("infra/generated")
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+    services_down: Callable[[], None] | None = None
+    services_up: Callable[[Cluster, Path], None] | None = None
+
+    def __post_init__(self) -> None:
+        if self.docker is None:
+            self.docker = Docker()
+
+    @property
+    def snapshot_dir(self) -> Path:
+        return self.sim.snapshot_dir
+
+
+async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool]:
+    """Pause a live run at a safe point. Returns (status, was_running)."""
+    status = await ctx.playback.status()
+    if status is None or status.get("state") not in LIVE_STATES:
+        return None, False
+    was_running = status["state"] == "running"
+    minimum = ctx.sim.snapshot_min_day_offset_s
+    while True:
+        clock = await ctx.playback.clock()
+        now = sim_seconds(clock)
+        offset = None if now is None else now % SECONDS_PER_DAY
+        if offset is None or offset >= minimum:
+            break
+        if not was_running or clock.get("state") != "running":
+            raise SnapshotError(
+                f"the run stands at {clock.get('sim_time')} of day {clock.get('sim_day')}, "
+                f"before {minimum // 3600:02d}:{minimum % 3600 // 60:02d}: the restored day "
+                "is replayed from midnight, so resume the run past that time first"
+            )
+        await ctx.sleep(0.1)
+    if was_running:
+        response = await ctx.playback.command({"action": "pause"})
+        if response.status_code != 200:
+            raise SnapshotError(f"cannot pause playback: {_message(response)}")
+    waited = 0.0
+    while True:
+        status = await ctx.playback.status() or {}
+        if not status.get("inflight"):
+            return status, was_running
+        if waited >= ctx.sim.snapshot_drain_timeout_s:
+            if was_running:
+                await ctx.playback.command({"action": "resume"})
+            raise SnapshotError(
+                f"{status.get('inflight')} requests still in flight after "
+                f"{ctx.sim.snapshot_drain_timeout_s:g} s; playback resumed, no snapshot"
+            )
+        await ctx.sleep(0.2)
+        waited += 0.2
+
+
+async def save(name: str, ctx: Context) -> dict[str, Any]:
+    check_name(name)
+    final = ctx.snapshot_dir / name
+    if final.exists():
+        raise SnapshotExistsError(f"snapshot {name!r} exists; choose another name")
+    cluster = load_cluster(ctx.cluster_file)
+    partial = ctx.snapshot_dir / f".{name}.partial"
+    if partial.exists():
+        shutil.rmtree(partial)  # left by a crashed snapshot
+    status, was_running = await _pause_for_snapshot(ctx)
+    failed = True
+    try:
+        partial.mkdir(parents=True)
+        record: dict[str, Any] = {
+            "name": name,
+            "created_at": datetime.now(UTC).isoformat(),
+            "sim_day": None,
+            "sim_time": None,
+            "regions": list(cluster.region_ids),
+            "cluster_file": str(ctx.cluster_file),
+            "run": None,
+            "volumes": [volume_name(node) for node in database_services(cluster)],
+        }
+        if status is not None:
+            clock = await ctx.playback.clock()
+            run_id = status["run_id"]
+            run_dir = ctx.runs_dir / run_id
+            meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
+            record["sim_day"] = clock.get("sim_day")
+            record["sim_time"] = clock.get("sim_time")
+            record["run"] = {
+                "run_id": run_id,
+                "seed": status.get("seed"),
+                "speed": status.get("speed"),
+                "from_day": status.get("from_day"),
+                "to_day": status.get("to_day"),
+                "duplicate_rate": meta.get("duplicate_rate", 0.0),
+                "shuffle": meta.get("shuffle", False),
+                # engine-wide facts: the host that resumes must match them
+                "sequential": meta.get("sequential", False),
+                "region": meta.get("region"),
+                "target_url": meta.get("target_url"),
+            }
+            shutil.copytree(run_dir, partial / "run" / run_id)
+        shutil.copy2(ctx.cluster_file, partial / "cluster.toml")
+        toxiproxy = ctx.toxiproxy_factory()
+        try:
+            proxies = await toxiproxy.list_proxies()
+        finally:
+            await toxiproxy.aclose()
+        (partial / "toxiproxy.json").write_text(
+            json.dumps(
+                [
+                    {
+                        "name": proxy.get("name"),
+                        "enabled": proxy.get("enabled", True),
+                        "toxics": proxy.get("toxics") or [],
+                    }
+                    for proxy in proxies
+                ],
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        services = database_services(cluster)
+        docker = ctx.docker
+        assert docker is not None
+        image = await asyncio.to_thread(docker.postgres_image)
+        await asyncio.to_thread(docker.stop, services)
+        try:
+            for node in services:
+                await asyncio.to_thread(docker.archive, volume_name(node), partial, image)
+            (partial / SNAPSHOT_FILE).write_text(
+                json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+            )
+            partial.rename(final)
+        finally:
+            # whatever happened after the stop, the databases come back
+            await asyncio.to_thread(docker.start, services)
+        failed = False
+    finally:
+        if failed:
+            shutil.rmtree(partial, ignore_errors=True)
+        if was_running:
+            response = await ctx.playback.command({"action": "resume"})
+            # a failed snapshot keeps its own error; a saved one reports
+            # a resume that did not happen
+            if response.status_code != 200 and not failed:
+                raise SnapshotError(
+                    f"snapshot {name!r} saved, but playback did not resume: {_message(response)}"
+                )
+    return record
+
+
+def list_snapshots(snapshot_dir: Path) -> list[dict[str, Any]]:
+    """Section 6.3: {name, created_at, sim_day, sim_time, regions} each."""
+    if not snapshot_dir.is_dir():
+        return []
+    answer = []
+    for entry in sorted(snapshot_dir.iterdir()):
+        record_file = entry / SNAPSHOT_FILE
+        if entry.name.startswith(".") or not record_file.is_file():
+            continue
+        record = json.loads(record_file.read_text(encoding="utf-8"))
+        answer.append(
+            {
+                key: record.get(key)
+                for key in ("name", "created_at", "sim_day", "sim_time", "regions")
+            }
+        )
+    return answer
+
+
+# --- restore ------------------------------------------------------------------------
+
+
+def _restock_done(run_dir: Path, day: int) -> bool:
+    log = run_dir / "orders.jsonl"
+    if not log.is_file():
+        return False
+    for text in log.read_text(encoding="utf-8").splitlines():
+        if '"restock"' not in text:
+            continue
+        line = json.loads(text)
+        if line.get("kind") == "restock" and line.get("restock_day") == day:
+            return True
+    return False
+
+
+def next_run_id(runs_dir: Path, run_id: str) -> str:
+    base = run_id[:58]
+    n = 1
+    while (runs_dir / f"{base}-r{n}").exists():
+        n += 1
+    return f"{base}-r{n}"
+
+
+async def _stop_live_run(ctx: Context) -> None:
+    status = await ctx.playback.status()
+    if status is None or status.get("state") not in (*LIVE_STATES, "stopping"):
+        return
+    response = await ctx.playback.command({"action": "stop"})
+    if response.status_code not in (200, 409):
+        raise SnapshotError(f"cannot stop the live run: {_message(response)}")
+
+
+async def _restore_toxiproxy(ctx: Context, cluster: Cluster, saved: list[dict]) -> list[str]:
+    """Put the saved proxy state back; returns the toxics it could not."""
+    skipped: list[str] = []
+    toxiproxy = ctx.toxiproxy_factory()
+    try:
+        await toxiproxy.sync(cluster)
+        # through the control process when it runs, so its fault map is
+        # cleared too; the restored toxics then show as unexplained there
+        if not await ctx.playback.heal_all():
+            await toxiproxy.reset()
+        existing = {str(proxy.get("name")) for proxy in await toxiproxy.list_proxies()}
+        for proxy in saved:
+            name = str(proxy.get("name"))
+            if name not in existing:
+                continue
+            if not proxy.get("enabled", True):
+                await toxiproxy.set_enabled(name, False)
+            # TODO(wp6b/faults-control): re-add the saved toxics with
+            # Toxiproxy.add_toxic once that PR is on main; until then a
+            # restore puts back cut proxies only and reports the toxics.
+            for toxic in proxy.get("toxics") or []:
+                skipped.append(f"{name}/{toxic.get('name')}")
+    finally:
+        await toxiproxy.aclose()
+    return skipped
+
+
+async def _resume(ctx: Context, record: dict[str, Any], snap: Path) -> dict[str, Any]:
+    run = record["run"]
+    day = int(record["sim_day"])
+    point = sim_seconds({"sim_day": record["sim_day"], "sim_time": record["sim_time"]})
+    assert point is not None
+    new_run = next_run_id(ctx.runs_dir, run["run_id"])
+    saved_speed = float(run["speed"])
+    catchup = max(saved_speed, ctx.sim.snapshot_catchup_speed)
+    skip = _restock_done(ctx.runs_dir / run["run_id"], day)
+    body: dict[str, Any] = {
+        "action": "start",
+        "from_day": day,
+        "to_day": run["to_day"],
+        "seed": run["seed"],
+        "speed": catchup,
+        "run_id": new_run,
+        "duplicate_rate": run.get("duplicate_rate", 0.0),
+        "shuffle": bool(run.get("shuffle", False)),
+        "skip_first_restock": skip,
+    }
+    resume = {
+        "run_id": new_run,
+        "parent_run": run["run_id"],
+        "from_day": day,
+        "skip_first_restock": skip,
+        "speed": saved_speed,
+        "catchup_speed": catchup,
+        "warnings": [],
+    }
+    flags = [f"--from-day {day}", f"--to-day {run['to_day']}", f"--seed {run['seed']}"]
+    flags += [f"--run-id {new_run}", f"--speed {saved_speed:g}"]
+    if body["duplicate_rate"]:
+        flags.append(f"--duplicate-rate {body['duplicate_rate']}")
+    if body["shuffle"]:
+        flags.append("--shuffle")
+    if skip:
+        flags.append("--skip-first-restock")
+    manual = "rosctl playback start " + " ".join(flags)
+    if await ctx.playback.status() is None:
+        resume["started"] = False
+        resume["warnings"].append(
+            f"no playback host at {ctx.playback.base_url}; resume with the original "
+            f"run's engine flags (--sequential, --region, ...) added: {manual}"
+        )
+        return resume
+    response = await ctx.playback.command(body)
+    if response.status_code != 200:
+        resume["started"] = False
+        resume["warnings"].append(f"the resumed run did not start: {_message(response)}")
+        return resume
+    resume["started"] = True
+    new_dir = ctx.runs_dir / new_run
+    if new_dir.is_dir():
+        (new_dir / RESUMED_FROM).write_text(
+            json.dumps(
+                {
+                    "parent_run": run["run_id"],
+                    "snapshot": record["name"],
+                    "sim_day": record["sim_day"],
+                    "sim_time": record["sim_time"],
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        meta = json.loads((new_dir / "meta.json").read_text(encoding="utf-8"))
+        for key in ("sequential", "region", "target_url"):
+            host = bool(meta.get(key, False)) if key == "sequential" else meta.get(key)
+            wanted = bool(run.get(key, False)) if key == "sequential" else run.get(key)
+            if host != wanted:
+                resume["warnings"].append(
+                    f"the playback host's {key} is {meta.get(key)!r}, the snapshot's run "
+                    f"had {run.get(key)!r}: restart the playback host with the original flags"
+                )
+    if catchup > saved_speed:
+        switch_at = point - ctx.sim.snapshot_catchup_margin_s
+        while True:
+            clock = await ctx.playback.clock()
+            now = sim_seconds(clock)
+            if clock.get("state") != "running" or now is None or now >= switch_at:
+                break
+            await ctx.sleep(0.05)
+        if clock.get("state") == "running":
+            changed = await ctx.playback.speed(saved_speed)
+            if changed.status_code != 200:
+                resume["warnings"].append(
+                    f"could not switch back to {saved_speed:g}x: {_message(changed)}"
+                )
+    return resume
+
+
+async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False) -> dict[str, Any]:
+    check_name(name)
+    snap = ctx.snapshot_dir / name
+    record_file = snap / SNAPSHOT_FILE
+    if not record_file.is_file():
+        raise UnknownSnapshotError(f"no snapshot {name!r} in {ctx.snapshot_dir}")
+    record = json.loads(record_file.read_text(encoding="utf-8"))
+    snapshot_toml = (snap / "cluster.toml").read_text(encoding="utf-8")
+    current_toml = (
+        ctx.cluster_file.read_text(encoding="utf-8") if ctx.cluster_file.is_file() else None
+    )
+    differs = current_toml != snapshot_toml
+    if differs and not replace_cluster_file:
+        raise SnapshotError(
+            f"the snapshot's cluster.toml differs from {ctx.cluster_file}; restore would "
+            "change the cluster's shape - pass --replace-cluster-file to write the "
+            "snapshot's copy over it"
+        )
+    snapshot_cluster = load_cluster(snap / "cluster.toml")
+    current_cluster = load_cluster(ctx.cluster_file) if current_toml is not None else None
+    docker = ctx.docker
+    assert docker is not None
+
+    await _stop_live_run(ctx)
+    if ctx.services_down is not None:
+        await asyncio.to_thread(ctx.services_down)
+    if current_cluster is not None:
+        # the databases of the shape running now, from today's generated file
+        await asyncio.to_thread(docker.stop, database_services(current_cluster))
+    if differs:
+        shutil.copy2(snap / "cluster.toml", ctx.cluster_file)
+    # the binding rule: regenerate from the snapshot's cluster file before
+    # any container starts
+    from restaurantos.sim.generator import generate
+
+    generate(snapshot_cluster, ctx.generated_dir, snapshot_toml)
+    services = database_services(snapshot_cluster)
+    await asyncio.to_thread(docker.create_missing, services)
+    image = await asyncio.to_thread(docker.postgres_image)
+    for node in services:
+        await asyncio.to_thread(docker.unpack, volume_name(node), snap, image)
+    if record.get("run"):
+        run_id = record["run"]["run_id"]
+        target = ctx.runs_dir / run_id
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(snap / "run" / run_id, target)
+    await asyncio.to_thread(docker.start, services)
+    saved = json.loads((snap / "toxiproxy.json").read_text(encoding="utf-8"))
+    skipped_toxics = await _restore_toxiproxy(ctx, snapshot_cluster, saved)
+    if ctx.services_up is not None:
+        await asyncio.to_thread(ctx.services_up, snapshot_cluster, ctx.cluster_file)
+    result: dict[str, Any] = {
+        "name": name,
+        "sim_day": record.get("sim_day"),
+        "sim_time": record.get("sim_time"),
+        "cluster_file_replaced": differs,
+        "resume": None,
+        "warnings": [],
+    }
+    if skipped_toxics:
+        result["warnings"].append(
+            f"not restored (needs the faults-control PR): toxics {', '.join(skipped_toxics)}"
+        )
+    if differs:
+        result["warnings"].append(
+            f"{ctx.cluster_file} now holds the snapshot's cluster shape; restart any "
+            "process that read the old one"
+        )
+    if record.get("run"):
+        result["resume"] = await _resume(ctx, record, snap)
+    return result
+
+
+# --- the services, through rosctl up/down's own code ---------------------------------
+
+
+def services_down() -> None:
+    from restaurantos.sim.services import RUNS_DIR, down_exit_code, down_services, require_proc
+
+    require_proc()
+    steps = down_services(runs_dir=RUNS_DIR)
+    if down_exit_code(steps):
+        failed = ", ".join(f"{step.name}: {step.outcome}" for step in steps)
+        raise SnapshotError(f"rosctl down left services behind ({failed})")
+
+
+def services_up(cluster: Cluster, cluster_file: Path) -> None:
+    from restaurantos.sim.services import RUNS_DIR, require_proc, up_exit_code, up_services
+
+    require_proc()
+    steps = up_services(cluster, runs_dir=RUNS_DIR, cluster_file=cluster_file)
+    if up_exit_code(steps):
+        failed = ", ".join(f"{step.name}: {step.outcome}" for step in steps)
+        raise SnapshotError(f"rosctl up did not bring every service back ({failed})")
+
+
+def default_context(cluster_file: Path, sim: SimSettings, *, port: int | None = None) -> Context:
+    base = f"http://{sim.control_host}:{port or sim.control_port}"
+    return Context(
+        cluster_file=cluster_file,
+        sim=sim,
+        playback=PlaybackClient(
+            base,
+            timeout_s=sim.http_timeout_s,
+            stop_timeout_s=sim.playback_drain_timeout_s + sim.http_timeout_s + 5.0,
+        ),
+        services_down=services_down,
+        services_up=services_up,
+    )
