@@ -306,6 +306,14 @@ def test_origin_normalisation() -> None:
     for unsupported in ("http://[fe80::1%25eth0]:5173", "http://[::ffff:127.0.0.1]:5173"):
         with pytest.raises(ValueError):
             normalise_origin(unsupported)
+    # non-ASCII hostnames are rejected: browsers send the punycode form
+    with pytest.raises(ValueError, match="punycode|xn--"):
+        normalise_origin("http://bücher.example:5173")
+    with pytest.raises(ValueError, match="punycode|xn--"):
+        normalise_origin("http://straße.example")
+    assert normalise_origin("HTTP://XN--BCHER-KVA.example:5173/") == (
+        "http://xn--bcher-kva.example:5173"
+    )
     for bad in (
         "*",
         "null",
@@ -481,3 +489,31 @@ async def test_an_expanded_ipv6_entry_matches_the_browsers_form(
     )
     assert response.status_code == 200
     assert response.headers["Access-Control-Allow-Origin"] == "http://[::1]:5173"
+
+
+@pytest.fixture
+def punycode_allowlist(monkeypatch):
+    from restaurantos.sim.config import get_sim_settings
+
+    get_sim_settings.cache_clear()
+    monkeypatch.setenv("ROS_SIM_CONTROL_ALLOWED_ORIGINS", "http://xn--bcher-kva.example:5173")
+    get_sim_settings.cache_clear()
+    yield
+    get_sim_settings.cache_clear()
+
+
+async def test_a_punycode_origin_passes_guard_and_cors(punycode_allowlist, app_and_client) -> None:
+    """Guard and CORS take their allowlist from the same normalised
+    tuple: an Origin browsers actually send passes both."""
+    origin = "http://xn--bcher-kva.example:5173"
+    posted = await app_and_client[1].post(
+        "/sim/faults/heal-all", headers={"Origin": origin, "Sec-Fetch-Site": "same-site"}
+    )
+    assert posted.status_code == 200
+    assert posted.headers["Access-Control-Allow-Origin"] == origin
+    preflight = await app_and_client[1].options(
+        "/sim/faults/heal-all",
+        headers={"Origin": origin, "Access-Control-Request-Method": "POST"},
+    )
+    assert preflight.status_code == 200
+    assert preflight.headers["Access-Control-Allow-Origin"] == origin

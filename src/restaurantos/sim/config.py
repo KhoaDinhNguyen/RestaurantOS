@@ -125,6 +125,13 @@ def normalise_origin(raw: str) -> str:
     ):
         raise ValueError(f"invalid origin: {raw!r}")
     host = parsed.hostname  # urlsplit already lower-cases it
+    if not host.isascii():
+        # browsers always send the ASCII/punycode form in Origin; a
+        # Unicode entry could only match itself, never a real request
+        raise ValueError(
+            f"non-ASCII hostname in ROS_SIM_CONTROL_ALLOWED_ORIGINS: {raw!r}; "
+            "write it in ASCII/punycode form (xn--...), as browsers send it in Origin"
+        )
     if ":" in host:
         # an IPv6 literal: canonicalise the way browsers write it, so an
         # expanded entry matches what the browser actually sends
