@@ -42,7 +42,7 @@ import httpx
 
 from restaurantos.common.cluster import BASELINE, HQ_PRIMARY, Cluster, load_cluster
 from restaurantos.common.simclock import SECONDS_PER_DAY
-from restaurantos.sim.checker import RESUMED_FROM
+from restaurantos.sim.checker import RESUMED_FROM, run_chain
 from restaurantos.sim.config import SimSettings
 from restaurantos.sim.timeline import EVENT_SCHEDULE
 from restaurantos.sim.toxiproxy import Toxiproxy
@@ -611,6 +611,36 @@ def _restock_done(run_dir: Path, day: int) -> bool:
     return bool(restock.get("skipped_first")) and meta.get("from_day") == day
 
 
+FAILED_VENDORS_SHOWN = 10
+
+
+def _failed_restock_vendors(runs_dir: Path, run_id: str, day: int) -> list[str] | None:
+    """The vendors whose `day` restock failed (anything but a 200, or a
+    transport error), from the logs of the run and the runs it continues.
+    Informational only - it decides nothing: the replay skips the whole
+    batch either way, as the original run went on without the failed
+    ones. None when a log cannot be read."""
+    failed: set[str] = set()
+    acked: set[str] = set()
+    try:
+        for chain_run in run_chain(runs_dir, [run_id]):
+            log = runs_dir / chain_run / "orders.jsonl"
+            if not log.is_file():
+                continue
+            with log.open(encoding="utf-8") as lines:
+                for text in lines:
+                    if '"restock"' not in text:
+                        continue
+                    line = json.loads(text)
+                    if line.get("kind") != "restock" or line.get("restock_day") != day:
+                        continue
+                    ok = "error" not in line and line.get("http_status") == 200
+                    (acked if ok else failed).add(str(line.get("vendor_id")))
+    except OSError, ValueError:
+        return None
+    return sorted(failed - acked)
+
+
 def next_run_id(runs_dir: Path, run_id: str) -> str:
     base = run_id[:58]
     n = 1
@@ -692,15 +722,32 @@ async def _resume(ctx: Context, record: dict[str, Any], snap: Path) -> dict[str,
         "shuffle": bool(run.get("shuffle", False)),
         "skip_first_restock": skip,
     }
-    resume = {
+    resume: dict[str, Any] = {
         "run_id": new_run,
         "parent_run": run["run_id"],
         "from_day": day,
         "skip_first_restock": skip,
+        "restock_failed_vendors": [],
         "speed": saved_speed,
         "catchup_speed": catchup,
         "warnings": [],
     }
+    if skip:
+        failed_vendors = _failed_restock_vendors(ctx.runs_dir, run["run_id"], day)
+        if failed_vendors is None:
+            resume["warnings"].append(
+                f"could not read the run log to list day {day}'s failed restocks"
+            )
+        elif failed_vendors:
+            resume["restock_failed_vendors"] = failed_vendors
+            shown = ", ".join(failed_vendors[:FAILED_VENDORS_SHOWN])
+            more = len(failed_vendors) - FAILED_VENDORS_SHOWN
+            resume["warnings"].append(
+                f"day {day}'s restock failed in the original run for {len(failed_vendors)} "
+                f"vendor(s): {shown}{f' and {more} more' if more > 0 else ''}. The replay "
+                "skips the whole batch, as the original run went on without them "
+                "(restock_failed_vendors lists every one)"
+            )
     flags = [f"--from-day {day}", f"--to-day {run['to_day']}", f"--seed {run['seed']}"]
     flags += [f"--run-id {new_run}", f"--speed {saved_speed:g}"]
     if body["duplicate_rate"]:

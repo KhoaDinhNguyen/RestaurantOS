@@ -717,6 +717,28 @@ def test_the_restock_decision_reads_the_runs_meta_only(tmp_path: Path) -> None:
     assert _restock_done(no_restock, 21) is False
 
 
+async def test_restore_names_the_vendors_whose_skipped_restock_had_failed(world) -> None:
+    ctx, host, _, _, _ = world
+    host.day = 21
+    log = ctx.runs_dir / "run-a" / "orders.jsonl"
+    lines = [
+        {"kind": "restock", "restock_day": 21, "vendor_id": "v1", "http_status": 200},
+        *(
+            {"kind": "restock", "restock_day": 21, "vendor_id": f"v{n:02d}", "error": "Timeout"}
+            for n in range(10, 22)
+        ),
+        {"kind": "restock", "restock_day": 21, "vendor_id": "v30", "http_status": 503},
+    ]
+    log.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+    await save("partly", ctx)
+    result = await restore("partly", ctx)
+    resume = result["resume"]
+    assert resume["skip_first_restock"] is True
+    assert resume["restock_failed_vendors"] == [*(f"v{n:02d}" for n in range(10, 22)), "v30"]
+    warning = next(w for w in resume["warnings"] if "restock failed" in w)
+    assert "13 vendor(s)" in warning and "and 3 more" in warning and "v1," not in warning
+
+
 async def test_restore_with_the_flag_replaces_the_cluster_file(world) -> None:
     ctx, *_ = world
     await save("snap", ctx)
