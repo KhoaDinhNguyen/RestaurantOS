@@ -199,8 +199,42 @@ def test_an_inherited_compose_profiles_never_starts_the_services(monkeypatch, tm
     assert bootstrap._rebuild(yes=True, compose="x", proxy_list="y", cluster_toml="z") is True
     ups = [call for call in calls if "up" in call["argv"]]
     assert ups, "bootstrap never called compose up"
-    assert "COMPOSE_PROFILES" not in ups[0]["env"]
+    # the empty value in the process environment outranks both a shell
+    # export and the .env that --env-file hands to Compose
+    assert ups[0]["env"]["COMPOSE_PROFILES"] == ""
     assert "PATH" in ups[0]["env"]
+
+
+def test_an_env_file_compose_profiles_never_starts_the_services(monkeypatch, tmp_path):
+    # COMPOSE_PROFILES=services in the root .env reaches Compose through
+    # --env-file; the empty value _compose exports blocks that source
+    # too. The up names no profile, the teardown still passes its
+    # explicit --profile services.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("COMPOSE_PROFILES=services\n", encoding="utf-8")
+    monkeypatch.delenv("COMPOSE_PROFILES", raising=False)
+    # the old generated file exists, so the teardown runs its down on it
+    (tmp_path / "compose.yaml").write_text("OLD", encoding="utf-8")
+    monkeypatch.setattr(bootstrap, "COMPOSE_FILE", tmp_path / "compose.yaml")
+    monkeypatch.setattr(bootstrap, "_existing_volumes", lambda: [])
+    calls: list[dict] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append({"argv": list(argv), **kwargs})
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(bootstrap.subprocess, "run", fake_run)
+
+    assert bootstrap._rebuild(yes=True, compose="x", proxy_list="y", cluster_toml="z") is True
+    ups = [call for call in calls if "up" in call["argv"]]
+    assert ups, "bootstrap never called compose up"
+    assert "--env-file" in ups[0]["argv"]
+    assert "--profile" not in ups[0]["argv"]
+    assert ups[0]["env"]["COMPOSE_PROFILES"] == ""
+    downs = [call for call in calls if "down" in call["argv"]]
+    assert downs, "bootstrap never called compose down"
+    for down in downs:
+        assert down["argv"][down["argv"].index("--profile") + 1] == "services"
 
 
 # ---- volumes the teardown files cannot name (round 2, item 2) --------------------
