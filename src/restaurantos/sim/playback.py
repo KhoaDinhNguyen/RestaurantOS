@@ -440,6 +440,12 @@ class Playback:
         # scheduled-but-not-yet-dispatched events and restocks:
         # (sim deadline, rank, tiebreak a, tiebreak b, kind, payload)
         self._heap: list[tuple] = []
+        # the dispatch frontier: the last dispatched item's own instant
+        # (absolute simulated seconds), None before the run's first
+        # dispatch. The clock runs on wall time and can run ahead of it
+        # (an event waits for its order's answer before it goes out), so
+        # a snapshot takes its point from here, not from the clock.
+        self._dispatched_at: float | None = None
 
         self._run_id = ""
         self._seed = 0
@@ -639,13 +645,7 @@ class Playback:
             },
             # where the kitchen-side calls (events, restocks) went:
             # the region edges, one override URL, or the target itself
-            "kitchen": (
-                {"mode": "override", "url": self._kitchen_url}
-                if self._kitchen_url is not None
-                else {"mode": "edge", "urls": self._kitchen_urls}
-                if self._kitchen_urls is not None
-                else {"mode": "target"}
-            ),
+            "kitchen": self._kitchen_fact(),
             # engine-wide facts first, per-run extras last: a key both
             # carry belongs to this run, not the engine
             **(self._run_meta or {}),
@@ -716,6 +716,7 @@ class Playback:
         self._client = client
         self._state = RUNNING
         self._dispatch_ended = False
+        self._dispatched_at = None
         self._simclock.start()
         self._task = asyncio.create_task(self._run(), name=f"playback-{self._run_id}")
         return self._run_id
@@ -835,6 +836,47 @@ class Playback:
             "restocks_acked": self._restocks_acked,
             "restocks_failed": self._restocks_failed,
             "inflight": len(self._send_tasks),
+            # where dispatch got to (a snapshot's point), and the facts
+            # every run on this engine shares (a restore checks them
+            # before it replays a snapshot's day on this engine)
+            **self._dispatched_fields(),
+            "engine": self.engine_facts(),
+        }
+
+    def _dispatched_fields(self) -> dict[str, Any]:
+        if self._dispatched_at is None:
+            return {"dispatched_sim_day": None, "dispatched_sim_time": None}
+        day, moment = from_sim_seconds(int(self._dispatched_at))
+        return {"dispatched_sim_day": day, "dispatched_sim_time": moment.strftime("%H:%M:%S")}
+
+    def _kitchen_fact(self) -> dict[str, Any]:
+        """Where the kitchen-side calls (events, restocks) go: the region
+        edges, one override URL, or the target itself."""
+        if self._kitchen_url is not None:
+            return {"mode": "override", "url": self._kitchen_url}
+        if self._kitchen_urls is not None:
+            return {"mode": "edge", "urls": self._kitchen_urls}
+        return {"mode": "target"}
+
+    def engine_facts(self) -> dict[str, Any]:
+        """What every run on this engine shares - set when the playback
+        process starts, never by a start body. The same values a run's
+        meta.json records, so a snapshot can compare a host with the run
+        it saved."""
+        return {
+            "sequential": self._sequential,
+            "region": (self._run_meta or {}).get("region"),
+            "target_url": self._orders_url,
+            "inflight": self._inflight,
+            "events": {
+                "enabled": self._status_events,
+                "sample_rate": self._event_sample_rate,
+                "jitter_s": self._event_jitter_s,
+            },
+            "restock_every": self._restock_every,
+            "duplicate_offset_s": self._duplicate_offset_s,
+            "shuffle_window": self._shuffle_window,
+            "kitchen": self._kitchen_fact(),
         }
 
     def clock(self) -> dict[str, Any]:
@@ -971,6 +1013,7 @@ class Playback:
                             stopped = True
                             break
                     last_dispatched_at = order_target
+                    self._dispatched_at = order_target
                     self._dispatch_order(order_target - sim_start, request, index)
                     if self._sequential and self._send_tasks:
                         # send-after-ack: wait for this order's answer
@@ -1026,6 +1069,7 @@ class Playback:
                             stopped = True
                             break
                         last_dispatched_at = deadline
+                        self._dispatched_at = deadline
                         self._dispatch_event(deadline - sim_start, handle, to_status, jitter)
                     elif kind == "duplicate":
                         # A scheduled resend: an order's second POST of the
@@ -1045,6 +1089,7 @@ class Playback:
                                 stopped = True
                                 break
                         last_dispatched_at = deadline
+                        self._dispatched_at = deadline
                         self._dispatch_duplicate(deadline - sim_start, request)
                         if self._sequential and self._send_tasks:
                             await asyncio.wait(set(self._send_tasks))
@@ -1083,6 +1128,7 @@ class Playback:
                                 break
                             last_restock_deadline = deadline
                         last_dispatched_at = deadline
+                        self._dispatched_at = deadline
                         self._dispatch_restock(deadline - sim_start, tie_a, tie_b)
                 # One loop turn per dispatch, even in a burst: sends and
                 # control requests must be able to run between the

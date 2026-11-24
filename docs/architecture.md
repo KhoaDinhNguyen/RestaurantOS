@@ -766,9 +766,18 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
   "state": "running", "run_id": "2026-11-20-a", "seed": 0, "from_day": 14, "to_day": 20, "speed": 1000.0,
   "orders_sent": 0, "orders_acked": 0, "orders_parked": 0, "orders_refused": 0, "orders_failed": 0,
   "events_sent": 0, "events_acked": 0, "events_duplicate": 0, "events_conflicted": 0, "events_failed": 0, "events_skipped": 0,
-  "restocks_sent": 0, "restocks_acked": 0, "restocks_failed": 0, "inflight": 0
+  "restocks_sent": 0, "restocks_acked": 0, "restocks_failed": 0, "inflight": 0,
+  "dispatched_sim_day": 14, "dispatched_sim_time": "09:41:07",
+  "engine": {
+    "sequential": false, "region": null, "target_url": "http://127.0.0.1:8000/api/v1/orders", "inflight": 64,
+    "events": {"enabled": true, "sample_rate": 1.0, "jitter_s": 60.0}, "restock_every": 7,
+    "duplicate_offset_s": 1.0, "shuffle_window": 8, "kitchen": {"mode": "edge", "urls": {"r1": "http://127.0.0.1:8011/api/v1"}}
+  }
 }
 ```
+
+- `dispatched_sim_day` / `dispatched_sim_time` is the dispatch frontier: the simulated instant of the last item the engine sent (`null` before the run's first dispatch). The clock runs on wall time and can run ahead of it, because a status event waits for its order's answer before it goes out; a snapshot takes its point from the frontier (Section 7.4).
+- `engine` holds what every run on this playback process shares, set when the process starts and never by a start body: the same values a run's `meta.json` records. A restore compares them with the snapshot's run before it replays the day (Section 7.4).
 
 - `start` needs `from_day`; `to_day`, `speed`, `seed` and `run_id` are optional. `duplicate_rate` (a share in [0, 1], default 0) and `shuffle` (default off, Section 7.2) are part of the start body: they are per-run facts, derived from the seed like every other random value, and recorded in the run's `meta.json` next to the seed. A rate outside [0, 1] answers `422`, and so does `shuffle` together with `--sequential`. Status events and restocks are switched on when the playback process starts, not per run.
 - `skip_first_restock` (default false) drops the restock at 00:00 of `from_day`. A snapshot restore sets it when the day it replays already had its restock (Section 7.4).
