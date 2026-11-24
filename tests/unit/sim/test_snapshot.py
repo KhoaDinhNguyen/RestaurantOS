@@ -107,12 +107,18 @@ class FakeDocker:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
         self.fail_archive: str | None = None
+        self.fail_stop = False
+        self.fail_start = False
 
     def stop(self, services: list[str]) -> None:
         self.calls.append(("stop", tuple(services)))
+        if self.fail_stop:
+            raise SnapshotError("stop: r1-standby did not stop")
 
     def start(self, services: list[str]) -> None:
         self.calls.append(("start", tuple(services)))
+        if self.fail_start:
+            raise SnapshotError("hq-primary is unhealthy")
 
     def create_missing(self, services: list[str]) -> None:
         self.calls.append(("create_missing", tuple(services)))
@@ -473,6 +479,42 @@ async def test_a_failed_snapshot_cleans_up_and_restarts_everything(world) -> Non
     assert not (ctx.snapshot_dir / ".broken.partial").exists()
     assert docker.calls[-1] == ("start", DATABASES)
     assert host.state == "running"
+
+
+async def test_a_half_failed_stop_still_brings_the_databases_back(world) -> None:
+    ctx, host, docker, _, _ = world
+    docker.fail_stop = True
+    with pytest.raises(SnapshotError, match="did not stop"):
+        await save("half", ctx)
+    assert docker.calls == [("stop", DATABASES), ("start", DATABASES)]
+    # back and healthy, so the run resumes
+    assert [body["action"] for body in host.commands] == ["pause", "resume"]
+    assert not (ctx.snapshot_dir / "half").exists()
+
+
+async def test_databases_that_do_not_come_back_leave_playback_paused(world) -> None:
+    ctx, host, docker, _, _ = world
+    docker.fail_start = True
+    with pytest.raises(SnapshotError) as caught:
+        await save("saved-but", ctx)
+    message = str(caught.value)
+    assert "did not come back" in message and "left paused" in message
+    assert "'saved-but' was saved" in message
+    assert (ctx.snapshot_dir / "saved-but").is_dir()  # the archives are good
+    assert [body["action"] for body in host.commands] == ["pause"]
+    assert host.state == "paused"
+
+
+async def test_a_failed_archive_and_a_failed_start_are_both_named(world) -> None:
+    ctx, host, docker, _, _ = world
+    docker.fail_archive, docker.fail_start = volume_name("r1-standby"), True
+    with pytest.raises(SnapshotError) as caught:
+        await save("both", ctx)
+    message = str(caught.value)
+    assert "disk full" in message and "unhealthy" in message and "was not saved" in message
+    assert not (ctx.snapshot_dir / "both").exists()
+    assert not (ctx.snapshot_dir / ".both.partial").exists()
+    assert [body["action"] for body in host.commands] == ["pause"]
 
 
 async def test_save_without_a_run_records_no_run(world) -> None:

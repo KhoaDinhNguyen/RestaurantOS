@@ -431,6 +431,10 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
         shutil.rmtree(partial)  # left by a crashed snapshot
     status, was_running = await _pause_for_snapshot(ctx)
     failed = True
+    # Playback resumes only when the databases are confirmed back - or
+    # were never stopped: a run resumed against stopped databases fails
+    # every send. `published` is the rename: the snapshot exists from then.
+    stop_begun = databases_back = published = False
     try:
         partial.mkdir(parents=True)
         record: dict[str, Any] = {
@@ -496,22 +500,42 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
         docker = ctx.docker
         assert docker is not None
         image = await asyncio.to_thread(docker.postgres_image)
-        await asyncio.to_thread(docker.stop, services)
+        stop_begun = True
+        first_error: BaseException | None = None
         try:
+            # the stop is inside: one that fails half way has still
+            # stopped some databases, and they come back below
+            await asyncio.to_thread(docker.stop, services)
             for node in services:
                 await asyncio.to_thread(docker.archive, volume_name(node), partial, image)
             (partial / SNAPSHOT_FILE).write_text(
                 json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
             partial.rename(final)
-        finally:
-            # whatever happened after the stop, the databases come back
+            published = True
+        except BaseException as error:  # noqa: BLE001 - re-raised once the databases are back
+            first_error = error
+        # whatever happened after the stop began, the databases come back
+        # (`up --wait`: healthy) before anything else
+        try:
             await asyncio.to_thread(docker.start, services)
+        except Exception as start_error:
+            before = f" after {_describe(first_error)}" if first_error is not None else ""
+            saved = "was saved" if published else "was not saved"
+            raise SnapshotError(
+                f"the databases did not come back{before}: {_describe(start_error)}. "
+                f"Playback is left paused; snapshot {name!r} {saved}. Bring them back "
+                "with: docker compose -p restaurantos -f infra/generated/compose.yaml "
+                f"up -d --wait {' '.join(services)}"
+            ) from start_error
+        databases_back = True
+        if first_error is not None:
+            raise first_error
         failed = False
     finally:
-        if failed:
+        if failed and not published:
             shutil.rmtree(partial, ignore_errors=True)
-        if was_running:
+        if was_running and (databases_back or not stop_begun):
             response = await ctx.playback.command({"action": "resume"})
             # a failed snapshot keeps its own error; a saved one reports
             # a resume that did not happen
