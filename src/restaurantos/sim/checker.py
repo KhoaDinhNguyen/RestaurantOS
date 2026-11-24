@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -158,6 +158,42 @@ def run_chain(runs_dir: Path, run_ids: Sequence[str]) -> list[str]:
     return ordered
 
 
+def _order_lines(log: Path, run_id: str) -> Iterator[dict[str, Any]]:
+    """The run log's order lines, parsed one line at a time: a long run
+    with status events holds several lines per order, and none of the
+    others need to stay in memory."""
+    with log.open(encoding="utf-8") as lines:
+        for number, text in enumerate(lines, start=1):
+            if not text.strip():
+                continue
+            try:
+                line = json.loads(text)
+            except json.JSONDecodeError as error:
+                raise CheckError(f"run {run_id}: line {number} is not JSON") from error
+            if line.get("kind") == "order":
+                yield line
+
+
+def _keep(
+    orders: dict[Key, OrderOutcome], line: dict[str, Any], meta: dict[str, Any], channel: str
+) -> None:
+    """Fold one order line into the best outcome kept for its order."""
+    key = (channel, str(line["external_order_id"]))
+    outcome = classify_line(line)
+    candidate = OrderOutcome(outcome, line.get("region_id"))
+    if outcome == ACCEPTED:
+        candidate.acked_at = _parse_time(line.get("acked_at")) or _wall_acked_at(line, meta)
+    elif outcome == FAILED:
+        candidate.sent_at = _wall_time(line.get("wall_sent_at"), meta)
+    seen = orders.get(key)
+    if seen is not None:
+        if _RANK[seen.outcome] > _RANK[outcome]:
+            return
+        if seen.outcome == outcome and not _replaces(seen, candidate):
+            return
+    orders[key] = candidate
+
+
 def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
     """Every order line of the runs (and the runs they continue), one
     entry per order with its best outcome: resends, and the replayed part
@@ -173,7 +209,6 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
         run_dir = runs_dir / run_id
         try:
             meta = json.loads((run_dir / "meta.json").read_text(encoding="utf-8"))
-            lines = (run_dir / "orders.jsonl").read_text(encoding="utf-8").splitlines()
         except OSError as error:
             raise CheckError(f"run {run_id}: {error}") from error
         if meta.get("from_day") is None or meta.get("to_day") is None:
@@ -182,31 +217,11 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
         regions.add(meta.get("region"))
         if meta.get("target_url") is not None:
             target_urls.add(str(meta["target_url"]))
-        for number, text in enumerate(lines, start=1):
-            if not text.strip():
-                continue
-            try:
-                line = json.loads(text)
-            except json.JSONDecodeError as error:
-                raise CheckError(f"run {run_id}: line {number} is not JSON") from error
-            if line.get("kind") != "order":
-                continue
-            key = (channel, str(line["external_order_id"]))
-            outcome = classify_line(line)
-            candidate = OrderOutcome(outcome, line.get("region_id"))
-            if outcome == ACCEPTED:
-                candidate.acked_at = _parse_time(line.get("acked_at")) or _wall_acked_at(
-                    line, meta
-                )
-            elif outcome == FAILED:
-                candidate.sent_at = _wall_time(line.get("wall_sent_at"), meta)
-            seen = orders.get(key)
-            if seen is not None:
-                if _RANK[seen.outcome] > _RANK[outcome]:
-                    continue
-                if seen.outcome == outcome and not _replaces(seen, candidate):
-                    continue
-            orders[key] = candidate
+        try:
+            for line in _order_lines(run_dir / "orders.jsonl", run_id):
+                _keep(orders, line, meta, channel)
+        except OSError as error:
+            raise CheckError(f"run {run_id}: {error}") from error
     if len(regions) > 1:
         raise CheckError(
             "the runs disagree on the region they replayed: "
