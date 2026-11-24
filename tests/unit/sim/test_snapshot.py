@@ -320,7 +320,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         generated_dir=tmp_path / "generated",
         sleep=sleep,
         services_down=lambda: services.append("down"),
-        services_up=lambda cluster, path: services.append("up"),
+        services_up=lambda cluster, path, down: services.append(f"up {list(down)}"),
     )
     return ctx, host, docker, server, services
 
@@ -651,7 +651,9 @@ async def test_restore_puts_everything_back_and_replays_the_day(world) -> None:
 
     result = await restore("snap", ctx)
 
-    assert services == ["down", "up"]
+    # the cut proxy stays cut, so rosctl up's precheck must skip its port
+    shared_port = next(proxy.port for proxy in proxies(CLUSTER) if proxy.name == SHARED)
+    assert services == ["down", f"up {[shared_port]}"]
     assert host.commands[0] == {"action": "stop"}
     assert docker.calls[0] == ("stop", DATABASES)
     assert ("create_missing", DATABASES) in docker.calls

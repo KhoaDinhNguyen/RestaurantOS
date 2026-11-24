@@ -68,7 +68,7 @@ import socket
 import subprocess
 import sys
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1324,6 +1324,7 @@ def up_services(
     names: Sequence[str] | None = None,
     cluster_file: Path | None = None,
     precheck: bool = True,
+    expected_down: Collection[int] = (),
     ready_timeout_s: float = READY_TIMEOUT_S,
     grace_s: float = RELAY_GRACE_S,
     specs: Sequence[ServiceSpec] | None = None,
@@ -1333,12 +1334,17 @@ def up_services(
     what the SELECTED services dial, all of it before anything spawns:
     no half-started set to reason about afterwards. `specs` overrides
     the table - how the lifecycle tests drive a fake target instead of
-    the real services."""
+    the real services. `expected_down` are ports the precheck skips:
+    a snapshot restore passes the listeners of the proxies it cut again
+    (a disabled Toxiproxy proxy does not listen), so the services start
+    with the saved cut in place; plain `rosctl up` passes none."""
     require_proc()
     table = list(specs) if specs is not None else service_specs(cluster)
     selected = select_specs(table, names)
     if precheck:
-        wanted = sorted({port for spec in selected for port in dials(spec, cluster)})
+        wanted = sorted(
+            {port for spec in selected for port in dials(spec, cluster)} - set(expected_down)
+        )
         unreachable = unreachable_ports(wanted)
         if unreachable:
             raise PrecheckError(precheck_message(cluster, unreachable))

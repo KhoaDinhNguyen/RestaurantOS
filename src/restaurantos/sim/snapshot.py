@@ -32,7 +32,7 @@ import os
 import re
 import shutil
 import subprocess
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,7 +40,7 @@ from typing import Any
 
 import httpx
 
-from restaurantos.common.cluster import BASELINE, HQ_PRIMARY, Cluster, load_cluster
+from restaurantos.common.cluster import BASELINE, HQ_PRIMARY, Cluster, load_cluster, proxies
 from restaurantos.common.simclock import SECONDS_PER_DAY
 from restaurantos.sim.checker import RESUMED_FROM, run_chain
 from restaurantos.sim.config import SimSettings
@@ -318,7 +318,9 @@ class Context:
     generated_dir: Path = Path("infra/generated")
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     services_down: Callable[[], None] | None = None
-    services_up: Callable[[Cluster, Path], None] | None = None
+    # (cluster, cluster file, ports the precheck must skip: the listeners
+    # of the proxies a restore cut again)
+    services_up: Callable[[Cluster, Path, Sequence[int]], None] | None = None
 
     def __post_init__(self) -> None:
         if self.docker is None:
@@ -703,9 +705,13 @@ async def _stop_live_run(ctx: Context) -> None:
         raise SnapshotError(f"cannot stop the live run: {_message(response)}")
 
 
-async def _restore_toxiproxy(ctx: Context, cluster: Cluster, saved: list[dict]) -> list[str]:
-    """Put the saved proxy state back; returns the toxics it could not."""
+async def _restore_toxiproxy(
+    ctx: Context, cluster: Cluster, saved: list[dict]
+) -> tuple[list[str], list[str]]:
+    """Put the saved proxy state back; returns (the toxics it could not,
+    the proxies it cut again)."""
     skipped: list[str] = []
+    cut: list[str] = []
     toxiproxy = ctx.toxiproxy_factory()
     try:
         await toxiproxy.sync(cluster)
@@ -720,6 +726,7 @@ async def _restore_toxiproxy(ctx: Context, cluster: Cluster, saved: list[dict]) 
                 continue
             if not proxy.get("enabled", True):
                 await toxiproxy.set_enabled(name, False)
+                cut.append(name)
             # TODO(wp6b/faults-control): re-add the saved toxics with
             # Toxiproxy.add_toxic once that PR is on main; until then a
             # restore puts back cut proxies only and reports the toxics.
@@ -727,7 +734,7 @@ async def _restore_toxiproxy(ctx: Context, cluster: Cluster, saved: list[dict]) 
                 skipped.append(f"{name}/{toxic.get('name')}")
     finally:
         await toxiproxy.aclose()
-    return skipped
+    return skipped, cut
 
 
 # the engine facts a replay must share with the run it continues; inflight
@@ -1059,9 +1066,17 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         shutil.copytree(snap / "run" / run_id, target)
     await asyncio.to_thread(docker.start, services)
     saved = json.loads((snap / "toxiproxy.json").read_text(encoding="utf-8"))
-    skipped_toxics = await _restore_toxiproxy(ctx, snapshot_cluster, saved)
+    skipped_toxics, cut = await _restore_toxiproxy(ctx, snapshot_cluster, saved)
     if ctx.services_up is not None:
-        await asyncio.to_thread(ctx.services_up, snapshot_cluster, ctx.cluster_file)
+        # A cut proxy does not listen, and rosctl up's precheck dials every
+        # proxy the services use: name the cut ones so it skips them. The
+        # cut stays in place - starting healed and cutting afterwards would
+        # let the relay drain the backlog the snapshot held behind it.
+        ports = {proxy.name: proxy.port for proxy in proxies(snapshot_cluster)}
+        expected_down = sorted(ports[name] for name in cut if name in ports)
+        await asyncio.to_thread(
+            ctx.services_up, snapshot_cluster, ctx.cluster_file, expected_down
+        )
     result: dict[str, Any] = {
         "name": name,
         "sim_day": record.get("sim_day"),
@@ -1097,11 +1112,13 @@ def services_down() -> None:
         raise SnapshotError(f"rosctl down left services behind ({failed})")
 
 
-def services_up(cluster: Cluster, cluster_file: Path) -> None:
+def services_up(cluster: Cluster, cluster_file: Path, expected_down: Sequence[int] = ()) -> None:
     from restaurantos.sim.services import RUNS_DIR, require_proc, up_exit_code, up_services
 
     require_proc()
-    steps = up_services(cluster, runs_dir=RUNS_DIR, cluster_file=cluster_file)
+    steps = up_services(
+        cluster, runs_dir=RUNS_DIR, cluster_file=cluster_file, expected_down=expected_down
+    )
     if up_exit_code(steps):
         failed = ", ".join(f"{step.name}: {step.outcome}" for step in steps)
         raise SnapshotError(f"rosctl up did not bring every service back ({failed})")
