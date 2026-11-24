@@ -293,6 +293,19 @@ def test_origin_normalisation() -> None:
     assert normalise_origin("HTTP://LocalHost:5173/") == "http://localhost:5173"
     assert normalise_origin("https://x.test:443") == "https://x.test"
     assert normalise_origin(" http://[::1]:8002 ") == "http://[::1]:8002"
+    # IPv6 literals canonicalise to the compressed form a browser sends
+    for entry in ("http://[0:0:0:0:0:0:0:1]:5173", "http://[::1]:5173", "HTTP://[0::1]:5173/"):
+        assert normalise_origin(entry) == "http://[::1]:5173"
+    assert parse_allowed_origins("http://[0:0:0:0:0:0:0:1]:5173,http://[::1]:5173") == (
+        "http://[::1]:5173",
+    )
+    assert normalise_origin("http://[::1]") == "http://[::1]"
+    assert normalise_origin("http://[::1]:80") == "http://[::1]"
+    # zone ids and IPv4-mapped forms are rejected on purpose (see
+    # normalise_origin): they never reach a browser's Origin header
+    for unsupported in ("http://[fe80::1%25eth0]:5173", "http://[::ffff:127.0.0.1]:5173"):
+        with pytest.raises(ValueError):
+            normalise_origin(unsupported)
     for bad in (
         "*",
         "null",
@@ -444,3 +457,27 @@ async def test_cors_methods_cover_every_route(server) -> None:
         "OPTIONS",
     }
     assert used <= set(CONTROL_CORS_METHODS), used - set(CONTROL_CORS_METHODS)
+
+
+@pytest.fixture
+def ipv6_allowlist(monkeypatch):
+    from restaurantos.sim.config import get_sim_settings
+
+    get_sim_settings.cache_clear()
+    monkeypatch.setenv("ROS_SIM_CONTROL_ALLOWED_ORIGINS", "http://[0:0:0:0:0:0:0:1]:5173")
+    get_sim_settings.cache_clear()
+    yield
+    get_sim_settings.cache_clear()
+
+
+async def test_an_expanded_ipv6_entry_matches_the_browsers_form(
+    ipv6_allowlist, app_and_client
+) -> None:
+    """A config entry written in expanded IPv6 normalises to the
+    compressed form the browser sends, so the guard and CORS both
+    recognise the request."""
+    response = await app_and_client[1].post(
+        "/sim/faults/heal-all", headers={"Origin": "http://[::1]:5173"}
+    )
+    assert response.status_code == 200
+    assert response.headers["Access-Control-Allow-Origin"] == "http://[::1]:5173"

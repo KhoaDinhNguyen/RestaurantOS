@@ -7,6 +7,7 @@ drives playback's restock events, so it lives here with them.
 
 from __future__ import annotations
 
+import ipaddress
 from functools import cache
 from urllib.parse import urlsplit
 
@@ -124,8 +125,19 @@ def normalise_origin(raw: str) -> str:
     ):
         raise ValueError(f"invalid origin: {raw!r}")
     host = parsed.hostname  # urlsplit already lower-cases it
-    if ":" in host:  # an IPv6 literal needs its brackets back
-        host = f"[{host}]"
+    if ":" in host:
+        # an IPv6 literal: canonicalise the way browsers write it, so an
+        # expanded entry matches what the browser actually sends
+        try:
+            addr = ipaddress.IPv6Address(host)
+        except ValueError:
+            raise ValueError(f"invalid origin: {raw!r}") from None
+        if addr.scope_id is not None or addr.ipv4_mapped is not None:
+            # browsers never send zone ids in Origin; IPv4-mapped forms
+            # serialise differently in Python (::ffff:127.0.0.1) and
+            # browsers (::ffff:7f00:1), so they can never reliably match
+            raise ValueError(f"unsupported IPv6 origin: {raw!r}") from None
+        host = f"[{addr.compressed}]"
     port = parsed.port
     if port is None or port == _DEFAULT_PORTS[parsed.scheme]:
         return f"{parsed.scheme}://{host}"
