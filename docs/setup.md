@@ -168,3 +168,24 @@ docker run --rm \
   -p 127.0.0.1:8000:8000 \
   restaurantos-services:local python -m restaurantos.gateway
 ```
+
+### Starting the whole system in container mode
+
+`rosctl bootstrap` writes the service entries into `infra/generated/compose.yaml` too - one per service, the same names, ports and identity environment as host mode, with `ROS_NETWORK=compose` - behind the `services` profile. It also copies the cluster config it ran with to `infra/generated/cluster.toml`, which every service entry mounts, and starts no service containers itself: bootstrap's own `up -d --wait` is profile-gated to the databases and Toxiproxy, so a data load never starts them.
+
+```bash
+# start every service container (after `uv run rosctl bootstrap`)
+docker compose -p restaurantos -f infra/generated/compose.yaml \
+  --profile services up -d --wait
+
+# stop the service containers WITHOUT touching the databases (one region;
+# an N-region cluster also has relay-r<n> and edge-r<n> for every region)
+docker compose -p restaurantos -f infra/generated/compose.yaml \
+  --profile services stop gateway coordinator hq-worker relay-r1 edge-r1
+docker compose -p restaurantos -f infra/generated/compose.yaml \
+  --profile services rm -f gateway coordinator hq-worker relay-r1 edge-r1
+```
+
+`docker compose ps` then shows each service as healthy (the entry's healthcheck is a stdlib `urllib.request` call against its readiness route - the image has no curl). Never a bare `docker compose down` to stop the services: it removes the database containers as well. A fresh `rosctl bootstrap` tears the service containers down with the rest of the cluster.
+
+Host and container mode use the same loopback ports (`8000`, `8001`, `8010 + n`), so never run both at once: a host-mode `rosctl up` and the container-mode command above fight over the same ports. `rosctl up` and `rosctl down` stay host-mode; they never manage containers.
