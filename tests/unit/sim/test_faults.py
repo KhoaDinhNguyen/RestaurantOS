@@ -320,3 +320,26 @@ async def test_heal_all_enables_the_flagged_proxies_too(layer, server) -> None:
     await layer.create("repl:r1", "cut")
     assert await layer.heal_all() == 1
     assert server.proxies[SHARED_REPL]["enabled"] is True
+
+
+async def test_a_rollback_after_the_shared_proxy_was_counted_and_flagged(layer, server) -> None:
+    """The failure lands AFTER the already-disabled SHARED_REPL has been
+    counted and flagged: rollback must restore both, and must not
+    re-enable a proxy that was already disabled."""
+    server.proxies[SHARED_REPL]["enabled"] = False  # disabled outside the layer
+    # repl:r1 = [SHARED_REPL, coordinator__r1-standby]: the disable of the
+    # SECOND member fails, after SHARED_REPL was counted and flagged
+    server.fail.add(("POST", "/proxies/coordinator__r1-standby"))
+    with pytest.raises(ToxiproxyError):
+        await layer.create("repl:r1", "cut")
+    # every ownership count is back to its pre-cut state
+    assert layer.cut_count(SHARED_REPL) == 0
+    assert layer.cut_count("coordinator__r1-standby") == 0
+    # the flag this call created is gone
+    links = {entry["group"]: entry for entry in await layer.links()}
+    assert all(entry["preexisting_disabled"] == [] for entry in links.values())
+    # SHARED_REPL must stay disabled (it was disabled before the cut), the
+    # proxy this call disabled was re-enabled, the failing one never flipped
+    assert server.proxies[SHARED_REPL]["enabled"] is False
+    assert server.proxies["coordinator__r1-standby"]["enabled"] is True
+    assert layer.faults() == []
