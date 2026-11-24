@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -1013,7 +1014,10 @@ def test_a_second_up_with_another_cluster_file_does_not_call_it_running(
     # already-running; the same file is still the idempotent no-op
     runs = tmp_path / "runs"
     spec = fake("sleeper", ROS_CLIENT="sleeper")
-    one, three = tmp_path / "one.toml", tmp_path / "three.toml"
+    # the second file's name has a space, so the hint's shell quoting
+    # is really exercised: the path must arrive as one argument
+    one = tmp_path / "one.toml"
+    three = tmp_path / "three regions.toml"
 
     def up_with(cluster_file: Path) -> list[Step]:
         steps = up_services(
@@ -1037,8 +1041,9 @@ def test_a_second_up_with_another_cluster_file_does_not_call_it_running(
     assert str(three.resolve()) in other[0].detail
     assert "rosctl down sleeper" in other[0].detail
     # the hint keeps --config: a bare `rosctl up sleeper` would read the
-    # default cluster file and hit the same mismatch again
-    assert f"--config {three.resolve()}" in other[0].detail
+    # default cluster file and hit the same mismatch again - and the
+    # path is shell-quoted, so the space in its name stays one argument
+    assert f"--config {shlex.quote(str(three.resolve()))}" in other[0].detail
     assert services.up_exit_code(other) == 1
     assert services.read_pid_record(runs, "sleeper") == record  # kept
     down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[spec])

@@ -62,6 +62,7 @@ import contextlib
 import os
 import re
 import select
+import shlex
 import signal
 import socket
 import subprocess
@@ -913,9 +914,11 @@ def start_service(
                     if live != wanted:
                         # the hint keeps --config when up was given one:
                         # a bare `rosctl up <name>` would read the default
-                        # cluster file and hit the same mismatch again
+                        # cluster file and hit the same mismatch again.
+                        # The path is shell-quoted so a cluster file with
+                        # spaces stays one argument if the hint is copied
                         hint = (
-                            f"then rosctl up {spec.name} --config {wanted}"
+                            f"then rosctl up {spec.name} --config {shlex.quote(wanted)}"
                             if wanted
                             else f"then rosctl up {spec.name}"
                         )
