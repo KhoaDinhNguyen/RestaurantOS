@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 import time
 from collections import Counter
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -442,8 +442,8 @@ def wait_for_drain(
     timeout_s: float,
     poll_s: float,
     scope: str | None = None,
-    sleep=time.sleep,
-    clock=time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Wait until no outbox row is unrelayed on any region's current
     primary and no holding-queue row is undelivered. A real condition,
