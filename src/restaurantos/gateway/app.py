@@ -423,17 +423,18 @@ def create_app() -> FastAPI:
 
         return dish
 
-    @gateway.get("/query/nearby")
+    @gateway.get("/query/nearby", response_model=None)
     async def query_nearby(
         request: Request,
         geohash: str = Query(
             ...,
             min_length=5,
             max_length=5,
+            pattern=r"^[0-9b-hjkmnp-zB-HJKMNP-Z]{5}$",
         ),
         dish: str = Query(...),
         limit: int = Query(10, ge=1, le=100),
-    ):
+    ) -> dict[str, object] | JSONResponse:
         async def dish_work():
             return await get_dish(
                 request.app.state.hq_pool,
@@ -466,7 +467,7 @@ def create_app() -> FastAPI:
             "meta": result.meta.model_dump(mode="json"),
         }
 
-    @gateway.get("/query/top-dishes")
+    @gateway.get("/query/top-dishes", response_model=None)
     async def query_top_dishes(
         request: Request,
         day: int | None = Query(default=None, ge=0),
@@ -477,7 +478,7 @@ def create_app() -> FastAPI:
         limit: int = Query(default=10, ge=1, le=100),
         rank_by: RankBy = "units",
         mode: Literal["live", "hq", "baseline"] = "live",
-    ):
+    ) -> dict[str, object]:
 
         try:
             window = normalize_window(
@@ -529,7 +530,7 @@ def create_app() -> FastAPI:
             "meta": result.meta.model_dump(mode="json"),
         }
 
-    @gateway.get("/query/ingredient-usage")
+    @gateway.get("/query/ingredient-usage", response_model=None)
     async def query_ingredient_usage(
         request: Request,
         day: int | None = Query(default=None, ge=0),
@@ -539,7 +540,7 @@ def create_app() -> FastAPI:
         to_time: time | None = None,
         strategy: Literal["A", "B", "C"] = "A",
         mode: Literal["live", "hq", "baseline"] = "live",
-    ):
+    ) -> dict[str, object]:
         try:
             window = normalize_window(
                 day=day,

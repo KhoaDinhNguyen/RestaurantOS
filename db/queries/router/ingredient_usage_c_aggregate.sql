@@ -12,7 +12,7 @@ SELECT
     recipe.ingredient_id,
     recipe.unit,
     sum(
-        oi.quantity
+        oi.quantity::numeric
         * pd.multiplier
         * recipe.amount
     ) AS amount

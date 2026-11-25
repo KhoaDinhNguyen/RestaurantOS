@@ -233,3 +233,11 @@ async def test_nearby_live_returns_partial_results_when_region_is_missing(
         "r2-primary",
     ]
     assert result.meta.rows_transferred == 1
+
+
+def test_nearby_cells_normalizes_uppercase_geohash() -> None:
+    lower = nearby_cells("w21z7")
+    upper = nearby_cells("W21Z7")
+
+    assert upper == lower
+    assert upper[0].geohash == "w21z7"

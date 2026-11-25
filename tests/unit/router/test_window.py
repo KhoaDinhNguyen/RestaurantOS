@@ -1,4 +1,4 @@
-from datetime import time
+from datetime import UTC, time
 
 import pytest
 
@@ -106,3 +106,17 @@ def test_cross_midnight_window() -> None:
 def test_invalid_windows(kwargs) -> None:
     with pytest.raises(ValueError):
         normalize_window(**kwargs)
+
+
+def test_rejects_time_with_utc_offset() -> None:
+    with pytest.raises(
+        ValueError,
+        match="must not include a UTC offset",
+    ):
+        normalize_window(
+            day=14,
+            from_day=None,
+            to_day=None,
+            from_time=time(9, 0, tzinfo=UTC),
+            to_time=time(17, 0, tzinfo=UTC),
+        )

@@ -39,6 +39,8 @@ class NearbyResult:
 def nearby_cells(geohash: str) -> list[NearbyCell]:
     """Return the customer cell and its eight neighbours with distances."""
 
+    geohash = geohash.lower()
+
     north = get_adjacent(geohash, "top")
     south = get_adjacent(geohash, "bottom")
     east = get_adjacent(geohash, "right")

@@ -1,7 +1,11 @@
 SELECT
     di.ingredient_id,
     di.unit,
-    sum(oi.quantity * pd.multiplier * di.amount) AS amount
+    sum(
+        oi.quantity::numeric
+        * pd.multiplier
+        * di.amount
+    ) AS amount
 FROM analytics_orders AS o
 INNER JOIN analytics_order_items AS oi
     ON

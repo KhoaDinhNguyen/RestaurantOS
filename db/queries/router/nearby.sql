@@ -35,6 +35,6 @@ WHERE
     AND can_make_one(p.vendor_id, p.product_id)
 ORDER BY
     requested.distance_m,
-    v.vendor_id,
-    p.product_id
+    v.vendor_id COLLATE "C",  -- noqa: RF02
+    p.product_id COLLATE "C"  -- noqa: RF02
 LIMIT %(row_limit)s;

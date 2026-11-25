@@ -144,6 +144,28 @@ def test_nearby_route_unknown_dish_returns_404(monkeypatch) -> None:
     assert response.json() == {"error": "not_found"}
 
 
+def test_nearby_route_rejects_invalid_geohash(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway_app,
+        "get_settings",
+        gateway_settings,
+    )
+
+    app = gateway_app.create_app()
+    client = TestClient(app)
+
+    for geohash in ("a21z7", "w21i7", "w21l7", "w21o7"):
+        response = client.get(
+            "/api/v1/query/nearby",
+            params={
+                "geohash": geohash,
+                "dish": "d1",
+            },
+        )
+
+        assert response.status_code == 422
+
+
 def test_ingredient_usage_live_strategy_c(monkeypatch) -> None:
     monkeypatch.setattr(
         gateway_app,

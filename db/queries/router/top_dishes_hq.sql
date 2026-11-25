@@ -2,10 +2,10 @@ SELECT
     pd.dish_id,
     d.dish_name,
     d.example_name,
-    sum(oi.quantity * pd.multiplier) AS units,
+    sum(oi.quantity::bigint * pd.multiplier) AS units,
     sum(oi.quantity) AS quantity,
     count(*) AS order_lines,
-    sum(oi.quantity * oi.price_units) AS sales_units
+    sum(oi.quantity::bigint * oi.price_units) AS sales_units
 FROM analytics_orders AS o
 INNER JOIN analytics_order_items AS oi
     ON

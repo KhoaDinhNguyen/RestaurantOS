@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from time import perf_counter
@@ -309,6 +310,7 @@ async def query_strategy_c_aggregate(
     recipes: list[dict[str, Any]],
     *,
     region_id: str | None = None,
+    on_submit: Callable[[], None] | None = None,
 ) -> list[dict[str, Any]]:
     """Round 2: aggregate using recipes shipped to the region."""
 
@@ -326,6 +328,9 @@ async def query_strategy_c_aggregate(
     )
 
     async def work(conn) -> list[dict[str, Any]]:
+        if on_submit is not None:
+            on_submit()
+
         cursor = await conn.execute(
             load_query("router/ingredient_usage_c_aggregate"),
             params,
@@ -423,6 +428,12 @@ async def ingredient_usage_c_live(
             recipe for dish_id in dish_ids for recipe in recipes_by_dish.get(dish_id, [])
         ]
 
+        submitted = False
+
+        def mark_submitted() -> None:
+            nonlocal submitted
+            submitted = True
+
         try:
             pool = await pools.get(node)
             rows = await query_strategy_c_aggregate(
@@ -430,10 +441,15 @@ async def ingredient_usage_c_live(
                 window,
                 region_recipes,
                 region_id=region_id,
+                on_submit=mark_submitted,
             )
             return region_id, rows, len(region_recipes)
         except RegionUnreachableError:
-            return region_id, None, len(region_recipes)
+            return (
+                region_id,
+                None,
+                len(region_recipes) if submitted else 0,
+            )
 
     second_round = await asyncio.gather(
         *(

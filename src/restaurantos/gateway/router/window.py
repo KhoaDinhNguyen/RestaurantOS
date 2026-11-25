@@ -60,6 +60,13 @@ def normalize_window(
     if (from_time is None) != (to_time is None):
         raise ValueError("from_time and to_time must be provided together")
 
+    if (
+        from_time is not None
+        and to_time is not None
+        and (from_time.utcoffset() is not None or to_time.utcoffset() is not None)
+    ):
+        raise ValueError("from_time and to_time must not include a UTC offset")
+
     return QueryWindow(
         from_day=start_day,
         to_day=end_day,
