@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -128,6 +129,13 @@ def point_problem(status: dict[str, Any], minimum: int) -> str | None:
             f"stands at {_at(frontier)}"
         )
     return None
+
+
+def next_due_seconds(status: dict[str, Any]) -> int | None:
+    """The earliest item of any kind the engine still has to send."""
+    return sim_seconds(
+        {"sim_day": status.get("next_due_sim_day"), "sim_time": status.get("next_due_sim_time")}
+    )
 
 
 def offset_floor(engine: dict[str, Any]) -> int:
@@ -353,6 +361,9 @@ class Context:
     runs_dir: Path = Path("runs")
     generated_dir: Path = Path("infra/generated")
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+    # wall time for the waits' deadlines (monotonic; tests pass a fake
+    # that their sleep advances)
+    clock: Callable[[], float] = time.monotonic
     services_down: Callable[[], None] | None = None
     # (cluster, cluster file, ports the precheck must skip: the listeners
     # of the proxies a restore cut again)
@@ -397,12 +408,16 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
             f"offset plus up to {events.get('jitter_s')} s jitter), and restore replays "
             f"only the snapshot's own day: raise it to at least {floor}"
         )
-    # dispatch can stall (a target that stopped answering holds the events
-    # behind their orders): give up once it has not moved for as long as
-    # the in-flight wait would wait, instead of waiting forever
-    still = 0.0
+    # Dispatch can stall (a target that stopped answering holds the events
+    # behind their orders), so the wait has a limit - but counted only
+    # while something is DUE (the clock is past the next item still to go
+    # out) and nothing moves. Waiting for an item that is not due yet is
+    # not a stall however long it takes: at 1x a quiet night has twenty
+    # real minutes between orders. Once something is due, sending it is
+    # HTTP work, so the limit is wall time.
+    limit = ctx.sim.snapshot_drain_timeout_s
+    stalled_since: float | None = None
     while True:
-        frontier = frontier_seconds(status)
         problem = point_problem(status, minimum)
         if problem is None:
             break
@@ -411,14 +426,21 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
                 f"cannot snapshot here: {problem}. The restored day is replayed from "
                 "midnight - resume the run until that clears first"
             )
-        if still >= ctx.sim.snapshot_drain_timeout_s:
-            raise SnapshotError(
-                f"the run's dispatch has not moved for {still:g} s and {problem}: no "
-                "snapshot - is the target answering?"
-            )
+        progress = (frontier_seconds(status), next_due_seconds(status))
         await ctx.sleep(0.1)
         status = await ctx.playback.status() or {}
-        still = 0.0 if frontier_seconds(status) != frontier else still + 0.1
+        now = sim_seconds(await ctx.playback.clock())
+        due = next_due_seconds(status)
+        moved = (frontier_seconds(status), due) != progress
+        if moved or due is None or now is None or now < due:
+            stalled_since = None
+        elif stalled_since is None:
+            stalled_since = ctx.clock()
+        elif ctx.clock() - stalled_since >= limit:
+            raise SnapshotError(
+                f"the run's dispatch has not moved for {limit:g} s with {_at(due)} due "
+                f"and {problem}: no snapshot - is the target answering?"
+            )
     if was_running:
         response = await ctx.playback.command({"action": "pause"})
         if response.status_code != 200:
@@ -428,18 +450,24 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
     # check) resumes a run this call paused. A run that was already
     # paused is left as it was.
     try:
-        waited = 0.0
+        # a real deadline, set before the first poll: each status call is
+        # bounded by the time left, so a slow host cannot stretch it
+        deadline = ctx.clock() + limit
         while True:
-            status = await ctx.playback.status() or {}
+            left = deadline - ctx.clock()
+            if left <= 0:
+                raise SnapshotError(
+                    f"{status.get('inflight')} requests still in flight after {limit:g} s"
+                )
+            try:
+                status = await asyncio.wait_for(ctx.playback.status(), timeout=left) or {}
+            except TimeoutError:
+                raise SnapshotError(
+                    f"the playback host did not answer within the {limit:g} s in-flight wait"
+                ) from None
             if not status.get("inflight"):
                 break
-            if waited >= ctx.sim.snapshot_drain_timeout_s:
-                raise SnapshotError(
-                    f"{status.get('inflight')} requests still in flight after "
-                    f"{ctx.sim.snapshot_drain_timeout_s:g} s"
-                )
-            await ctx.sleep(0.2)
-            waited += 0.2
+            await ctx.sleep(min(0.2, max(left, 0.0)))
         # dispatch is frozen now; it may have moved since the read above -
         # across midnight, or past a held order's day - so check again
         problem = point_problem(status, minimum)

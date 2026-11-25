@@ -169,6 +169,11 @@ class FakeHost:
         # the earliest order held back unsent (shuffle), absolute
         # simulated seconds; a callable sees the host, for a moving one
         self.held: Any = None
+        # overrides: the frontier, and the next item due (value or
+        # callable); wall seconds the fake has slept
+        self.frontier_fn: Any = None
+        self.next_due: Any = None
+        self.wall = 0.0
         self.dispatched = True
         # failure injection: status() raises once the run is paused; a
         # resume answers 500
@@ -189,6 +194,7 @@ class FakeHost:
         }
 
     def advance(self, wall_s: float) -> None:
+        self.wall += wall_s
         if self.state == "running":
             self.offset += wall_s * self.speed_value
 
@@ -196,15 +202,21 @@ class FakeHost:
         """Absolute simulated seconds of the last dispatched item."""
         if self.state == "paused" and self.frontier_after_pause is not None:
             return self.frontier_after_pause
+        if self.frontier_fn is not None:
+            return self.frontier_fn(self)
         return self.day * 86400 + int(self.offset) - self.lag
 
     def _held_fields(self) -> dict[str, Any]:
-        held = self.held(self) if callable(self.held) else self.held
-        if held is None:
-            return {"held_sim_day": None, "held_sim_time": None}
-        day, rest = divmod(held, 86400)
-        moment = f"{rest // 3600:02d}:{rest % 3600 // 60:02d}:{rest % 60:02d}"
-        return {"held_sim_day": day, "held_sim_time": moment}
+        fields: dict[str, Any] = {}
+        for prefix, value in (("held", self.held), ("next_due", self.next_due)):
+            at = value(self) if callable(value) else value
+            if at is None:
+                fields |= {f"{prefix}_sim_day": None, f"{prefix}_sim_time": None}
+                continue
+            day, rest = divmod(at, 86400)
+            moment = f"{rest // 3600:02d}:{rest % 3600 // 60:02d}:{rest % 60:02d}"
+            fields |= {f"{prefix}_sim_day": day, f"{prefix}_sim_time": moment}
+        return fields
 
     async def status(self) -> dict | None:
         if not self.alive:
@@ -336,6 +348,7 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
         runs_dir=runs,
         generated_dir=tmp_path / "generated",
         sleep=sleep,
+        clock=lambda: host.wall,
         services_down=lambda: services.append("down"),
         services_up=lambda cluster, path, down: services.append(f"up {list(down)}"),
     )
@@ -488,14 +501,48 @@ async def test_a_run_paused_before_the_save_stays_paused_on_failure(world: World
 
 
 async def test_save_gives_up_on_a_dispatch_that_does_not_move(world: World) -> None:
+    """The clock is past an item that is due, and dispatch is stuck at
+    00:10: after the limit (wall time) save gives up."""
     ctx, host, docker, _, _ = world
-    host.offset, host.speed_value = 600, 0.0  # 00:10, and stuck there
+    host.offset = 600
+    host.frontier_fn = lambda h: 23 * 86400 + 600
+    host.next_due = 23 * 86400 + 660
     ctx.sim = SimSettings(
         _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_drain_timeout_s=1.0
     )
-    with pytest.raises(SnapshotError, match="has not moved"):
+    with pytest.raises(SnapshotError, match="has not moved for 1 s"):
         await save("stalled", ctx)
     assert host.commands == [] and docker.calls == []
+    assert host.wall < 3.0
+
+
+async def test_a_quiet_stretch_with_nothing_due_is_not_a_stall(world: World) -> None:
+    """At low speed nothing may be due for many real seconds - a quiet
+    night at 1x - and that is not a stall: save keeps waiting."""
+    ctx, host, _, _, _ = world
+    host.offset, host.speed_value = 600, 100.0
+    # dispatch sits at 00:10 until the next order is due at 01:00 (about
+    # 30 wall seconds at 100x), then follows the clock
+    host.frontier_fn = lambda h: 23 * 86400 + (600 if h.offset < 3600 else int(h.offset))
+    host.next_due = lambda h: 23 * 86400 + 3600 if h.offset < 3600 else None
+    ctx.sim = SimSettings(
+        _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_drain_timeout_s=1.0
+    )
+    record = await save("quiet", ctx)
+    assert host.wall > 20.0  # far past the 1 s limit, never counted
+    assert sim_seconds(record) % 86400 >= 3600
+
+
+async def test_the_in_flight_wait_is_bounded_by_wall_time(world: World) -> None:
+    ctx, host, _, _, _ = world
+    host.status_drains, host.inflight = False, 3
+    ctx.sim = SimSettings(
+        _env_file=None, snapshot_dir=ctx.snapshot_dir, snapshot_drain_timeout_s=1.0
+    )
+    with pytest.raises(SnapshotError, match="still in flight after 1 s"):
+        await save("slow", ctx)
+    assert 1.0 <= host.wall < 1.5
+    assert [body["action"] for body in host.commands] == ["pause", "resume"]
 
 
 async def test_save_waits_for_a_held_order_of_the_previous_day(world: World) -> None:
