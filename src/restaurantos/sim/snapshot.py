@@ -442,9 +442,7 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
                 f"and {problem}: no snapshot - is the target answering?"
             )
     if was_running:
-        response = await ctx.playback.command({"action": "pause"})
-        if response.status_code != 200:
-            raise SnapshotError(f"cannot pause playback: {_message(response)}")
+        await _pause(ctx, str(status.get("run_id")))
     # From here this call owns the pause: whatever fails before save takes
     # over (a status call that errors, the drain timeout, the frontier
     # check) resumes a run this call paused. A run that was already
@@ -487,6 +485,41 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
         if isinstance(error, SnapshotError):
             raise SnapshotError(f"{error}; playback resumed, no snapshot") from error
         raise
+
+
+async def _pause(ctx: Context, run_id: str) -> None:
+    """Pause the run. A pause request that fails in transport (a timeout,
+    a reset) may still have paused it on the host: read the SAME run's
+    state, resume it only when it is confirmed paused (this call asked),
+    and say so when the state cannot be read - never leave the raw
+    transport error, or a run paused behind the caller's back."""
+    try:
+        response = await ctx.playback.command({"action": "pause"})
+    except Exception as error:  # noqa: BLE001 - resolved below
+        failure = f"the pause request failed ({_describe(error)})"
+        try:
+            status = await ctx.playback.status()
+        except Exception:  # noqa: BLE001 - the state is unknown
+            status = {}
+        if status is None or status.get("run_id") not in (None, run_id):
+            raise SnapshotError(f"{failure}; run {run_id} is no longer live") from error
+        state = status.get("state")
+        if state is None:
+            raise SnapshotError(
+                f"{failure}, and playback's state cannot be read: run {run_id} may still "
+                "be paused - check rosctl playback status and resume it if so"
+            ) from error
+        if state != "paused":
+            raise SnapshotError(f"{failure}; run {run_id} is {state}, no snapshot") from error
+        problem = await _resume_quietly(ctx)
+        if problem is not None:
+            raise SnapshotError(
+                f"{failure}, but it paused run {run_id}, and resuming it failed too "
+                f"(it is left paused): {problem}"
+            ) from error
+        raise SnapshotError(f"{failure}; it had paused run {run_id}, now resumed") from error
+    if response.status_code != 200:
+        raise SnapshotError(f"cannot pause playback: {_message(response)}")
 
 
 def _describe(error: BaseException) -> str:

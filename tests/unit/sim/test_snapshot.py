@@ -180,6 +180,10 @@ class FakeHost:
         self.fail_status_when_paused = False
         self.fail_resume = False
         self.status_drains = True
+        # None: pause answers; True/False: the request times out, after
+        # the host did / did not pause
+        self.pause_times_out: bool | None = None
+        self.status_fails = False
         # GET /sim/playback's engine block (what every run on it shares)
         self.engine: dict[str, Any] = {
             "sequential": False,
@@ -221,7 +225,7 @@ class FakeHost:
     async def status(self) -> dict | None:
         if not self.alive:
             return None
-        if self.fail_status_when_paused and self.state == "paused":
+        if self.status_fails or (self.fail_status_when_paused and self.state == "paused"):
             raise httpx.ReadTimeout("status timed out")
         day, rest = divmod(self.frontier(), 86400)
         answer = {
@@ -255,6 +259,11 @@ class FakeHost:
         action = body["action"]
         if action == "resume" and self.fail_resume:
             return httpx.Response(500, json={"message": "resume broke"})
+        if action == "pause" and self.pause_times_out is not None:
+            # the request times out; whether the host paused is the case
+            if self.pause_times_out:
+                self.state = "paused"
+            raise httpx.ReadTimeout("pause timed out")
         if action == "pause":
             self.state = "paused"
         elif action == "resume":
@@ -571,6 +580,41 @@ async def test_a_held_order_of_the_same_day_is_replayed_and_fine(world: World) -
     host.held = 23 * 86400 + 600  # earlier than the frontier, but day 23
     record = await save("same-day", ctx)
     assert record["sim_day"] == 23
+
+
+async def test_a_timed_out_pause_that_paused_is_resumed(world: World) -> None:
+    ctx, host, docker, _, _ = world
+    host.pause_times_out = True
+    with pytest.raises(SnapshotError, match="it had paused run run-a, now resumed"):
+        await save("flaky", ctx)
+    assert host.state == "running" and docker.calls == []
+    assert [body["action"] for body in host.commands] == ["pause", "resume"]
+
+
+async def test_a_timed_out_pause_that_did_not_pause_resumes_nothing(world: World) -> None:
+    ctx, host, _, _, _ = world
+    host.pause_times_out = False
+    with pytest.raises(SnapshotError, match="is running, no snapshot"):
+        await save("flaky", ctx)
+    assert [body["action"] for body in host.commands] == ["pause"]
+
+
+async def test_a_timed_out_pause_with_an_unreadable_state_says_so(world: World) -> None:
+    ctx, host, _, _, _ = world
+    host.pause_times_out = True
+
+    real_command = host.command
+
+    async def command(body: dict) -> httpx.Response:
+        try:
+            return await real_command(body)
+        finally:
+            host.status_fails = True  # the host stops answering after it
+
+    host.command = command  # type: ignore[method-assign]
+    with pytest.raises(SnapshotError, match="may still be paused"):
+        await save("flaky", ctx)
+    assert [body["action"] for body in host.commands] == ["pause"]
 
 
 async def test_save_refuses_a_paused_run_that_dispatched_nothing(world: World) -> None:
