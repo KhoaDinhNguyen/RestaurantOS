@@ -60,7 +60,7 @@ import contextlib
 import json
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +68,7 @@ from typing import Any
 
 from restaurantos.common.cluster import HQ_PRIMARY, HQ_STANDBY, Cluster, host_conninfo
 from restaurantos.common.simclock import SECONDS_PER_DAY
+from restaurantos.sim.toxiproxy import ToxiproxyError
 
 LIVE_STATES = ("running", "paused", "stopping")
 RESULT_FILE = "scenario.json"
@@ -95,6 +96,15 @@ class UnknownScenarioError(ScenarioError):
 class ScenarioParamsError(ScenarioError, ValueError):
     status = 422
     code = "invalid_params"
+
+
+class ScenarioNotBuiltError(ScenarioError):
+    """The checker module is not on this branch, so no scenario can run
+    (its verdict needs the checker). Answers `501 not_built`, like the
+    snapshot and check routes."""
+
+    status = 501
+    code = "not_built"
 
 
 # --- the scenarios and their parameters --------------------------------------
@@ -164,7 +174,7 @@ class Params:
     down_s: float = 5.0  # T3: how long the killed services stay down
     duplicate_rate: float = 0.08  # T4
     shuffle: bool = True  # T4
-    latency_ms: int = 1000  # T5, each direction
+    latency_ms: int = 100  # T5, each direction; measured: 1000 promotes the standby
     jitter_ms: int = 0  # T5
     reset_timeout_ms: int = 200  # T6: a connection lives this long, then is reset
 
@@ -192,7 +202,13 @@ def seconds_of_day(text: str) -> int:
 
 
 def _number(key: str, value: Any, *, minimum: float, above: bool = False) -> float:
-    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ScenarioParamsError(f"{key} must be a number")
+    try:
+        finite = math.isfinite(value)
+    except OverflowError:  # an int too large for a float
+        raise ScenarioParamsError(f"{key} is too large") from None
+    if not finite:
         raise ScenarioParamsError(f"{key} must be a number")
     if value < minimum or (above and value == minimum):
         relation = "above" if above else "at least"
@@ -281,7 +297,11 @@ class ClusterProbe:
     def _rows(self, node: str, sql: str, params: Any = None) -> list[tuple]:
         import psycopg
 
-        with psycopg.connect(host_conninfo(self.cluster, node), connect_timeout=5) as conn:
+        with psycopg.connect(
+            host_conninfo(self.cluster, node),
+            connect_timeout=5,
+            options="-c statement_timeout=5000",
+        ) as conn:
             return conn.execute(sql, params).fetchall()
 
     def hq(self) -> str:
@@ -345,6 +365,11 @@ class ClusterProbe:
             (region_id,),
         )[0][0]
 
+    def outbox_left(self, node: str) -> int:
+        """Undelivered rows of the region's outbox on its current primary
+        (the relay's own queue; T3 asks whether work was pending)."""
+        return self._rows(node, "SELECT count(*) FROM outbox WHERE relayed_at IS NULL")[0][0]
+
     def probe_source(self, node: str) -> dict[str, Any]:
         """A product of the region to copy the dish link and price from."""
         rows = self._rows(
@@ -395,11 +420,15 @@ class Services:
         *,
         runs_dir: Path = Path("runs"),
         compose: Callable[..., Any] | None = None,
+        container_start_wait_s: float = 15.0,
+        container_stable_s: float = 3.0,
     ) -> None:
         self._cluster = cluster
         self._cluster_file = cluster_file
         self._runs_dir = runs_dir
         self._compose = compose
+        self._container_start_wait_s = container_start_wait_s
+        self._container_stable_s = container_stable_s
 
     def _compose_call(self, *args: str) -> Any:
         if self._compose is not None:
@@ -408,15 +437,42 @@ class Services:
 
         return _compose(*args)
 
-    def _mode(self, name: str) -> str:
+    def _compose_running(self, name: str) -> bool:
         from restaurantos.sim.nodes import parse_running
-        from restaurantos.sim.services import read_pid_record
 
-        if read_pid_record(self._runs_dir, name) is not None:
-            return "host"
         result = self._compose_call("--profile", "services", "ps", "--format", "json", name)
-        if parse_running(result.stdout):
+        return parse_running(result.stdout)
+
+    def _mode(self, name: str) -> str:
+        from restaurantos.sim.services import identity, pid_path, read_pid_record, service_specs
+
+        record = read_pid_record(self._runs_dir, name)
+        host_live = False
+        unknown: str | None = None
+        if isinstance(record, tuple):
+            pid, ticks = record
+            spec = {row.name: row for row in service_specs(self._cluster)}.get(name)
+            if spec is None:
+                unknown = f"no service {name} in this cluster ({pid_path(self._runs_dir, name)})"
+            else:
+                who = identity(pid, ticks, spec)
+                if who == "match":
+                    host_live = True
+                elif who == "unknown":
+                    unknown = str(pid_path(self._runs_dir, name))
+        elif isinstance(record, str):
+            unknown = f"{record} ({pid_path(self._runs_dir, name)})"
+        container_live = self._compose_running(name)
+        if host_live and container_live:
+            raise ScenarioError(f"{name} runs both from rosctl up and as a container; stop one")
+        if host_live:
+            return "host"
+        if container_live:
             return "container"
+        if unknown is not None:
+            raise ScenarioError(
+                f"cannot tell whether {name} runs from rosctl up - inspect {unknown}"
+            )
         raise ScenarioError(
             f"{name} is not running: no pid file from `rosctl up` and no running container"
         )
@@ -459,6 +515,31 @@ class Services:
                 "detail": f"{step.outcome}: {step.detail}",
             }
         self._compose_call("--profile", "services", "start", name)
+        # compose start returns before a worker that crashes on start has
+        # exited: wait until it runs, then check it is still running
+        deadline = time.monotonic() + self._container_start_wait_s
+        while not self._compose_running(name):
+            if time.monotonic() >= deadline:
+                return {
+                    "service": name,
+                    "mode": mode,
+                    "ok": False,
+                    "detail": (
+                        f"docker compose start: not running within "
+                        f"{self._container_start_wait_s:g} s"
+                    ),
+                }
+            time.sleep(0.5)
+        time.sleep(self._container_stable_s)
+        if not self._compose_running(name):
+            return {
+                "service": name,
+                "mode": mode,
+                "ok": False,
+                "detail": (
+                    f"docker compose start: not still running {self._container_stable_s:g} s later"
+                ),
+            }
         return {"service": name, "mode": mode, "ok": True, "detail": "docker compose start"}
 
     async def kill(self, name: str) -> dict[str, Any]:
@@ -487,6 +568,8 @@ class ScenarioEnv:
     check: Callable[[str, bool], dict[str, Any]]
     # the POST /menu/products body -> its answer (T6)
     publish_menu: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+    # why no scenario may run at all (the checker module missing), or None
+    ready: Callable[[], str | None] = lambda: None
     runs_dir: Path = Path("runs")
     default_from_day: int = 0
     last_day: int | None = None
@@ -543,6 +626,13 @@ def default_env(
             raise ScenarioError(f"POST {url} answered {response.status_code}: {response.text}")
         return response.json()
 
+    import importlib.util
+
+    def ready() -> str | None:
+        if importlib.util.find_spec("restaurantos.sim.checker") is None:
+            return "the checker is not on this branch (sim/checker.py, PR #33)"
+        return None
+
     return ScenarioEnv(
         cluster=cluster,
         playback=playback,
@@ -552,6 +642,7 @@ def default_env(
         probe=ClusterProbe(cluster),
         check=check,
         publish_menu=publish_menu,
+        ready=ready,
         runs_dir=runs_dir,
         default_from_day=default_from_day,
         last_day=last_day,
@@ -559,15 +650,68 @@ def default_env(
     )
 
 
-def refuse_reason(env: ScenarioEnv) -> str | None:
-    """Why no scenario may start now, or None."""
+async def refuse_reason(env: ScenarioEnv) -> tuple[int, str, str] | None:
+    """Why no scenario may start now, as `(status, code, message)`, or None.
+
+    `ready` (the checker module missing on this branch) answers `501
+    not_built`, like the snapshot and check routes; everything else is a
+    refusal. The link state is read live last: a cut a restart left
+    behind belongs to no live fault, so a scenario would neither know
+    about it nor heal it."""
+    why = env.ready()
+    if why is not None:
+        return (501, "not_built", why)
     state = env.playback.state
     if state in LIVE_STATES:
-        return f"a playback run is {state}; stop it first (rosctl playback stop)"
+        return (
+            409,
+            "scenario_refused",
+            f"a playback run is {state}; stop it first (rosctl playback stop)",
+        )
     if env.faults.faults():
         ids = ", ".join(fault.fault_id for fault in env.faults.faults())
-        return f"faults are live ({ids}); heal them first (rosctl fault heal-all)"
+        return (
+            409,
+            "scenario_refused",
+            f"faults are live ({ids}); heal them first (rosctl fault heal-all)",
+        )
+    try:
+        links = await env.faults.links()
+    except ToxiproxyError as error:
+        return (
+            getattr(error, "status", 502),
+            "toxiproxy_error",
+            f"Toxiproxy cannot be read: {error}",
+        )
+    stray: dict[str, dict[str, list[Any]]] = {}
+    for entry in links:
+        kinds = {
+            kind: things for kind, things in (entry.get("unexplained") or {}).items() if things
+        }
+        if kinds:
+            stray[str(entry.get("group"))] = kinds
+    if stray:
+        named = "; ".join(
+            f"{group}: "
+            + ", ".join(f"{kind} {_plain(things)}" for kind, things in sorted(kinds.items()))
+            for group, kinds in stray.items()
+        )
+        return (
+            409,
+            "scenario_refused",
+            f"Toxiproxy holds link state no live fault explains ({named}); "
+            "clear it with rosctl fault heal-all",
+        )
     return None
+
+
+def _plain(things: Sequence[Any]) -> str:
+    """Name the stray entries of one kind: a toxic by its name, a proxy
+    by its own string."""
+    return ", ".join(
+        str(thing.get("name") or thing.get("type")) if isinstance(thing, dict) else str(thing)
+        for thing in things
+    )
 
 
 def next_free_day(runs_dir: Path, default: int) -> int:
@@ -577,7 +721,10 @@ def next_free_day(runs_dir: Path, default: int) -> int:
     if runs_dir.is_dir():
         for meta_file in runs_dir.glob("*/meta.json"):
             with contextlib.suppress(OSError, ValueError, TypeError):
-                to_day = json.loads(meta_file.read_text(encoding="utf-8")).get("to_day")
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                if not isinstance(meta, dict):
+                    continue  # not a run's meta.json (a list, a number, ...)
+                to_day = meta.get("to_day")
                 if isinstance(to_day, int):
                     last = max(last, to_day)
     return last + 1
@@ -591,6 +738,13 @@ def _seconds(start: datetime | None, end: datetime | None) -> float | None:
     if start is None or end is None:
         return None
     return round((end - start).total_seconds(), 3)
+
+
+def _start_hint(mode: str, name: str) -> str:
+    """The command a person runs to start one service by hand."""
+    if mode == "host":
+        return f"uv run rosctl up {name}"
+    return f"docker compose -p restaurantos -f {COMPOSE_FILE} --profile services start {name}"
 
 
 # --- one scenario run ----------------------------------------------------------
@@ -656,14 +810,17 @@ class Session:
             left = end - env.monotonic()
             self.progress(f"{label}: {max(left, 0):.0f} s left")
             if tick is not None:
-                await tick()
-            if left <= 0:
-                return
+                # a probe read must not hold the fault past its deadline:
+                # the read may still finish in its thread, the hold does not wait
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(tick(), timeout=max(min(left, 2.0), 0.1))
             if under_load and env.playback.state not in LIVE_STATES:
                 raise ScenarioError(
                     f"the run ended ({env.playback.state}) during '{label}'; "
                     "its window is too short - pick a lower speed"
                 )
+            if left <= 0:
+                return
             await env.sleep(min(env.tick_s, left))
 
     def watch(self, coro: Awaitable[None]) -> None:
@@ -685,12 +842,17 @@ class Session:
         if answer.get("running"):
             raise ScenarioError(f"{node} is still running after the kill")
 
-    async def start_nodes(self) -> None:
+    async def start_nodes(self) -> list[str]:
+        """Start the killed nodes again; returns the ones that did not
+        come back (T1b fails its own verdict on that list)."""
+        failed: list[str] = []
         while self.killed_nodes:
             node = self.killed_nodes.pop()
             answer = await self.env.nodes.start(node)
             if not answer.get("running"):
                 self.warnings.append(f"{node} did not start again")
+                failed.append(node)
+        return failed
 
     # --- the shared script ------------------------------------------------
 
@@ -701,11 +863,16 @@ class Session:
         if spec.name == "T3":
             hold_s += params.kill_after_s + params.down_s
         needed = seconds_of_day(params.inject_at) + hold_s * speed + TAIL_MARGIN_S
+        if not math.isfinite(needed):
+            raise ScenarioParamsError(
+                f"the script's window is not a finite number of days at {speed:g}x "
+                "(the speed or the hold is too large)"
+            )
         days = max(1, math.ceil(needed / SECONDS_PER_DAY))
         if params.from_day is not None:
             from_day = params.from_day
         else:
-            from_day = next_free_day(env.runs_dir, env.default_from_day)
+            from_day = await asyncio.to_thread(next_free_day, env.runs_dir, env.default_from_day)
             if env.last_day is not None and from_day + days - 1 > env.last_day:
                 self.warnings.append(
                     f"every day up to {env.last_day} has been replayed; replaying from day "
@@ -796,8 +963,19 @@ class Session:
         """Repair what the script broke, after an error."""
         for task in self.watchers:
             task.cancel()
+        try:
+            await self.heal_faults()
+        except Exception as error:  # noqa: BLE001 - a last resort exists for this one
+            # the preflight refused every other live fault, so everything
+            # Toxiproxy still holds here is this scenario's own
+            self.warnings.append(f"could not heal the scenario's faults: {error}")
+            try:
+                await self.env.faults.heal_all()
+            except Exception as heal_error:  # noqa: BLE001
+                self.warnings.append(f"heal-all also failed: {heal_error}")
+            else:
+                self.warnings.append("rosctl fault heal-all ran as a last resort")
         steps = (
-            ("heal the scenario's faults", self.heal_faults),
             ("start the killed nodes", self.start_nodes),
             ("start the killed services", self._restart_services),
             ("stop the run", self._stop_run),
@@ -810,13 +988,26 @@ class Session:
 
     async def _restart_services(self) -> None:
         for name, mode in list(self.killed_services.items()):
-            answer = await self.env.services.start(name, mode)
-            self.killed_services.pop(name)
-            if not answer.get("ok"):
-                self.warnings.append(f"{name} did not start again: {answer.get('detail')}")
+            try:
+                answer = await self.env.services.start(name, mode)
+            except Exception as error:  # noqa: BLE001 - the other services still get their turn
+                self.warnings.append(
+                    f"could not start {name} again: {error}; "
+                    f"start it by hand: {_start_hint(mode, name)}"
+                )
+                continue
+            if answer.get("ok"):
+                self.killed_services.pop(name, None)
+            else:
+                self.warnings.append(
+                    f"{name} did not start again: {answer.get('detail')}; "
+                    f"start it by hand: {_start_hint(mode, name)}"
+                )
 
     async def _stop_run(self) -> None:
-        if self.env.playback.state in ("running", "paused"):
+        # only the scenario's own run: someone else's run is not ours to stop
+        status = self.env.playback.status()
+        if status.get("run_id") == self.run_id and status.get("state") in ("running", "paused"):
             await self.env.playback.stop()
 
     def result(self, error: str | None = None) -> dict[str, Any]:
@@ -855,11 +1046,28 @@ class Session:
 
 class Script:
     """One scenario's own part. `prepare` runs before the run starts (a
-    refusal there costs nothing), `act` from the injection moment to the
-    heal, `conclude` after the run and before the check."""
+    refusal there costs nothing), `recheck` at the injection moment (a
+    failover during the warm-up would break the wrong node, so the
+    scripts that break a primary refuse there), `act` from the injection
+    moment to the heal, `conclude` after the run and before the check."""
 
     async def prepare(self, s: Session) -> None:
-        s.state["event_mark"] = await s.db(s.env.probe.last_event_id)
+        pass
+
+    async def recheck(self, s: Session) -> None:
+        pass
+
+    async def _same_primary(self, s: Session, key: str) -> None:
+        """Refuse when the region's primary moved between `prepare` and
+        the injection moment: the script would break the wrong node, and
+        an earlier failover event would then count as this run's."""
+        view = await s.db(s.env.probe.region, s.params.region_id)
+        if view["primary"] != s.state[key] or view["epoch"] != s.state["epoch"]:
+            raise ScenarioError(
+                f"{s.params.region_id} failed over before the fault "
+                f"({s.state[key]} epoch {s.state['epoch']} -> "
+                f"{view['primary']} epoch {view['epoch']}); run the scenario again"
+            )
 
     async def act(self, s: Session) -> None:
         await s.hold(s.params.fault_s, "load")
@@ -899,6 +1107,9 @@ class PrimaryLoss(Script):
         s.state.update(old=old, epoch=view["epoch"])
         s.measurements.update(old_primary=old, epoch_before=view["epoch"])
 
+    async def recheck(self, s: Session) -> None:
+        await self._same_primary(s, "old")
+
     async def act(self, s: Session) -> None:
         old, rid = s.state["old"], s.params.region_id
         injected = s.mark("injected_at")
@@ -916,11 +1127,18 @@ class PrimaryLoss(Script):
                     s.state["promoted_seen_at"] = s.env.now()
 
         await s.hold(s.params.fault_s, f"{old} {'killed' if self.crash else 'cut off'}", tick)
+        failed: list[str] = []
         if self.crash:
-            await s.start_nodes()
+            failed = await s.start_nodes()
         else:
             await s.heal_faults()
         s.mark("healed_at")
+        if self.crash:
+            s.condition(
+                f"{old} started again",
+                old not in failed,
+                "started again" if old not in failed else f"{old} did not start again",
+            )
         s.measurements["promotion_seen_s"] = _seconds(injected, s.state.get("promoted_seen_at"))
 
     async def conclude(self, s: Session) -> None:
@@ -986,6 +1204,16 @@ class Partition(Script):
     async def _kill_workers(self, s: Session) -> None:
         names = (f"relay-{s.params.region_id}", "hq-worker")
         await s.env.sleep(s.params.kill_after_s)
+        # was there work to interrupt? A T3 that kills an idle pair proves
+        # nothing about the drain; both numbers go into the result
+        holding: int | None = None
+        outbox: int | None = None
+        with contextlib.suppress(Exception):
+            holding = await s.db(s.env.probe.holding_left, s.params.region_id)
+        with contextlib.suppress(Exception):
+            view = await s.db(s.env.probe.region, s.params.region_id)
+            outbox = await s.db(s.env.probe.outbox_left, view["primary"])
+        s.measurements["pending_at_kill"] = {"holding_queue": holding, "outbox": outbox}
         kills = []
         for name in names:
             answer = await s.env.services.kill(name)
@@ -996,10 +1224,22 @@ class Partition(Script):
         starts = []
         for name in names:
             answer = await s.env.services.start(name, s.killed_services[name])
-            s.killed_services.pop(name)
             starts.append(answer)
+            if answer.get("ok"):
+                s.killed_services.pop(name, None)
+            else:
+                s.warnings.append(
+                    f"{name} did not start again: {answer.get('detail')}; "
+                    f"start it by hand: {_start_hint(s.killed_services[name], name)}"
+                )
         s.mark("workers_started_at")
         s.measurements["workers"] = {"killed": kills, "started": starts}
+        pending = s.measurements["pending_at_kill"]
+        s.condition(
+            "work was pending when the workers were killed",
+            (pending["holding_queue"] or 0) + (pending["outbox"] or 0) > 0,
+            f"holding_queue {pending['holding_queue']}, outbox {pending['outbox']}",
+        )
         s.condition(
             "relay and HQ worker killed and started again",
             all(item["ok"] for item in kills + starts),
@@ -1040,7 +1280,10 @@ class SlowNode(Script):
     async def prepare(self, s: Session) -> None:
         await super().prepare(s)
         view = await s.db(s.env.probe.region, s.params.region_id)
-        s.state["primary"] = view["primary"]
+        s.state.update(primary=view["primary"], epoch=view["epoch"])
+
+    async def recheck(self, s: Session) -> None:
+        await self._same_primary(s, "primary")
 
     async def act(self, s: Session) -> None:
         primary = s.state["primary"]
@@ -1074,9 +1317,12 @@ class MenuPublish(Script):
     async def prepare(self, s: Session) -> None:
         await super().prepare(s)
         view = await s.db(s.env.probe.region, s.params.region_id)
-        s.state["primary"] = view["primary"]
+        s.state.update(primary=view["primary"], epoch=view["epoch"])
         s.state["source"] = await s.db(s.env.probe.probe_source, view["primary"])
         s.measurements.update(samples=0, mixed=[])
+
+    async def recheck(self, s: Session) -> None:
+        await self._same_primary(s, "primary")
 
     async def _sample(self, s: Session) -> dict[str, Any] | None:
         product = s.state.get("product")
@@ -1182,15 +1428,23 @@ async def run_scenario(
     an error later repairs what the script broke, writes the partial
     result and raises."""
     spec, params = parse_params(name, body, env.cluster)
-    reason = refuse_reason(env)
+    reason = await refuse_reason(env)
     if reason is not None:
-        raise ScenarioError(reason)
+        status, code, message = reason
+        if code == "not_built":
+            raise ScenarioNotBuiltError(message)
+        raise ScenarioError(message)
     script = SCRIPTS[spec.name]()
     s = Session(env, spec, params, progress)
     await script.prepare(s)
     try:
         await s.start_run()
         await s.wait_for_injection()
+        # the mark and the recheck sit at the injection moment: a failover
+        # during the warm-up would break the wrong node, and an event from
+        # before it would then count as this run's
+        await script.recheck(s)
+        s.state["event_mark"] = await s.db(s.env.probe.last_event_id)
         await script.act(s)
         await s.hold(params.settle_s, "settling after the heal", under_load=False)
         await s.finish_run()
@@ -1199,10 +1453,10 @@ async def run_scenario(
         await s.run_check()
     except BaseException as error:
         await s.cleanup()
-        s.write(s.result(error=f"{type(error).__name__}: {error}"))
+        await asyncio.to_thread(s.write, s.result(error=f"{type(error).__name__}: {error}"))
         raise
     result = s.result()
-    s.write(result)
+    await asyncio.to_thread(s.write, result)
     progress(f"{spec.name} {'passed' if result['passed'] else 'FAILED'}")
     return result
 

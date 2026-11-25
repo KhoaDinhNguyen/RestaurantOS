@@ -130,6 +130,8 @@ class FakeFaults:
     def __init__(self) -> None:
         self.live: dict[str, FakeFault] = {}
         self.log: list[tuple[str, ...]] = []
+        self.links_answer: list[dict[str, Any]] = []
+        self.heal_all_calls = 0
 
     def faults(self) -> list[FakeFault]:
         return list(self.live.values())
@@ -144,10 +146,20 @@ class FakeFaults:
         record = self.live.pop(fault_id)
         self.log.append(("heal", record.target, record.fault))
 
+    async def links(self) -> list[dict[str, Any]]:
+        return self.links_answer
+
+    async def heal_all(self) -> int:
+        self.heal_all_calls += 1
+        healed = len(self.live)
+        self.live.clear()
+        return healed
+
 
 class FakeNodes:
     def __init__(self) -> None:
         self.running = {node: True for node in CLUSTER.nodes}
+        self.fail_start = False
         self.log: list[tuple[str, str]] = []
 
     async def kill(self, node: str) -> dict[str, Any]:
@@ -156,14 +168,16 @@ class FakeNodes:
         return {"node_id": node, "running": False}
 
     async def start(self, node: str) -> dict[str, Any]:
-        self.running[node] = True
+        running = not self.fail_start
+        self.running[node] = running
         self.log.append(("start", node))
-        return {"node_id": node, "running": True}
+        return {"node_id": node, "running": running}
 
 
 class FakeServices:
     def __init__(self) -> None:
         self.log: list[tuple[str, str]] = []
+        self.fail_start: set[str] = set()
 
     async def kill(self, name: str) -> dict[str, Any]:
         self.log.append(("kill", name))
@@ -171,7 +185,13 @@ class FakeServices:
 
     async def start(self, name: str, mode: str) -> dict[str, Any]:
         self.log.append(("start", name))
-        return {"service": name, "mode": mode, "ok": True, "detail": "started"}
+        ok = name not in self.fail_start
+        return {
+            "service": name,
+            "mode": mode,
+            "ok": ok,
+            "detail": "started" if ok else "it crashed on start",
+        }
 
 
 class FakeProbe:
@@ -185,6 +205,7 @@ class FakeProbe:
         self.streaming_count = 1
         self.failovers: list[dict[str, Any]] = []
         self.holding = 0
+        self.outbox = 0
         self.menu: dict[str, Any] = {"version": 1, "ahead": 0, "probe": None}
         self.menu_after_heal: dict[str, Any] | None = None
         self.healed = False
@@ -203,11 +224,16 @@ class FakeProbe:
     def failovers_since(self, after_id: int, region_id: str) -> list[dict[str, Any]]:
         return [event for event in self.failovers if event["event_id"] > after_id]
 
-    def first_commit_after(self, node: str, after: datetime, days: tuple[int, int]):
+    def first_commit_after(
+        self, node: str, after: datetime, days: tuple[int, int]
+    ) -> datetime | None:
         return after + timedelta(seconds=9) if node == "r1-standby" else None
 
     def holding_left(self, region_id: str) -> int:
         return self.holding
+
+    def outbox_left(self, node: str) -> int:
+        return self.outbox
 
     def probe_source(self, node: str) -> dict[str, Any]:
         return {"vendor_id": "v1", "dish_id": "d1", "multiplier": 2, "price_units": 30}
@@ -308,6 +334,7 @@ def test_params_defaults_and_names_ignore_case() -> None:
         ("T5", {"latency_ms": -1}, "whole number"),
         ("T4", {"shuffle": "yes"}, "true or false"),
         ("T2", {"settle_s": True}, "must be a number"),
+        ("T2", {"fault_s": 10**400}, "too large"),
     ],
 )
 def test_bad_params_are_refused(name: str, body: dict, match: str) -> None:
@@ -324,7 +351,7 @@ def test_unknown_scenario() -> None:
 def test_describe_lists_every_scenario_with_its_own_params() -> None:
     listed = {entry["name"]: entry["params"] for entry in describe()}
     assert list(listed) == ["T1", "T1b", "T2", "T3", "T4", "T5", "T6"]
-    assert listed["T5"]["latency_ms"] == 1000 and "latency_ms" not in listed["T2"]
+    assert listed["T5"]["latency_ms"] == 100 and "latency_ms" not in listed["T2"]
     assert listed["T2"]["fault_s"] == 60
 
 
@@ -344,12 +371,34 @@ def test_next_free_day_reads_meta_files_only(tmp_path: Path) -> None:
 async def test_refused_while_a_run_is_live_or_faults_are_on(world: World) -> None:
     world.playback._state = "running"
     world.playback.started = {"from_day": 14, "to_day": 99, "speed": 1, "t0": 0}
-    assert "stop it first" in (refuse_reason(world.env) or "")
+    reason = await refuse_reason(world.env)
+    assert reason is not None and "stop it first" in reason[2]
     with pytest.raises(ScenarioError, match="stop it first"):
         await run_scenario("T2", None, world.env)
     world.playback._state = "done"
     await world.faults.create("repl:r1", "cut", {})
-    assert "heal them first" in (refuse_reason(world.env) or "")
+    reason = await refuse_reason(world.env)
+    assert reason is not None and "heal them first" in reason[2]
+
+
+async def test_refused_over_link_state_no_live_fault_explains(world: World) -> None:
+    world.faults.links_answer = [
+        {
+            "group": "link:r1<->hq",
+            "unexplained": {"disabled": ["gateway__r1-primary"], "toxics": [], "missing": []},
+        }
+    ]
+    reason = await refuse_reason(world.env)
+    assert reason is not None
+    status, code, message = reason
+    assert (status, code) == (409, "scenario_refused")
+    assert "gateway__r1-primary" in message and "heal-all" in message
+
+
+async def test_refused_while_the_checker_is_missing(world: World) -> None:
+    world.env.ready = lambda: "the checker is not on this branch (sim/checker.py, PR #33)"
+    reason = await refuse_reason(world.env)
+    assert reason is not None and reason[:2] == (501, "not_built")
 
 
 async def test_t1_refused_without_a_streaming_standby(world: World) -> None:
@@ -362,6 +411,12 @@ async def test_t1_refused_without_a_streaming_standby(world: World) -> None:
 async def test_a_window_past_the_data_is_refused(world: World) -> None:
     with pytest.raises(ScenarioParamsError, match="data ends on day 90"):
         await run_scenario("T2", {"from_day": 90, "fault_s": 900}, world.env)
+    assert world.playback.started is None
+
+
+async def test_an_impossible_window_is_refused_before_any_run(world: World) -> None:
+    with pytest.raises(ScenarioParamsError, match="not a finite number of days"):
+        await run_scenario("T2", {"speed": 1e308}, world.env)
     assert world.playback.started is None
 
 
@@ -456,7 +511,36 @@ async def test_t1b_kills_the_primary_and_starts_it_at_the_heal(world: World) -> 
     assert world.faults.log == []
 
 
+async def test_t1b_fails_when_the_old_primary_does_not_come_back(world: World) -> None:
+    world.nodes.fail_start = True
+    result = await run_scenario("T1b", None, world.env)
+    assert result["passed"] is False
+    failed = {item["name"] for item in result["conditions"] if not item["passed"]}
+    assert "r1-primary started again" in failed
+
+
+async def test_a_failover_during_the_warm_up_is_refused_at_injection(world: World) -> None:
+    # the primary moves at wall-second 10, long before the 11:00 injection
+    world.probe.promote_at = 10.0
+    with pytest.raises(ScenarioError, match="failed over before the fault"):
+        await run_scenario("T1", None, world.env)
+    # nothing was broken, and the run was stopped
+    assert world.faults.log == [] and world.nodes.log == []
+    assert world.playback.stopped is True
+
+
 async def test_t3_kills_and_restarts_the_relay_and_the_hq_worker(world: World) -> None:
+    world.probe.holding = 3  # work is pending at the kill, so the drain is real
+
+    # the holding queue empties once the workers are back
+    original_start = world.services.start
+
+    async def start_then_drain(name: str, mode: str) -> dict[str, Any]:
+        answer = await original_start(name, mode)
+        world.probe.holding = 0
+        return answer
+
+    world.services.start = start_then_drain  # type: ignore[method-assign]
     result = await run_scenario("T3", {"region_id": "r2", "fault_s": 10}, world.env)
     assert world.faults.log[0] == ("create", "link:r2<->hq", "cut")
     assert world.services.log == [
@@ -470,6 +554,37 @@ async def test_t3_kills_and_restarts_the_relay_and_the_hq_worker(world: World) -
         item["name"] for item in result["conditions"]
     ]
     assert result["timeline"]["workers_killed_at"] < result["timeline"]["workers_started_at"]
+
+
+async def test_t3_with_nothing_pending_fails_saying_why(world: World) -> None:
+    result = await run_scenario("T3", {"region_id": "r2", "fault_s": 10}, world.env)
+    assert result["passed"] is False
+    assert result["measurements"]["pending_at_kill"] == {"holding_queue": 0, "outbox": 0}
+    failed = {item["name"] for item in result["conditions"] if not item["passed"]}
+    assert "work was pending when the workers were killed" in failed
+
+
+async def test_a_failed_service_restart_warns_and_keeps_the_condition(world: World) -> None:
+    world.probe.holding = 3
+    world.services.fail_start = {"relay-r2"}
+
+    # the drain completes only when a worker actually comes back
+    original_start = world.services.start
+
+    async def start_then_drain(name: str, mode: str) -> dict[str, Any]:
+        answer = await original_start(name, mode)
+        if answer.get("ok"):
+            world.probe.holding = 0
+        return answer
+
+    world.services.start = start_then_drain  # type: ignore[method-assign]
+    result = await run_scenario("T3", {"region_id": "r2", "fault_s": 10}, world.env)
+    # the other service still got its start
+    assert ("start", "hq-worker") in world.services.log
+    assert result["passed"] is False
+    failed = {item["name"] for item in result["conditions"] if not item["passed"]}
+    assert "relay and HQ worker killed and started again" in failed
+    assert any("uv run rosctl up relay-r2" in item for item in result["warnings"])
 
 
 async def test_t4_resends_and_shuffles_and_checks_strictly(world: World) -> None:
@@ -543,11 +658,46 @@ async def test_an_error_repairs_what_the_script_broke(world: World) -> None:
     assert written["passed"] is False and "the gateway is down" in written["error"]
 
 
+async def test_cleanup_never_stops_someone_elses_run(world: World) -> None:
+    def foreign_run_is_live(after_id: int, region_id: str) -> list[dict[str, Any]]:
+        # between this scenario's finish and its cleanup, run B went live
+        world.playback.started = {
+            "run_id": "run-b",
+            "from_day": 20,
+            "to_day": 21,
+            "speed": 1,
+            "t0": world.clock.t,
+        }
+        world.playback._state = "running"
+        raise RuntimeError("HQ is gone")
+
+    world.probe.failovers_since = foreign_run_is_live  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="HQ is gone"):
+        await run_scenario("T2", {"fault_s": 5}, world.env)
+    assert world.playback.stopped is False  # run B was left alone
+
+
+async def test_a_failed_heal_runs_heal_all_once(world: World) -> None:
+    async def boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("the gateway is down")
+
+    async def unhealable(fault_id: str) -> None:
+        raise RuntimeError("toxiproxy is gone")
+
+    world.env.publish_menu = boom
+    world.faults.heal = unhealable  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="the gateway is down"):
+        await run_scenario("T6", None, world.env)
+    assert world.faults.heal_all_calls == 1
+    written = json.loads(next(world.env.runs_dir.glob(f"*/{RESULT_FILE}")).read_text())
+    assert any("heal-all ran as a last resort" in item for item in written["warnings"])
+
+
 async def test_progress_is_reported(world: World) -> None:
     seen: list[str] = []
     await run_scenario("T5", {"fault_s": 5}, world.env, progress=seen.append)
     assert seen[0].startswith("starting run t5-r1-")
-    assert any("slowed by 1000 ms" in line for line in seen)
+    assert any("slowed by 100 ms" in line for line in seen)
     assert seen[-1] == "T5 passed"
 
 
@@ -598,14 +748,78 @@ async def test_services_in_container_mode_go_through_compose(tmp_path: Path) -> 
             stdout = json.dumps({"Service": name, "State": "running"}) + "\n"
         return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
 
-    services = Services(CLUSTER, tmp_path / "cluster.toml", runs_dir=tmp_path, compose=compose)
+    services = Services(
+        CLUSTER,
+        tmp_path / "cluster.toml",
+        runs_dir=tmp_path,
+        compose=compose,
+        container_start_wait_s=0,
+        container_stable_s=0,
+    )
     killed = await services.kill("relay-r1")
     assert killed["mode"] == "container" and killed["ok"] is True
     assert ("--profile", "services", "kill", "relay-r1") in calls
     started = await services.start("relay-r1", killed["mode"])
     assert started["ok"] is True
     assert ("--profile", "services", "start", "relay-r1") in calls
+    # a malformed pid file plus a running container: container mode wins
+    (tmp_path / "services").mkdir(exist_ok=True)
+    (tmp_path / "services" / "relay-r1.pid").write_text("garbage\n", encoding="utf-8")
+    killed = await services.kill("relay-r1")
+    assert killed["mode"] == "container"
     # neither a pid file nor a running container: refused, nothing killed
     with pytest.raises(ScenarioError, match="hq-worker is not running"):
         await services.kill("hq-worker")
     assert not any(call[2] == "kill" and call[-1] == "hq-worker" for call in calls)
+
+
+async def test_an_unjudgeable_pid_file_names_itself(tmp_path: Path) -> None:
+    import subprocess
+
+    from restaurantos.sim.scenarios import Services
+
+    def compose(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    services = Services(
+        CLUSTER,
+        tmp_path / "cluster.toml",
+        runs_dir=tmp_path,
+        compose=compose,
+        container_start_wait_s=0,
+        container_stable_s=0,
+    )
+    # a pid record for a process that no longer exists cannot be judged:
+    # the refusal names the file so a person can look at it
+    (tmp_path / "services").mkdir()
+    (tmp_path / "services" / "relay-r1.pid").write_text("99999999 12345\n", encoding="utf-8")
+    with pytest.raises(ScenarioError, match="relay-r1.pid"):
+        await services.kill("relay-r1")
+
+
+async def test_a_container_that_dies_right_after_start_reports_it(tmp_path: Path) -> None:
+    import subprocess
+
+    from restaurantos.sim.scenarios import Services
+
+    running = {"relay-r1"}
+
+    def compose(*args: str) -> subprocess.CompletedProcess:
+        command, name = args[2], args[-1]
+        stdout = ""
+        if command == "ps" and name in running:
+            stdout = json.dumps({"Service": name, "State": "running"}) + "\n"
+            running.discard(name)  # seen running once, then gone
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+
+    services = Services(
+        CLUSTER,
+        tmp_path / "cluster.toml",
+        runs_dir=tmp_path,
+        compose=compose,
+        container_start_wait_s=0,
+        container_stable_s=0,
+    )
+    started = await services.start("relay-r1", "container")
+    assert started["ok"] is False
+    assert "not still running" in started["detail"]

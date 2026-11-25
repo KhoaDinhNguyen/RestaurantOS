@@ -12,11 +12,25 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 NOT_BUILT: dict[str, str] = {}
+
+
+def _finite_float(text: str) -> float:
+    """An argparse type that rejects nan and the infinities up front: the
+    control side would refuse them too, but only after the request
+    crossed the wire, and `nan` would silently sort past `type=float`."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid float value: {text!r}") from None
+    if not math.isfinite(value):
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite number")
+    return value
 
 
 def _add_engine_args(parser: argparse.ArgumentParser) -> None:
@@ -510,16 +524,22 @@ def build_parser() -> argparse.ArgumentParser:
     scenario.add_argument("name", help="T1, T1b, T2, T3, T4, T5, T6, or list")
     scenario.add_argument("--region", dest="region_id", default=None, help="default r1")
     scenario.add_argument("--from-day", type=int, default=None, help="default: the next unused day")
-    scenario.add_argument("--speed", type=float, default=None, help="default: the playback speed")
+    scenario.add_argument(
+        "--speed", type=_finite_float, default=None, help="default: the playback speed"
+    )
     scenario.add_argument("--seed", type=int, default=None)
     scenario.add_argument(
         "--inject-at", default=None, help="simulated time of day the fault starts (11:00:00)"
     )
-    scenario.add_argument("--fault-s", type=float, default=None, help="how long the fault holds")
-    scenario.add_argument("--settle-s", type=float, default=None, help="load after the heal")
-    scenario.add_argument("--kill-after-s", type=float, default=None, help="T3")
-    scenario.add_argument("--down-s", type=float, default=None, help="T3")
-    scenario.add_argument("--duplicate-rate", type=float, default=None, help="T4")
+    scenario.add_argument(
+        "--fault-s", type=_finite_float, default=None, help="how long the fault holds"
+    )
+    scenario.add_argument(
+        "--settle-s", type=_finite_float, default=None, help="load after the heal"
+    )
+    scenario.add_argument("--kill-after-s", type=_finite_float, default=None, help="T3")
+    scenario.add_argument("--down-s", type=_finite_float, default=None, help="T3")
+    scenario.add_argument("--duplicate-rate", type=_finite_float, default=None, help="T4")
     scenario.add_argument(
         "--shuffle", action=argparse.BooleanOptionalAction, default=None, help="T4"
     )

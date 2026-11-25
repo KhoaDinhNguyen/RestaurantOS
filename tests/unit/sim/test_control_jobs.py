@@ -67,6 +67,27 @@ async def test_scenario_refusals(setup) -> None:
     assert "heal them first" in live.json()["message"]
 
 
+async def test_refused_over_unexplained_link_state(setup) -> None:
+    world, _jobs, client = setup
+    world.faults.links_answer = [
+        {
+            "group": "link:r1<->hq",
+            "unexplained": {"disabled": ["gateway__r1-primary"], "toxics": [], "missing": []},
+        }
+    ]
+    answer = await client.post("/sim/scenarios/T2")
+    assert answer.status_code == 409 and answer.json()["error"] == "scenario_refused"
+    assert "gateway__r1-primary" in answer.json()["message"]
+    assert "heal-all" in answer.json()["message"]
+
+
+async def test_refused_with_501_while_the_checker_is_missing(setup) -> None:
+    world, _jobs, client = setup
+    world.env.ready = lambda: "the checker is not on this branch (sim/checker.py, PR #33)"
+    answer = await client.post("/sim/scenarios/T2")
+    assert answer.status_code == 501 and answer.json()["error"] == "not_built"
+
+
 async def test_one_job_at_a_time(setup) -> None:
     _world, jobs, client = setup
     first = (await client.post("/sim/scenarios/T5", json={"fault_s": 5})).json()

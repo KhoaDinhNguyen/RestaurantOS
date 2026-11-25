@@ -85,9 +85,10 @@ def add_job_routes(
             spec, _params = parse_params(name, body, scenarios.cluster)
         except ScenarioError as error:
             return error_response(error.status, error.code, str(error))
-        reason = refuse_reason(scenarios)
+        reason = await refuse_reason(scenarios)
         if reason is not None:
-            return error_response(409, "scenario_refused", reason)
+            status, code, message = reason
+            return error_response(status, code, message)
         holder: dict[str, str] = {}
 
         async def work() -> dict[str, Any]:

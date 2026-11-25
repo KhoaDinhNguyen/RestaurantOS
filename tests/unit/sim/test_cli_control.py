@@ -386,3 +386,13 @@ def test_scenario_refusal_and_list(capsys) -> None:
     assert "a run is live" in capsys.readouterr().err
     assert control_cli.run(_args(["scenario", "list"]), transport=transport) == 0
     assert json.loads(capsys.readouterr().out) == [{"name": "T1"}]
+
+
+def test_scenario_flags_reject_non_finite_numbers() -> None:
+    for bad in ("nan", "inf", "-inf"):
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["scenario", "T5", "--fault-s", bad])
+        with pytest.raises(SystemExit):
+            build_parser().parse_args(["scenario", "T5", "--speed", bad])
+    args = _args(["scenario", "T5", "--fault-s", "2.5", "--duplicate-rate", "0.1"])
+    assert args.fault_s == 2.5 and args.duplicate_rate == 0.1
