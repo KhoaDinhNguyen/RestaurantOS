@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import threading
 from collections.abc import Iterable
@@ -338,6 +339,16 @@ class FakeHost:
     async def heal_all(self) -> bool:
         self.healed = True
         return True
+
+
+@pytest.fixture(autouse=True)
+def _no_sim_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every SimSettings here is its defaults plus what the test passes
+    (all with _env_file=None): a developer's ROS_SIM_* must not change a
+    snapshot test - the manual command, the offset floor and the waits
+    all read them."""
+    for key in [key for key in os.environ if key.startswith("ROS_SIM_")]:
+        monkeypatch.delenv(key)
 
 
 # what the `world` fixture hands each test: the snapshot context and the
