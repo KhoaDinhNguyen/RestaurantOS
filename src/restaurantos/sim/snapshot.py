@@ -94,6 +94,42 @@ def frontier_seconds(status: dict[str, Any]) -> int | None:
     )
 
 
+def held_seconds(status: dict[str, Any]) -> int | None:
+    """The earliest order the engine pulled but has not sent (shuffle
+    holds up to a window of them), absolute simulated seconds."""
+    return sim_seconds(
+        {"sim_day": status.get("held_sim_day"), "sim_time": status.get("held_sim_time")}
+    )
+
+
+def _hhmm(seconds: int) -> str:
+    return f"{seconds // 3600:02d}:{seconds % 3600 // 60:02d}"
+
+
+def point_problem(status: dict[str, Any], minimum: int) -> str | None:
+    """Why the run cannot be snapshotted where it stands, or None.
+
+    Restore replays the frontier's day from midnight, so the point must
+    stand `minimum` into that day (the previous day's events are out by
+    then), and no order of an EARLIER day may still be held back unsent:
+    with shuffle on, a held order can trail the frontier, and at night a
+    window of orders can span 00:30 - the replay of the next day would
+    never send it."""
+    frontier = frontier_seconds(status)
+    if frontier is None:
+        return "nothing dispatched yet"
+    if frontier % SECONDS_PER_DAY < minimum:
+        return f"dispatch stands at {_at(frontier)}, before {_hhmm(minimum)} of its day"
+    held = held_seconds(status)
+    midnight = frontier - frontier % SECONDS_PER_DAY
+    if held is not None and held < midnight:
+        return (
+            f"an order of {_at(held)} is still held back unsent (shuffle) while dispatch "
+            f"stands at {_at(frontier)}"
+        )
+    return None
+
+
 def offset_floor(engine: dict[str, Any]) -> int:
     """The least a snapshot's point may stand into its day, for the engine
     that runs the run (its `engine` block in `GET /sim/playback`).
@@ -367,21 +403,18 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
     still = 0.0
     while True:
         frontier = frontier_seconds(status)
-        if frontier is not None and frontier % SECONDS_PER_DAY >= minimum:
+        problem = point_problem(status, minimum)
+        if problem is None:
             break
         if not was_running or status.get("state") != "running":
-            where = "nothing dispatched yet" if frontier is None else f"at {_at(frontier)}"
             raise SnapshotError(
-                f"the run's dispatch stands {where}, before "
-                f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day: the restored "
-                "day is replayed from midnight, so resume the run past that time first"
+                f"cannot snapshot here: {problem}. The restored day is replayed from "
+                "midnight - resume the run until that clears first"
             )
         if still >= ctx.sim.snapshot_drain_timeout_s:
-            where = "before its first item" if frontier is None else f"at {_at(frontier)}"
             raise SnapshotError(
-                f"the run's dispatch has not moved for {still:g} s ({where}), before "
-                f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day: no snapshot "
-                "- is the target answering?"
+                f"the run's dispatch has not moved for {still:g} s and {problem}: no "
+                "snapshot - is the target answering?"
             )
         await ctx.sleep(0.1)
         status = await ctx.playback.status() or {}
@@ -407,15 +440,11 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
                 )
             await ctx.sleep(0.2)
             waited += 0.2
-        # the frontier is frozen now; it can only have moved forward since
-        # the read above, but forward across midnight lands before the minimum
-        frontier = frontier_seconds(status)
-        if frontier is None or frontier % SECONDS_PER_DAY < minimum:
-            where = "nothing dispatched" if frontier is None else f"at {_at(frontier)}"
-            raise SnapshotError(
-                f"the run's dispatch stopped {where}, before "
-                f"{minimum // 3600:02d}:{minimum % 3600 // 60:02d} of its day - try again"
-            )
+        # dispatch is frozen now; it may have moved since the read above -
+        # across midnight, or past a held order's day - so check again
+        problem = point_problem(status, minimum)
+        if problem is not None:
+            raise SnapshotError(f"dispatch moved before the pause took: {problem} - try again")
         return status, was_running
     except BaseException as error:
         if not was_running:

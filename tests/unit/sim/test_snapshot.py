@@ -166,6 +166,9 @@ class FakeHost:
         self.lag = 0
         # once set, the frontier reported after the pause (to cross midnight)
         self.frontier_after_pause: int | None = None
+        # the earliest order held back unsent (shuffle), absolute
+        # simulated seconds; a callable sees the host, for a moving one
+        self.held: Any = None
         self.dispatched = True
         # failure injection: status() raises once the run is paused; a
         # resume answers 500
@@ -195,6 +198,14 @@ class FakeHost:
             return self.frontier_after_pause
         return self.day * 86400 + int(self.offset) - self.lag
 
+    def _held_fields(self) -> dict[str, Any]:
+        held = self.held(self) if callable(self.held) else self.held
+        if held is None:
+            return {"held_sim_day": None, "held_sim_time": None}
+        day, rest = divmod(held, 86400)
+        moment = f"{rest // 3600:02d}:{rest % 3600 // 60:02d}:{rest % 60:02d}"
+        return {"held_sim_day": day, "held_sim_time": moment}
+
     async def status(self) -> dict | None:
         if not self.alive:
             return None
@@ -216,6 +227,7 @@ class FakeHost:
                 else None
             ),
             "engine": self.engine,
+            **self._held_fields(),
         }
         if self.state == "paused" and self.inflight and self.status_drains:
             self.inflight -= 1
@@ -486,6 +498,34 @@ async def test_save_gives_up_on_a_dispatch_that_does_not_move(world: World) -> N
     assert host.commands == [] and docker.calls == []
 
 
+async def test_save_waits_for_a_held_order_of_the_previous_day(world: World) -> None:
+    """Shuffle held a day-22 order back while dispatch went past 00:30 of
+    day 23: save waits until it is sent (the day-23 replay would never
+    send it)."""
+    ctx, host, _, _, _ = world
+    host.offset = 3600  # dispatch at day 23 01:00
+    host.held = lambda h: 22 * 86400 + 86000 if h.offset < 4000 else None
+    record = await save("held", ctx)
+    assert record["sim_day"] == 23 and host.offset >= 4000
+
+
+async def test_a_paused_run_with_a_held_order_of_the_previous_day_is_refused(
+    world: World,
+) -> None:
+    ctx, host, docker, _, _ = world
+    host.state, host.held = "paused", 22 * 86400 + 86000
+    with pytest.raises(SnapshotError, match="still held back"):
+        await save("held", ctx)
+    assert docker.calls == []
+
+
+async def test_a_held_order_of_the_same_day_is_replayed_and_fine(world: World) -> None:
+    ctx, host, _, _, _ = world
+    host.held = 23 * 86400 + 600  # earlier than the frontier, but day 23
+    record = await save("same-day", ctx)
+    assert record["sim_day"] == 23
+
+
 async def test_save_refuses_a_paused_run_that_dispatched_nothing(world: World) -> None:
     ctx, host, docker, _, _ = world
     host.state, host.dispatched = "paused", False
@@ -497,7 +537,7 @@ async def test_save_refuses_a_paused_run_that_dispatched_nothing(world: World) -
 async def test_save_refuses_a_run_paused_before_half_past_midnight(world: World) -> None:
     ctx, host, docker, _, _ = world
     host.state, host.offset = "paused", 600
-    with pytest.raises(SnapshotError, match="resume the run past that time"):
+    with pytest.raises(SnapshotError, match="before 00:30 of its day"):
         await save("early", ctx)
     assert docker.calls == []
     assert not (ctx.snapshot_dir / "early").exists()
