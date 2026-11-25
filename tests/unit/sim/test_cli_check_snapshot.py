@@ -15,6 +15,7 @@ def test_parsers() -> None:
     parser = build_parser()
     check = parser.parse_args(["check", "--run", "a", "--run", "a-r1", "--allow-unacked"])
     assert check.runs == ["a", "a-r1"] and check.allow_unacked and not check.json
+    assert check.port is None
     with pytest.raises(SystemExit):
         parser.parse_args(["check"])
     restore = parser.parse_args(["snapshot", "restore", "s1", "--replace-cluster-file"])
@@ -75,10 +76,19 @@ def test_check_asks_the_playback_host_for_the_live_run(monkeypatch, capsys, tmp_
         seen.update(kwargs)
         raise CheckError("run a is still live on the playback host")
 
-    monkeypatch.setattr(jobs_cli, "_live_run", lambda sim: "a")
+    ports: list = []
+
+    def live_run(sim, port=None):
+        ports.append(port)
+        return "a"
+
+    monkeypatch.setattr(jobs_cli, "_live_run", live_run)
     monkeypatch.setattr(jobs_cli, "run_check", run_check)
     assert app(["check", "--run", "a", "--config", str(cluster_file)]) == 1
     assert seen["live_run"] == "a"
+    # --port asks the playback host on that port, like snapshot save/restore
+    assert app(["check", "--run", "a", "--config", str(cluster_file), "--port", "8099"]) == 1
+    assert ports == [None, 8099]
     assert "still live" in capsys.readouterr().err
 
 
@@ -114,3 +124,26 @@ def test_snapshot_restore_passes_the_services_mode(monkeypatch, capsys, tmp_path
     argv = ["snapshot", "restore", "s1", "--services", "none", "--config", str(cluster_file)]
     assert app(argv) == 0
     assert seen == {"name": "s1", "services": "none"}
+
+
+def test_live_run_asks_the_given_port(monkeypatch) -> None:
+    import restaurantos.sim.snapshot as snapshot
+    from restaurantos.sim.config import SimSettings
+
+    bases: list[str] = []
+
+    class Client:
+        def __init__(self, base, timeout_s):
+            bases.append(base)
+
+        async def status(self):
+            return {"state": "running", "run_id": "a"}
+
+    monkeypatch.setattr(snapshot, "PlaybackClient", Client)
+    sim = SimSettings(_env_file=None)
+    assert jobs_cli._live_run(sim, 8099) == "a"
+    assert jobs_cli._live_run(sim) == "a"
+    assert bases == [
+        f"http://{sim.control_host}:8099",
+        f"http://{sim.control_host}:{sim.control_port}",
+    ]

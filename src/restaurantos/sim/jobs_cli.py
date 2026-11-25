@@ -21,14 +21,15 @@ def _cluster_file(args: argparse.Namespace) -> Path:
     return Path(args.config or get_settings().cluster_file)
 
 
-def _live_run(sim) -> str | None:
-    """The run the playback host is still running, pausing or stopping;
-    None when there is none or no host listens. A host that cannot be
-    asked is said, and the check goes on."""
+def _live_run(sim, port: int | None = None) -> str | None:
+    """The run the playback host on `port` (default the configured control
+    port) is still running, pausing or stopping; None when there is none
+    or no host listens. A host that cannot be asked is said, and the check
+    goes on."""
     from restaurantos.sim.snapshot import LIVE_STATES, PlaybackClient
 
     client = PlaybackClient(
-        f"http://{sim.control_host}:{sim.control_port}", timeout_s=sim.http_timeout_s
+        f"http://{sim.control_host}:{port or sim.control_port}", timeout_s=sim.http_timeout_s
     )
     try:
         status = asyncio.run(client.status())
@@ -58,7 +59,7 @@ def check_command(args: argparse.Namespace) -> int:
             allow_unacked=args.allow_unacked,
             drain_timeout_s=sim.check_drain_timeout_s,
             poll_s=sim.check_poll_s,
-            live_run=_live_run(sim),
+            live_run=_live_run(sim, args.port),
         )
     except (CheckError, OSError, ValueError) as error:
         print(f"rosctl check: {error}", file=sys.stderr)

@@ -854,7 +854,7 @@ Browsers decide same-site by scheme + registrable domain, ignoring the port: `ht
 
   `duplicates` entries are `{"external_order_id", "where": "regions", "regions"}` or `{"external_order_id", "where": "hq", "count"}`; `unaccounted` entries are `{"external_order_id", "reason", "region_id"}` (Section 7.5 lists the reasons). `stored_unacked` fails the check unless `allow_unacked` is true.
 
-- The same code runs as `rosctl check --run <run_id> [--run ...] [--allow-unacked] [--json]` (exit 0 on pass, 1 on fail) and `rosctl snapshot save|restore|list`.
+- The same code runs as `rosctl check --run <run_id> [--run ...] [--allow-unacked] [--json] [--port <control port>]` (exit 0 on pass, 1 on fail; `--port` is the playback host it asks whether a run is still live, as for `rosctl snapshot`) and `rosctl snapshot save|restore|list`.
 
 ## 7. Simulation harness
 

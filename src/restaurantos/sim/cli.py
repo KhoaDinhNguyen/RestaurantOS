@@ -324,6 +324,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check.add_argument("--json", action="store_true", help="print the Section 6.3 result")
     check.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="the playback host's control port, asked whether a run is still live "
+        "(default ROS_SIM_CONTROL_PORT)",
+    )
+    check.add_argument(
         "--config",
         type=Path,
         default=None,
