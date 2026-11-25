@@ -54,7 +54,7 @@ from restaurantos.common.simclock import SECONDS_PER_DAY
 from restaurantos.sim.checker import RESUMED_FROM, run_chain
 from restaurantos.sim.config import SimSettings
 from restaurantos.sim.timeline import EVENT_SCHEDULE
-from restaurantos.sim.toxiproxy import Toxiproxy
+from restaurantos.sim.toxiproxy import STREAMS, Toxiproxy
 
 _NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SNAPSHOT_FILE = "snapshot.json"
@@ -912,11 +912,40 @@ def _saved_proxies(name: str, snap: Path) -> list[dict[str, Any]]:
         if not isinstance(proxy.get("enabled", True), bool):
             raise bad(f"{proxy['name']}: enabled is not true or false")
         toxics = proxy.get("toxics") or []
-        if not isinstance(toxics, list) or not all(
-            isinstance(toxic, dict) and isinstance(toxic.get("name"), str) for toxic in toxics
-        ):
-            raise bad(f"{proxy['name']}: toxics is not a list of named toxics")
+        if not isinstance(toxics, list):
+            raise bad(f"{proxy['name']}: toxics is not a list")
+        proxy["toxics"] = [_saved_toxic(proxy["name"], toxic, bad) for toxic in toxics]
     return saved
+
+
+def _saved_toxic(proxy: str, toxic: Any, bad: Callable[[str], SnapshotError]) -> dict[str, Any]:
+    """One saved toxic, checked and normalised to exactly what restore
+    passes to Toxiproxy.add_toxic: a name, a type, a stream (upstream or
+    downstream; downstream when absent, Toxiproxy's own default), a
+    toxicity in [0, 1] and an attributes object."""
+    if not isinstance(toxic, dict) or not isinstance(toxic.get("name"), str):
+        raise bad(f"{proxy}: a toxic has no name")
+    where = f"{proxy}/{toxic['name']}"
+    if not isinstance(toxic.get("type"), str) or not toxic["type"]:
+        raise bad(f"{where}: no toxic type")
+    stream = toxic.get("stream") or "downstream"
+    if stream not in STREAMS:
+        raise bad(f"{where}: stream {stream!r} is not one of {', '.join(STREAMS)}")
+    toxicity = toxic.get("toxicity", 1.0)
+    if isinstance(toxicity, bool) or not isinstance(toxicity, int | float):
+        raise bad(f"{where}: toxicity is not a number")
+    if not 0.0 <= float(toxicity) <= 1.0:
+        raise bad(f"{where}: toxicity {toxicity} is outside [0, 1]")
+    attributes = toxic.get("attributes") or {}
+    if not isinstance(attributes, dict):
+        raise bad(f"{where}: attributes is not an object")
+    return {
+        "name": toxic["name"],
+        "type": toxic["type"],
+        "stream": stream,
+        "toxicity": float(toxicity),
+        "attributes": attributes,
+    }
 
 
 def _saved_runs(record: dict[str, Any]) -> list[str]:
@@ -1042,14 +1071,15 @@ async def _restore_toxiproxy(
             if not proxy.get("enabled", True) and name not in later:
                 await toxiproxy.set_enabled(name, False)
                 cut.append(name)
+            # checked and normalised by _saved_toxic in the pre-check
             for toxic in proxy.get("toxics") or []:
                 await toxiproxy.add_toxic(
                     name,
-                    str(toxic.get("type")),
-                    dict(toxic.get("attributes") or {}),
-                    stream=str(toxic.get("stream") or "downstream"),
-                    name=str(toxic["name"]) if toxic.get("name") else None,
-                    toxicity=float(toxic.get("toxicity", 1.0)),
+                    toxic["type"],
+                    dict(toxic["attributes"]),
+                    stream=toxic["stream"],
+                    name=toxic["name"],
+                    toxicity=toxic["toxicity"],
                 )
     finally:
         await toxiproxy.aclose()

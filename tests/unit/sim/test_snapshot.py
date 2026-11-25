@@ -902,6 +902,11 @@ async def test_a_failed_automatic_start_drops_the_reserved_link(world: World) ->
         '[{"enabled": false}]',
         '[{"name": "x", "enabled": "no"}]',
         '[{"name": "x", "toxics": [{"type": "latency"}]}]',
+        '[{"name": "x", "toxics": [{"name": "t", "type": "latency", "stream": "sideways"}]}]',
+        '[{"name": "x", "toxics": [{"name": "t"}]}]',
+        '[{"name": "x", "toxics": [{"name": "t", "type": "latency", "toxicity": 1.5}]}]',
+        '[{"name": "x", "toxics": [{"name": "t", "type": "latency", "toxicity": "all"}]}]',
+        '[{"name": "x", "toxics": [{"name": "t", "type": "latency", "attributes": [1]}]}]',
     ],
 )
 async def test_restore_refuses_a_malformed_toxiproxy_file_first(world: World, content: str) -> None:
@@ -1249,6 +1254,36 @@ async def test_restore_with_the_flag_replaces_the_cluster_file(world: World) -> 
     assert ctx.cluster_file.read_text() == TOML
     assert result["cluster_file_replaced"] is True
     assert "restart any process" in result["warnings"][0]
+
+
+def test_saved_toxics_are_normalised_to_what_add_toxic_takes(tmp_path: Path) -> None:
+    from restaurantos.sim.snapshot import _saved_proxies
+
+    (tmp_path / "toxiproxy.json").write_text(
+        json.dumps(
+            [
+                {
+                    "name": "p",
+                    "enabled": True,
+                    "toxics": [
+                        {"name": "up", "type": "latency", "stream": "upstream", "toxicity": 1},
+                        {"name": "down", "type": "timeout", "attributes": {"timeout": 0}},
+                    ],
+                }
+            ]
+        )
+    )
+    toxics = _saved_proxies("s", tmp_path)[0]["toxics"]
+    assert toxics == [
+        {"name": "up", "type": "latency", "stream": "upstream", "toxicity": 1.0, "attributes": {}},
+        {
+            "name": "down",
+            "type": "timeout",
+            "stream": "downstream",
+            "toxicity": 1.0,
+            "attributes": {"timeout": 0},
+        },
+    ]
 
 
 async def test_restore_names_the_old_shapes_databases_it_leaves(world: World) -> None:
