@@ -276,6 +276,9 @@ def test_control_serves_playback_and_control_routes(tmp_path, monkeypatch, fresh
         "/sim/jobs/{job_id}",
         "/sim/scenarios",
         "/sim/scenarios/{name}",
+        "/sim/snapshots",
+        "/sim/snapshots/{name}/restore",
+        "/sim/check",
     } <= paths
     # the scenarios get the engine's own defaults
     engine = captured["scenario_engine"]

@@ -1,7 +1,9 @@
-"""The job routes: the scenarios over HTTP (architecture Section 6.3),
-on the fake world of test_scenarios."""
+"""The job routes: scenarios, snapshots, restore and the checker over
+HTTP (architecture Section 6.3), on the fake world of test_scenarios."""
 
 from __future__ import annotations
+
+import sys
 
 import httpx
 import pytest
@@ -72,3 +74,46 @@ async def test_one_job_at_a_time(setup) -> None:
     assert busy.status_code == 409
     assert busy.json()["error"] == "busy" and busy.json()["job_id"] == first["job_id"]
     await jobs.wait(first["job_id"])
+
+
+async def test_check_and_snapshots_answer_501_without_their_modules(setup, monkeypatch) -> None:
+    _world, _jobs, client = setup
+    monkeypatch.setitem(sys.modules, "restaurantos.sim.checker", None)
+    monkeypatch.setitem(sys.modules, "restaurantos.sim.snapshot", None)
+    check = await client.post("/sim/check", json={"runs": ["r"]})
+    assert check.status_code == 501 and check.json()["error"] == "not_built"
+    assert (await client.get("/sim/snapshots")).status_code == 501
+    assert (await client.post("/sim/snapshots", json={"name": "a"})).status_code == 501
+    assert (await client.post("/sim/snapshots/a/restore")).status_code == 501
+
+
+async def test_check_validates_its_runs(setup) -> None:
+    pytest.importorskip("restaurantos.sim.checker")
+    world, jobs, client = setup
+    missing = await client.post("/sim/check", json={"runs": ["nope"]})
+    assert missing.status_code == 404 and missing.json()["error"] == "unknown_run"
+    empty = await client.post("/sim/check", json={"runs": []})
+    assert empty.status_code == 422
+    # a run that is still live is refused
+    await world.playback.start(
+        seed=0, from_day=14, to_day=99, speed=1.0, run_id="live-1", meta_extra={}
+    )
+    live = await client.post("/sim/check", json={"runs": ["live-1"]})
+    assert live.status_code == 409 and live.json()["error"] == "run_live"
+
+
+async def test_snapshot_names_are_checked(setup, monkeypatch, tmp_path) -> None:
+    pytest.importorskip("restaurantos.sim.snapshot")
+    from restaurantos.sim.config import get_sim_settings
+
+    get_sim_settings.cache_clear()
+    monkeypatch.setenv("ROS_SIM_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
+    _world, _jobs, client = setup
+    bad = await client.post("/sim/snapshots", json={"name": "../x"})
+    assert bad.status_code == 422 and bad.json()["error"] == "invalid_name"
+    (tmp_path / "snapshots" / "taken").mkdir(parents=True)
+    taken = await client.post("/sim/snapshots", json={"name": "taken"})
+    assert taken.status_code == 409 and taken.json()["error"] == "snapshot_exists"
+    unknown = await client.post("/sim/snapshots/nope/restore")
+    assert unknown.status_code == 404 and unknown.json()["error"] == "unknown_snapshot"
+    get_sim_settings.cache_clear()

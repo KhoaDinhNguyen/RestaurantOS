@@ -751,11 +751,11 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
 | `DELETE /sim/faults/{fault_id}`, `POST /sim/faults/heal-all` | remove faults | required |
 | `POST /sim/nodes/{node_id}/kill`, `POST /sim/nodes/{node_id}/start` | real crash (T1b) and restart | required |
 | `GET /sim/scenarios`, `POST /sim/scenarios/{name}` | list the scripted scenarios; run one (`T1`, `T1b`, `T2` to `T6`, Section 7.3) | built (WP6b) |
-| `GET /sim/snapshots`, `POST /sim/snapshots`, `POST /sim/snapshots/{name}/restore` | Section 7.4 | optional |
-| `POST /sim/check` | run the invariant checker | optional |
+| `GET /sim/snapshots`, `POST /sim/snapshots`, `POST /sim/snapshots/{name}/restore` | Section 7.4 | built (WP6b) |
+| `POST /sim/check` | run the invariant checker | built (WP6b) |
 | `GET /sim/jobs/{job_id}` | progress of a scenario, snapshot, restore or check | built (WP6b) |
 
-"Optional" routes must work as `rosctl` commands; putting them on the Ops view is extra. Their shapes are fixed here either way. The scenarios run as jobs in the control process.
+"Optional" routes must work as `rosctl` commands; putting them on the Ops view is extra. Their shapes are fixed here either way. All of them are built now: the last four rows run as jobs in the control process.
 
 **Playback.** `GET /sim/clock` answers `{"state", "sim_day", "sim_time", "speed"}`. Before the first run the last three are `null`: there is no "today" yet, and a screen should ask for a day. The clock shows how far the replay got, never how long cleanup took. While a run is paused it stands where the pause caught it. After a normal end it stands at the last item's own instant, the same on every run. After a stop it stands at the moment the stop was accepted, and after a failure at the moment the run failed. From then on it does not move, including while the state is still `stopping`. `state` is `idle`, `running`, `paused`, `stopping`, `done`, `stopped` or `failed`.
 
