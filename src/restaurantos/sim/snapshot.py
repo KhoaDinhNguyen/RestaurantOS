@@ -41,7 +41,14 @@ from typing import Any
 
 import httpx
 
-from restaurantos.common.cluster import BASELINE, HQ_PRIMARY, Cluster, load_cluster, proxies
+from restaurantos.common.cluster import (
+    BASELINE,
+    HQ_PRIMARY,
+    HQ_STANDBY,
+    Cluster,
+    load_cluster,
+    proxies,
+)
 from restaurantos.common.simclock import SECONDS_PER_DAY
 from restaurantos.sim.checker import RESUMED_FROM, run_chain
 from restaurantos.sim.config import SimSettings
@@ -637,8 +644,16 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
         first_error: BaseException | None = None
         try:
             # the stop is inside: one that fails half way has still
-            # stopped some databases, and they come back below
-            await asyncio.to_thread(docker.stop, services)
+            # stopped some databases, and they come back below. HQ goes
+            # FIRST: the coordinator acts only with exactly one reachable
+            # writable HQ, so with HQ down it decides nothing while the
+            # regions stop. Stopped all at once, Compose stops a standby
+            # before its primary with HQ still up, and a synchronous
+            # cluster's coordinator would downgrade that primary to async
+            # and record it - into the snapshot.
+            hq_nodes = [node for node in services if node in (HQ_PRIMARY, HQ_STANDBY)]
+            await asyncio.to_thread(docker.stop, hq_nodes)
+            await asyncio.to_thread(docker.stop, [n for n in services if n not in hq_nodes])
             for node in services:
                 await asyncio.to_thread(docker.archive, volume_name(node), partial, image)
             (partial / SNAPSHOT_FILE).write_text(

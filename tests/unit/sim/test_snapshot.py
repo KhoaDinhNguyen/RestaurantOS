@@ -375,6 +375,9 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
 
 
 DATABASES = (*CLUSTER.nodes, BASELINE)
+# save stops HQ first, then the rest
+HQ_DATABASES = ("hq-primary", "hq-standby")
+OTHER_DATABASES = tuple(node for node in DATABASES if node not in HQ_DATABASES)
 
 
 def test_helpers() -> None:
@@ -399,8 +402,9 @@ async def test_save_pauses_archives_every_database_and_resumes(world: World) -> 
     snap = ctx.snapshot_dir / "before-t2"
     assert snap.is_dir() and not (ctx.snapshot_dir / ".before-t2.partial").exists()
     assert [body["action"] for body in host.commands] == ["pause", "resume"]
-    # only the PostgreSQL services stop: Toxiproxy keeps its faults
-    assert docker.calls[0] == ("stop", DATABASES)
+    # only the PostgreSQL services stop: Toxiproxy keeps its faults; HQ
+    # first, so the coordinator decides nothing while the regions stop
+    assert docker.calls[:2] == [("stop", HQ_DATABASES), ("stop", OTHER_DATABASES)]
     assert docker.calls[-1] == ("start", DATABASES)
     assert {call[1] for call in docker.calls if call[0] == "archive"} == {
         volume_name(node) for node in DATABASES
@@ -704,7 +708,7 @@ async def test_a_half_failed_stop_still_brings_the_databases_back(world: World) 
     docker.fail_stop = True
     with pytest.raises(SnapshotError, match="did not stop"):
         await save("half", ctx)
-    assert docker.calls == [("stop", DATABASES), ("start", DATABASES)]
+    assert docker.calls == [("stop", HQ_DATABASES), ("start", DATABASES)]
     # back and healthy, so the run resumes
     assert [body["action"] for body in host.commands] == ["pause", "resume"]
     assert not (ctx.snapshot_dir / "half").exists()
@@ -754,7 +758,7 @@ async def test_save_without_a_cluster_is_refused(world: World) -> None:
     docker.image = None
     with pytest.raises(SnapshotError, match="no hq-primary container"):
         await save("nothing", ctx)
-    assert ("stop", DATABASES) not in docker.calls
+    assert not any(call[0] == "stop" for call in docker.calls)
     assert host.state == "running"
 
 
