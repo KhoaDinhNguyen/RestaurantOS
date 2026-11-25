@@ -1036,7 +1036,12 @@ def engine_mismatches(run: dict[str, Any], host: dict[str, Any] | None) -> list[
 
 
 def _num(value: Any) -> str:
-    return f"{float(value):g}"
+    """A number for a command the replay will parse: exact (the shortest
+    text that reads back as the same float), never rounded - `:g` keeps 6
+    digits, and a duplicate rate of 1/3 replayed as 0.333333 resends a
+    different set of orders. Display text keeps `:g`."""
+    text = repr(float(value))
+    return text.removesuffix(".0")
 
 
 def _api_base(url: str) -> str:

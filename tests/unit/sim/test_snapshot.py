@@ -1196,6 +1196,16 @@ def test_a_setting_the_run_overrode_comes_back_as_a_flag() -> None:
     assert "--skip-first-restock" in command
 
 
+def test_the_manual_command_keeps_numbers_exact() -> None:
+    import shlex
+
+    rate = 1 / 3
+    command, _ = _command({"duplicate_rate": rate, "engine": ENGINE})
+    words = shlex.split(command)
+    assert float(words[words.index("--duplicate-rate") + 1]) == rate
+    assert "--speed 1000 " in command + " "  # whole numbers stay short
+
+
 def test_the_engine_flags_of_a_sequential_edge_run() -> None:
     from restaurantos.sim.regions import edge_target_url
 
