@@ -1487,8 +1487,22 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         raise SnapshotError(f"no {HQ_PRIMARY} container after compose up --no-start")
     _check_image(saved_image, found, "nothing is unpacked yet; the databases are stopped")
     image = found[0]
-    for node in services:
-        await asyncio.to_thread(docker.unpack, volume_name(node), snap, image)
+    abort = threading.Event()
+
+    def unpack_all() -> None:
+        for node in services:
+            if abort.is_set():
+                raise SnapshotError("cancelled")
+            docker.unpack(volume_name(node), snap, image)
+
+    # one worker for every volume, waited for even when cancelled (Ctrl-C,
+    # or a cancelled job): an unpack thread cannot be stopped, and nothing
+    # may touch the volumes while it writes; it stops at its next volume
+    unpack_error, cancelled = await _to_completion(unpack_all, on_cancel=abort.set)
+    if cancelled is not None:
+        raise cancelled
+    if unpack_error is not None:
+        raise unpack_error
     # the run and its whole history, as they were at the snapshot
     for run_id in _saved_runs(record):
         target = ctx.runs_dir / run_id

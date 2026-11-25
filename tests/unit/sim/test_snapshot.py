@@ -118,6 +118,8 @@ class FakeDocker:
         # container mode: the service entries running as containers
         self.running_containers: set[str] = set()
         self.archiving = threading.Event()
+        self.unpack_gate: threading.Event | None = None
+        self.unpacking = threading.Event()
         # (image id, name) of hq-primary's container; None: no container
         self.image: tuple[str, str] | None = ("sha256:pg18", "postgres:18-test")
 
@@ -161,6 +163,9 @@ class FakeDocker:
 
     def unpack(self, volume: str, in_dir: Path, image: str) -> None:
         assert self.image is not None and image == self.image[0]
+        if self.unpack_gate is not None:
+            self.unpacking.set()
+            assert self.unpack_gate.wait(5.0)
         assert (in_dir / f"{volume}.tar.gz").is_file()
         self.calls.append(("unpack", volume))
 
@@ -999,6 +1004,25 @@ async def test_restore_refuses_services_running_both_ways(world: World) -> None:
     with pytest.raises(SnapshotError, match="both as host processes"):
         await restore("snap", ctx)
     assert docker.calls == [] and host.commands == [] and services == []
+
+
+async def test_cancelling_a_restore_waits_for_its_unpack_worker(world: World) -> None:
+    ctx, _, docker, _, _ = world
+    await save("snap", ctx)
+    docker.calls.clear()
+    docker.unpack_gate = threading.Event()
+    task = asyncio.create_task(restore("snap", ctx))
+    while not docker.unpacking.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0.1)
+    assert not task.done()  # the unpack thread still writes: wait for it
+    docker.unpack_gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # it stopped at its next volume; nothing ran after it
+    assert sum(1 for call in docker.calls if call[0] == "unpack") == 1
+    assert docker.calls[-1][0] == "unpack"
 
 
 async def test_save_without_a_run_records_no_run(world: World) -> None:
