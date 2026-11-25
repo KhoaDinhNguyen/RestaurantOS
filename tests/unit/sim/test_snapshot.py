@@ -194,6 +194,8 @@ class FakeHost:
         # overrides: the frontier, and the next item due (value or
         # callable); wall seconds the fake has slept
         self.frontier_fn: Any = None
+        # called on every GET /sim/clock (to pause a run mid catch-up)
+        self.on_clock: Any = None
         self.next_due: Any = None
         self.wall = 0.0
         self.dispatched = True
@@ -280,6 +282,8 @@ class FakeHost:
         return answer
 
     async def clock(self) -> dict:
+        if self.on_clock is not None:
+            self.on_clock(self)
         day, rest = self.day + int(self.offset) // 86400, int(self.offset) % 86400
         moment = f"{rest // 3600:02d}:{rest % 3600 // 60:02d}:{rest % 60:02d}"
         return {"state": self.state, "sim_day": day, "sim_time": moment, "speed": self.speed_value}
@@ -1134,6 +1138,35 @@ async def test_restore_puts_everything_back_and_replays_the_day(world: World) ->
     assert pointer["parent_run"] == "run-a" and pointer["snapshot"] == "snap"
     assert result["resume"]["started"] is True and result["resume"]["warnings"] == []
     assert result["cluster_file_replaced"] is False
+
+
+async def test_a_replay_paused_during_catch_up_gets_its_speed_back(world: World) -> None:
+    """Someone pauses the replay before the switch point: the saved speed
+    is set back while it is paused, not left at the catch-up speed."""
+    ctx, host, _, _, _ = world
+    await save("snap", ctx)
+
+    def pause_the_replay(h: FakeHost) -> None:
+        if h.run_id == "run-a-r1" and h.state == "running":
+            h.state = "paused"
+
+    host.on_clock = pause_the_replay
+    result = await restore("snap", ctx)
+    assert host.speeds == [1000.0] and host.state == "paused"
+    assert any("paused during catch-up" in w for w in result["resume"]["warnings"])
+
+
+async def test_a_replay_stopped_during_catch_up_is_left_alone(world: World) -> None:
+    ctx, host, _, _, _ = world
+    await save("snap", ctx)
+
+    def stop_the_replay(h: FakeHost) -> None:
+        if h.run_id == "run-a-r1":
+            h.state = "stopped"
+
+    host.on_clock = stop_the_replay
+    await restore("snap", ctx)
+    assert host.speeds == []
 
 
 async def test_restore_skips_the_restock_of_a_day_it_already_had(world: World) -> None:

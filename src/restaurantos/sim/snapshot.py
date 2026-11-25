@@ -1361,12 +1361,25 @@ async def _resume(
             if clock.get("state") != "running" or now is None or now >= switch_at:
                 break
             await ctx.sleep(0.05)
-        if clock.get("state") == "running":
-            changed = await ctx.playback.speed(saved_speed)
-            if changed.status_code != 200:
-                resume["warnings"].append(
-                    f"could not switch back to {saved_speed:g}x: {_message(changed)}"
-                )
+        # Running past the switch point, or paused before it (someone
+        # paused the replay during catch-up): either way the replay's own
+        # speed goes back now - a pause must not leave it at catch-up
+        # speed for when it resumes. Only this replay run: a stopped run,
+        # or another run started meanwhile, is left alone.
+        state = clock.get("state")
+        if state in LIVE_STATES:
+            current = await ctx.playback.status() or {}
+            if current.get("run_id") == new_run and current.get("state") in LIVE_STATES:
+                changed = await ctx.playback.speed(saved_speed)
+                if changed.status_code != 200:
+                    resume["warnings"].append(
+                        f"could not switch back to {saved_speed:g}x: {_message(changed)}"
+                    )
+                elif current.get("state") == "paused":
+                    resume["warnings"].append(
+                        f"the replay was paused during catch-up; its speed is back at "
+                        f"{saved_speed:g}x for when it resumes"
+                    )
     return resume
 
 
