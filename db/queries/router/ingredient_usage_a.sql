@@ -45,5 +45,5 @@ GROUP BY
     di.unit
 ORDER BY
     amount DESC,
-    di.ingredient_id ASC,
-    di.unit ASC;
+    di.ingredient_id COLLATE "C" ASC,  -- noqa: RF02
+    di.unit COLLATE "C" ASC;  -- noqa: RF02

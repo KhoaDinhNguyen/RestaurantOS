@@ -100,7 +100,7 @@ async def query_strategy_b_lines(
     *,
     region_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Ship every qualifying order line with its local dish link."""
+    """Ship every qualifying raw order line to the router."""
 
     async def work(conn) -> list[dict[str, Any]]:
         cursor = await conn.execute(
