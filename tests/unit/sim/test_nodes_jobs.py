@@ -119,3 +119,22 @@ async def test_aclose_cancels_a_running_job() -> None:
     await runner.aclose()
     assert runner.get(job.job_id).state == "failed"
     assert "cancelled" in (runner.get(job.job_id).error or "")
+
+
+async def test_a_job_reports_its_progress_while_it_runs() -> None:
+    runner = JobRunner()
+    release = asyncio.Event()
+
+    async def work() -> None:
+        await release.wait()
+
+    job = runner.submit("scenario", "T2", work)
+    assert job.as_dict()["progress"] is None
+    runner.set_progress(job.job_id, "T2: fault held, 30 s left")
+    assert runner.get(job.job_id).as_dict()["progress"] == "T2: fault held, 30 s left"
+    release.set()
+    await runner.wait(job.job_id)
+    # a finished job keeps its last line and takes no new one
+    runner.set_progress(job.job_id, "late")
+    assert runner.get(job.job_id).progress == "T2: fault held, 30 s left"
+    runner.set_progress("j99", "unknown jobs are ignored")

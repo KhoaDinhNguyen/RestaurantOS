@@ -161,6 +161,7 @@ async def test_jobs_route(app_and_client) -> None:
         "finished_at",
         "result",
         "error",
+        "progress",
     }
     release.set()
     await app.state.jobs.wait(job.job_id)

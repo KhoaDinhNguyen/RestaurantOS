@@ -502,6 +502,33 @@ def build_parser() -> argparse.ArgumentParser:
     job.add_argument("job_id")
     job.add_argument("--port", type=int, default=None, help="control port")
 
+    scenario = sub.add_parser(
+        "scenario",
+        help="run a fault scenario (T1, T1b, T2 to T6) on the control process and wait "
+        "for its verdict (exit 0 pass, 1 fail); `rosctl scenario list` shows them",
+    )
+    scenario.add_argument("name", help="T1, T1b, T2, T3, T4, T5, T6, or list")
+    scenario.add_argument("--region", dest="region_id", default=None, help="default r1")
+    scenario.add_argument("--from-day", type=int, default=None, help="default: the next unused day")
+    scenario.add_argument("--speed", type=float, default=None, help="default: the playback speed")
+    scenario.add_argument("--seed", type=int, default=None)
+    scenario.add_argument(
+        "--inject-at", default=None, help="simulated time of day the fault starts (11:00:00)"
+    )
+    scenario.add_argument("--fault-s", type=float, default=None, help="how long the fault holds")
+    scenario.add_argument("--settle-s", type=float, default=None, help="load after the heal")
+    scenario.add_argument("--kill-after-s", type=float, default=None, help="T3")
+    scenario.add_argument("--down-s", type=float, default=None, help="T3")
+    scenario.add_argument("--duplicate-rate", type=float, default=None, help="T4")
+    scenario.add_argument(
+        "--shuffle", action=argparse.BooleanOptionalAction, default=None, help="T4"
+    )
+    scenario.add_argument("--latency-ms", type=int, default=None, help="T5")
+    scenario.add_argument("--jitter-ms", type=int, default=None, help="T5")
+    scenario.add_argument("--reset-timeout-ms", type=int, default=None, help="T6")
+    scenario.add_argument("--json", action="store_true", help="print the whole result")
+    scenario.add_argument("--port", type=int, default=None, help="control port")
+
     for name, helptext in NOT_BUILT.items():
         sub.add_parser(name, help=helptext)
 
@@ -639,7 +666,7 @@ def app(argv: Sequence[str] | None = None) -> int:
         except ValueError as error:
             print(f"rosctl control: {error}", file=sys.stderr)
             return 1
-    if args.command in ("links", "fault", "node", "job"):
+    if args.command in ("links", "fault", "node", "job", "scenario"):
         from restaurantos.sim.control_cli import run as run_control_client
 
         return run_control_client(args)

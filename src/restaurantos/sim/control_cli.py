@@ -1,4 +1,5 @@
-"""`rosctl links`, `fault`, `node` and `job`: clients of the control process.
+"""`rosctl links`, `fault`, `node`, `job` and `scenario`: clients of the
+control process.
 
 Architecture Section 6.3: commands that create or read shared state
 (links, faults, nodes) call the control process on port 8002 instead of
@@ -12,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -195,4 +197,85 @@ def run(args: argparse.Namespace, *, transport: httpx.BaseTransport | None = Non
         _print(body)
         return 0 if body.get("state") != "failed" else 1
 
+    if args.command == "scenario":
+        return _scenario(args, call)
+
     raise AssertionError(f"unhandled control command {args.command!r}")  # pragma: no cover
+
+
+# the scenario flags, as the body keys of POST /sim/scenarios/{name}
+_SCENARIO_KEYS = (
+    "region_id",
+    "from_day",
+    "speed",
+    "seed",
+    "inject_at",
+    "fault_s",
+    "settle_s",
+    "kill_after_s",
+    "down_s",
+    "duplicate_rate",
+    "shuffle",
+    "latency_ms",
+    "jitter_ms",
+    "reset_timeout_ms",
+)
+
+
+# how often `rosctl scenario` asks for its job (tests set it to 0)
+POLL_S = 1.0
+
+
+def _scenario(args: argparse.Namespace, call: Any) -> int:
+    """POST the scenario, then follow its job until it ends. Ctrl-C stops
+    following, not the scenario."""
+    if args.name.lower() == "list":
+        answer = call("GET", "/sim/scenarios")
+        if answer is None:
+            return 1
+        status, body = answer
+        if status != 200:
+            return _fail(args, body)
+        _print(body)
+        return 0
+    body = {
+        key: getattr(args, key) for key in _SCENARIO_KEYS if getattr(args, key, None) is not None
+    }
+    answer = call("POST", f"/sim/scenarios/{args.name}", json_body=body)
+    if answer is None:
+        return 1
+    status, job = answer
+    if status != 202:
+        return _fail(args, job)
+    job_id = job["job_id"]
+    print(f"scenario {job['name']} is job {job_id} on the control process", file=sys.stderr)
+    shown = None
+    try:
+        while job.get("state") == "running":
+            if job.get("progress") and job["progress"] != shown:
+                shown = job["progress"]
+                print(f"  {shown}", file=sys.stderr)
+            time.sleep(POLL_S)
+            answer = call("GET", f"/sim/jobs/{job_id}")
+            if answer is None:
+                return 1
+            status, job = answer
+            if status != 200:
+                return _fail(args, job)
+    except KeyboardInterrupt:
+        print(
+            f"\nstopped following; the scenario keeps running: rosctl job {job_id}",
+            file=sys.stderr,
+        )
+        return 130
+    if job.get("state") == "failed":
+        print(f"{_label(args)}: {job.get('error')}", file=sys.stderr)
+        return 1
+    result = job.get("result") or {}
+    if args.json:
+        _print(result)
+    else:
+        from restaurantos.sim.scenarios import format_result
+
+        print(format_result(result))
+    return 0 if result.get("passed") else 1
