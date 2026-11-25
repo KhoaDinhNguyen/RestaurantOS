@@ -208,6 +208,10 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
     regions: set[str | None] = set()
     target_urls: set[str] = set()
     orders: dict[Key, OrderOutcome] = {}
+    # the last day the runs actually SENT: a run stopped early still says
+    # its planned to_day in meta.json, and the days it never reached may
+    # hold another run's orders, which are not this run's to account for
+    last_sent: int | None = None
     for run_id in chain:
         run_dir = runs_dir / run_id
         try:
@@ -223,6 +227,9 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
         try:
             for line in _order_lines(run_dir / "orders.jsonl", run_id):
                 _keep(orders, line, meta, channel)
+                day = line.get("order_day")
+                if isinstance(day, int):
+                    last_sent = day if last_sent is None else max(last_sent, day)
         except OSError as error:
             raise CheckError(f"run {run_id}: {error}") from error
     if len(regions) > 1:
@@ -230,10 +237,11 @@ def read_runs(runs_dir: Path, run_ids: Sequence[str], channel: str) -> RunSet:
             "the runs disagree on the region they replayed: "
             f"{', '.join(sorted(str(r) for r in regions))}"
         )
+    planned_to = max(day for _, day in days)
     return RunSet(
         run_ids=chain,
         from_day=min(day for day, _ in days),
-        to_day=max(day for _, day in days),
+        to_day=planned_to if last_sent is None else min(planned_to, last_sent),
         region=next(iter(regions)),
         orders=orders,
         target_urls=target_urls,

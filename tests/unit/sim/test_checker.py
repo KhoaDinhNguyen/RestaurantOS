@@ -253,6 +253,18 @@ def test_an_hq_only_failed_order_needs_a_failover_after_its_first_send(tmp_path)
     assert early["lost_at_failover"]["order_ids"] == ["1"]
 
 
+def test_the_window_ends_at_the_last_day_the_runs_sent(tmp_path) -> None:
+    """meta.json says days 14-20, but the run stopped during day 15: the
+    days it never reached are not its to account for."""
+    line = {**accepted("1"), "order_day": 15}
+    write_run(tmp_path, "stopped", [line])
+    runs = read_runs(tmp_path, ["stopped"], CH)
+    assert (runs.from_day, runs.to_day) == (14, 15)
+    # no order lines at all: the planned window
+    write_run(tmp_path, "empty", [])
+    assert read_runs(tmp_path, ["empty"], CH).to_day == 20
+
+
 def test_a_failed_orders_earliest_send_is_kept_whatever_the_order(tmp_path) -> None:
     """Sends at minutes 10 and 1 (two runs, or lines read out of order):
     minute 1 bounds the loss, so a failover at 5 explains it."""
