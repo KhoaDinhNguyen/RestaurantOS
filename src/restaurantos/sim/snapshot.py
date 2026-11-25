@@ -868,6 +868,36 @@ def _check_complete(name: str, snap: Path, record: dict[str, Any], cluster: Clus
         )
 
 
+def _saved_proxies(name: str, snap: Path) -> list[dict[str, Any]]:
+    """toxiproxy.json, parsed and checked before restore changes anything:
+    a list of {name: str, enabled: bool, toxics: [{name: str, ...}]}.
+    Malformed state would otherwise abort the restore half way, after
+    the volumes were replaced."""
+
+    def bad(why: str) -> SnapshotError:
+        return SnapshotError(
+            f"snapshot {name!r} has a malformed toxiproxy.json ({why}); nothing was changed"
+        )
+
+    try:
+        saved = json.loads((snap / "toxiproxy.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise bad(str(error)) from error
+    if not isinstance(saved, list):
+        raise bad("not a list of proxies")
+    for index, proxy in enumerate(saved):
+        if not isinstance(proxy, dict) or not isinstance(proxy.get("name"), str):
+            raise bad(f"entry {index} has no proxy name")
+        if not isinstance(proxy.get("enabled", True), bool):
+            raise bad(f"{proxy['name']}: enabled is not true or false")
+        toxics = proxy.get("toxics") or []
+        if not isinstance(toxics, list) or not all(
+            isinstance(toxic, dict) and isinstance(toxic.get("name"), str) for toxic in toxics
+        ):
+            raise bad(f"{proxy['name']}: toxics is not a list of named toxics")
+    return saved
+
+
 def _saved_runs(record: dict[str, Any]) -> list[str]:
     """The runs a snapshot holds: the run and every run it continues (a
     snapshot from before the chain was recorded holds its run alone)."""
@@ -1280,6 +1310,7 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         )
     snapshot_cluster = load_cluster(snap / "cluster.toml")
     _check_complete(name, snap, record, snapshot_cluster)
+    saved = _saved_proxies(name, snap)
     current_cluster = load_cluster(ctx.cluster_file) if current_toml is not None else None
     docker = ctx.docker
     assert docker is not None
@@ -1320,7 +1351,6 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
             shutil.rmtree(target)
         shutil.copytree(snap / "run" / run_id, target)
     await asyncio.to_thread(docker.start, services)
-    saved = json.loads((snap / "toxiproxy.json").read_text(encoding="utf-8"))
     skipped_toxics, cut = await _restore_toxiproxy(ctx, snapshot_cluster, saved)
     if ctx.services_up is not None:
         # A cut proxy does not listen, and rosctl up's precheck dials every

@@ -866,6 +866,29 @@ async def test_a_failed_automatic_start_drops_the_reserved_link(world: World) ->
     assert not (ctx.runs_dir / "run-a-r1").exists()
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "not json",
+        '{"name": "x"}',
+        '[{"enabled": false}]',
+        '[{"name": "x", "enabled": "no"}]',
+        '[{"name": "x", "toxics": [{"type": "latency"}]}]',
+    ],
+)
+async def test_restore_refuses_a_malformed_toxiproxy_file_first(
+    world: World, content: str
+) -> None:
+    ctx, host, docker, _, services = world
+    await save("snap", ctx)
+    (ctx.snapshot_dir / "snap" / "toxiproxy.json").write_text(content)
+    docker.calls.clear()
+    host.commands.clear()
+    with pytest.raises(SnapshotError, match="malformed toxiproxy.json"):
+        await restore("snap", ctx)
+    assert docker.calls == [] and host.commands == [] and services == []
+
+
 async def test_save_without_a_run_records_no_run(world: World) -> None:
     ctx, host, _, _, _ = world
     host.alive = False
