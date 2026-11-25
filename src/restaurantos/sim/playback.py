@@ -229,6 +229,15 @@ class RealWallClock:
         await asyncio.sleep(seconds)
 
 
+def _instant(prefix: str, at: float | None) -> dict[str, Any]:
+    """`<prefix>_sim_day` / `<prefix>_sim_time` for an absolute simulated
+    instant, both None without one."""
+    if at is None:
+        return {f"{prefix}_sim_day": None, f"{prefix}_sim_time": None}
+    day, moment = from_sim_seconds(int(at))
+    return {f"{prefix}_sim_day": day, f"{prefix}_sim_time": moment.strftime("%H:%M:%S")}
+
+
 class RunLog:
     """`orders.jsonl`, one line per order, written in send order.
 
@@ -446,6 +455,11 @@ class Playback:
         # (an event waits for its order's answer before it goes out), so
         # a snapshot takes its point from here, not from the clock.
         self._dispatched_at: float | None = None
+        # the run's reorder buffer (the dispatcher's own list, shared, not
+        # copied): orders pulled from the stream but not dispatched yet.
+        # With shuffle on they can be EARLIER than the frontier, so a
+        # snapshot needs them too.
+        self._held: list[tuple[float, int, OrderRequest]] = []
 
         self._run_id = ""
         self._seed = 0
@@ -717,6 +731,7 @@ class Playback:
         self._state = RUNNING
         self._dispatch_ended = False
         self._dispatched_at = None
+        self._held = []
         self._simclock.start()
         self._task = asyncio.create_task(self._run(), name=f"playback-{self._run_id}")
         return self._run_id
@@ -844,10 +859,16 @@ class Playback:
         }
 
     def _dispatched_fields(self) -> dict[str, Any]:
-        if self._dispatched_at is None:
-            return {"dispatched_sim_day": None, "dispatched_sim_time": None}
-        day, moment = from_sim_seconds(int(self._dispatched_at))
-        return {"dispatched_sim_day": day, "dispatched_sim_time": moment.strftime("%H:%M:%S")}
+        held = [to_sim_seconds(r.order_day, r.order_time) for _rank, _index, r in self._held]
+        due = [*held, *([self._heap[0][0]] if self._heap else [])]
+        return {
+            **_instant("dispatched", self._dispatched_at),
+            # the earliest order pulled but not sent yet (shuffle holds up
+            # to a window of them, possibly before the frontier)
+            **_instant("held", min(held) if held else None),
+            # the earliest item still waiting to go out, of any kind
+            **_instant("next_due", min(due) if due else None),
+        }
 
     def _kitchen_fact(self) -> dict[str, Any]:
         """Where the kitchen-side calls (events, restocks) go: the region
@@ -931,6 +952,7 @@ class Playback:
             stream_items = enumerate(stream)
             window = self._shuffle_window if self._shuffle_on else 1
             buffer: list[tuple[float, int, OrderRequest]] = []
+            self._held = buffer
             # A stream that raises mid-pull (a corrupt cache, an I/O
             # error) must not drop the orders it already yielded into the
             # buffer (review round 2): the error is kept, pulling stops,

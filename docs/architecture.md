@@ -768,6 +768,7 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
   "events_sent": 0, "events_acked": 0, "events_duplicate": 0, "events_conflicted": 0, "events_failed": 0, "events_skipped": 0,
   "restocks_sent": 0, "restocks_acked": 0, "restocks_failed": 0, "inflight": 0,
   "dispatched_sim_day": 14, "dispatched_sim_time": "09:41:07",
+  "held_sim_day": 14, "held_sim_time": "09:40:55", "next_due_sim_day": 14, "next_due_sim_time": "09:40:55",
   "engine": {
     "sequential": false, "region": null, "target_url": "http://127.0.0.1:8000/api/v1/orders", "inflight": 64,
     "events": {"enabled": true, "sample_rate": 1.0, "jitter_s": 60.0}, "restock_every": 7,
@@ -777,6 +778,7 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
 ```
 
 - `dispatched_sim_day` / `dispatched_sim_time` is the dispatch frontier: the simulated instant of the last item the engine sent (`null` before the run's first dispatch). The clock runs on wall time and can run ahead of it, because a status event waits for its order's answer before it goes out; a snapshot takes its point from the frontier (Section 7.4).
+- `held_sim_day` / `held_sim_time` is the earliest order pulled from the stream but not sent yet (with shuffle on, up to a window of them wait, possibly earlier than the frontier); `next_due_sim_day` / `next_due_sim_time` is the earliest item of any kind still waiting to go out. Both `null` when nothing waits. A snapshot uses them to wait for held orders of the previous day and to tell a stalled dispatch from one with nothing due yet (Section 7.4).
 - `engine` holds what every run on this playback process shares, set when the process starts and never by a start body: the same values a run's `meta.json` records. A restore compares them with the snapshot's run before it replays the day (Section 7.4).
 
 - `start` needs `from_day`; `to_day`, `speed`, `seed` and `run_id` are optional. `duplicate_rate` (a share in [0, 1], default 0) and `shuffle` (default off, Section 7.2) are part of the start body: they are per-run facts, derived from the seed like every other random value, and recorded in the run's `meta.json` next to the seed. A rate outside [0, 1] answers `422`, and so does `shuffle` together with `--sequential`. Status events and restocks are switched on when the playback process starts, not per run.

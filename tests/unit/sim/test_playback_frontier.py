@@ -95,3 +95,25 @@ async def test_the_engine_facts_match_meta_json(tmp_path: Path) -> None:
     assert meta["kitchen"] == engine["kitchen"]
     assert meta["events"] == engine["events"]
     assert meta["region"] == engine["region"] and meta["sequential"] is True
+
+
+async def test_status_reports_held_orders_and_the_next_due_item(tmp_path: Path) -> None:
+    """Shuffle holds up to a window of orders that may be EARLIER than the
+    frontier; a snapshot needs the earliest of them, and the earliest
+    item still to go out of any kind."""
+    pb = make_playback(
+        [make_order(14, 9, 0, 0, "1")], tmp_path, transport=httpx.MockTransport(_accepting)
+    )
+    empty = pb.status()
+    assert empty["held_sim_day"] is None and empty["next_due_sim_day"] is None
+    pb._held = [
+        (0.7, 0, make_order(15, 0, 10, 0, "b")),
+        (0.2, 1, make_order(14, 23, 50, 0, "a")),
+    ]
+    pb._heap = [(15 * 86400 + 5, 0, 0, 0, "event", None)]
+    status = pb.status()
+    assert (status["held_sim_day"], status["held_sim_time"]) == (14, "23:50:00")
+    assert (status["next_due_sim_day"], status["next_due_sim_time"]) == (14, "23:50:00")
+    pb._held = [(0.7, 0, make_order(15, 0, 10, 0, "b"))]
+    status = pb.status()
+    assert (status["next_due_sim_day"], status["next_due_sim_time"]) == (15, "00:00:05")
