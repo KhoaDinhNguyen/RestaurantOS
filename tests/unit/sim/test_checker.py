@@ -253,6 +253,16 @@ def test_an_hq_only_failed_order_needs_a_failover_after_its_first_send(tmp_path)
     assert early["lost_at_failover"]["order_ids"] == ["1"]
 
 
+def test_a_failed_orders_earliest_send_is_kept_whatever_the_order(tmp_path) -> None:
+    """Sends at minutes 10 and 1 (two runs, or lines read out of order):
+    minute 1 bounds the loss, so a failover at 5 explains it."""
+    cluster = facts({"r1": []}, [("1", "r1")], failovers=[("r1", at(5))])
+    for name, minutes in (("later-first", (10, 1)), ("earlier-first", (1, 10))):
+        lines = [failed("1", sent_minute=minute) for minute in minutes]
+        result = check(tmp_path / name, lines, cluster)
+        assert result["lost_at_failover"]["order_ids"] == ["1"], name
+
+
 def test_an_hq_only_failed_order_without_a_send_time_is_unaccounted(tmp_path) -> None:
     result = check(
         tmp_path, [failed("1")], facts({"r1": []}, [("1", "r1")], failovers=[("r1", at(5))])

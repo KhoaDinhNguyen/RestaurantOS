@@ -127,15 +127,18 @@ def _replaces(seen: OrderOutcome, candidate: OrderOutcome) -> bool:
       an order answered after a failover survived that failover, so only
       a failover after its LAST ack can explain it going missing (a
       resend, or a restored day's replay, acks an order again).
-    - failed: the first send with a known time is kept (the earliest
-      moment the region could have committed the order).
+    - failed: the EARLIEST known send time is kept (the earliest moment
+      the region could have committed the order), whatever order the
+      runs and their lines are read in.
     """
     if candidate.outcome == ACCEPTED:
         if candidate.acked_at is None:
             return False
         return seen.acked_at is None or candidate.acked_at > seen.acked_at
     if candidate.outcome == FAILED:
-        return seen.sent_at is None and candidate.sent_at is not None
+        if candidate.sent_at is None:
+            return False
+        return seen.sent_at is None or candidate.sent_at < seen.sent_at
     return False
 
 
