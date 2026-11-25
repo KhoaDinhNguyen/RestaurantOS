@@ -85,6 +85,22 @@ def check_name(name: str) -> str:
     return name
 
 
+def check_free(snapshot_dir: Path, name: str) -> None:
+    """Save's name check: refuse a name that is taken (the control API asks
+    before it queues the job; save asks again, as the last guard)."""
+    if (snapshot_dir / name).exists():
+        raise SnapshotExistsError(f"snapshot {name!r} exists; choose another name")
+
+
+def record_path(snapshot_dir: Path, name: str) -> Path:
+    """Restore's name check: the snapshot's snapshot.json, or
+    UnknownSnapshotError (asked before the job is queued, and again in it)."""
+    record_file = snapshot_dir / name / SNAPSHOT_FILE
+    if not record_file.is_file():
+        raise UnknownSnapshotError(f"no snapshot {name!r} in {snapshot_dir}")
+    return record_file
+
+
 def sim_seconds(clock: dict[str, Any]) -> int | None:
     """Absolute simulated seconds of a `GET /sim/clock` answer."""
     day, moment = clock.get("sim_day"), clock.get("sim_time")
@@ -599,9 +615,8 @@ async def _resume_quietly(ctx: Context) -> str | None:
 
 async def save(name: str, ctx: Context) -> dict[str, Any]:
     check_name(name)
+    check_free(ctx.snapshot_dir, name)
     final = ctx.snapshot_dir / name
-    if final.exists():
-        raise SnapshotExistsError(f"snapshot {name!r} exists; choose another name")
     cluster = load_cluster(ctx.cluster_file)
     partial = ctx.snapshot_dir / f".{name}.partial"
     if partial.exists():
@@ -1441,9 +1456,7 @@ async def restore(
         raise SnapshotError(f"services must be one of {', '.join(SERVICE_MODES)}, not {services!r}")
     check_name(name)
     snap = ctx.snapshot_dir / name
-    record_file = snap / SNAPSHOT_FILE
-    if not record_file.is_file():
-        raise UnknownSnapshotError(f"no snapshot {name!r} in {ctx.snapshot_dir}")
+    record_file = record_path(ctx.snapshot_dir, name)
     record = json.loads(record_file.read_text(encoding="utf-8"))
     if not (snap / "cluster.toml").is_file():
         raise SnapshotError(

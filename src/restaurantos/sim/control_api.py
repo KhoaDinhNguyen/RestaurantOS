@@ -237,8 +237,12 @@ def add_sim_jobs(app: FastAPI) -> None:
     from restaurantos.sim.snapshot import (
         LIVE_STATES,
         PlaybackClient,
+        SnapshotError,
+        check_free,
+        check_name,
         default_context,
         list_snapshots,
+        record_path,
         restore,
         save,
     )
@@ -292,6 +296,13 @@ def add_sim_jobs(app: FastAPI) -> None:
 
     @app.post("/sim/snapshots", status_code=202)
     async def sim_snapshot_save(body: SaveSnapshotBody) -> Any:
+        # answered now, not as a failed job; the job checks again (a
+        # `rosctl snapshot save` from a shell can take the name meanwhile)
+        try:
+            check_free(sim.snapshot_dir, body.name)
+        except SnapshotError as error:
+            return error_response(error.status, error.code, str(error))
+
         async def work() -> Any:
             ctx = default_context(Path(get_settings().cluster_file), sim)
             return await save(body.name, ctx)
@@ -301,6 +312,15 @@ def add_sim_jobs(app: FastAPI) -> None:
     @app.post("/sim/snapshots/{name}/restore", status_code=202)
     async def sim_snapshot_restore(name: str, body: RestoreSnapshotBody | None = None) -> Any:
         options = body or RestoreSnapshotBody()
+        try:
+            check_name(name)
+        except SnapshotError as error:
+            return error_response(422, "invalid_name", str(error))
+        # answered now, not as a failed job; the job checks again
+        try:
+            record_path(sim.snapshot_dir, name)
+        except SnapshotError as error:
+            return error_response(error.status, error.code, str(error))
 
         async def work() -> Any:
             ctx = default_context(Path(get_settings().cluster_file), sim)

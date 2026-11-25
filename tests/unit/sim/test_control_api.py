@@ -656,6 +656,20 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
         assert seen["saved"] == "evening"
         bad = await client.post("/sim/snapshots", json={"name": "../escape"})
         assert bad.status_code == 422
+        # a taken name and an unknown snapshot are answered at once, not
+        # as failed jobs (nothing is queued)
+        snapshots = tmp_path / "snapshots"
+        (snapshots / "evening").mkdir(parents=True)
+        queued = len(jobs._jobs)
+        taken = await client.post("/sim/snapshots", json={"name": "evening"})
+        assert taken.status_code == 409 and taken.json()["error"] == "snapshot_exists"
+        unknown = await client.post("/sim/snapshots/day7/restore")
+        assert unknown.status_code == 404 and unknown.json()["error"] == "unknown_snapshot"
+        bad = await client.post("/sim/snapshots/.hidden/restore")
+        assert bad.status_code == 422 and bad.json()["error"] == "invalid_name"
+        assert len(jobs._jobs) == queued
+        (snapshots / "day7").mkdir()
+        (snapshots / "day7" / "snapshot.json").write_text("{}", encoding="utf-8")
         posted = await client.post(
             "/sim/snapshots/day7/restore",
             json={"replace_cluster_file": True, "services": "none"},
