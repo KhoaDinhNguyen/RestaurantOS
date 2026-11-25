@@ -5,8 +5,10 @@ skip a restock that already went out, catch up, switch speed back)."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -110,6 +112,9 @@ class FakeDocker:
         self.fail_archive: str | None = None
         self.fail_stop = False
         self.fail_start = False
+        # set: archive blocks on it (a worker thread mid-archive)
+        self.gate: threading.Event | None = None
+        self.archiving = threading.Event()
         # (image id, name) of hq-primary's container; None: no container
         self.image: tuple[str, str] | None = ("sha256:pg18", "postgres:18-test")
 
@@ -132,6 +137,9 @@ class FakeDocker:
 
     def archive(self, volume: str, out_dir: Path, image: str) -> None:
         assert self.image is not None and image == self.image[0]
+        if self.gate is not None:
+            self.archiving.set()
+            assert self.gate.wait(5.0)
         if volume == self.fail_archive:
             raise SnapshotError("disk full")
         (out_dir / f"{volume}.tar.gz").write_text("archive", encoding="utf-8")
@@ -737,6 +745,31 @@ async def test_a_failed_archive_and_a_failed_start_are_both_named(world: World) 
     assert not (ctx.snapshot_dir / "both").exists()
     assert not (ctx.snapshot_dir / ".both.partial").exists()
     assert [body["action"] for body in host.commands] == ["pause"]
+
+
+async def test_cancelling_a_save_waits_for_its_docker_worker(world: World) -> None:
+    """Ctrl-C mid-archive: the worker thread cannot be stopped, so the
+    databases come back and partial/ goes only once it has finished;
+    then the cancellation goes on."""
+    ctx, host, docker, _, _ = world
+    docker.gate = threading.Event()
+    task = asyncio.create_task(save("cancelled", ctx))
+    while not docker.archiving.is_set():
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0.1)
+    # the worker is still archiving: nothing may race it yet
+    assert ("start", DATABASES) not in docker.calls
+    assert (ctx.snapshot_dir / ".cancelled.partial").is_dir()
+    docker.gate.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # it stopped at its next step, then the databases came back
+    assert sum(1 for call in docker.calls if call[0] == "archive") == 1
+    assert docker.calls[-1] == ("start", DATABASES)
+    assert not (ctx.snapshot_dir / ".cancelled.partial").exists()
+    assert not (ctx.snapshot_dir / "cancelled").exists()
+    assert [body["action"] for body in host.commands] == ["pause", "resume"]
 
 
 async def test_save_without_a_run_records_no_run(world: World) -> None:

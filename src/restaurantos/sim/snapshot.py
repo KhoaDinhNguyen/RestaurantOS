@@ -32,6 +32,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -536,6 +537,30 @@ async def _pause(ctx: Context, run_id: str) -> None:
         raise SnapshotError(f"cannot pause playback: {_message(response)}")
 
 
+async def _to_completion(
+    fn: Callable[..., Any], *args: Any, on_cancel: Callable[[], None] | None = None
+) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+    """Run a blocking call in a thread and wait until it has FINISHED, even
+    when this task is cancelled meanwhile. Returns (the call's exception
+    or None, the cancellation to re-raise once the caller has cleaned up,
+    or None). `on_cancel` tells the call to stop early, if it can."""
+    worker = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    cancelled: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as error:
+            cancelled = error
+            if on_cancel is not None:
+                on_cancel()
+            if not worker.done():
+                continue
+        except BaseException:  # noqa: BLE001 - the call's own error, returned below
+            pass
+        break
+    return (None if worker.cancelled() else worker.exception()), cancelled
+
+
 def _describe(error: BaseException) -> str:
     return str(error) if isinstance(error, SnapshotError) else f"{type(error).__name__}: {error}"
 
@@ -641,33 +666,44 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
             json.dumps({"id": found[0], "name": found[1]}) + "\n", encoding="utf-8"
         )
         stop_begun = True
-        first_error: BaseException | None = None
-        try:
-            # the stop is inside: one that fails half way has still
-            # stopped some databases, and they come back below. HQ goes
-            # FIRST: the coordinator acts only with exactly one reachable
-            # writable HQ, so with HQ down it decides nothing while the
-            # regions stop. Stopped all at once, Compose stops a standby
-            # before its primary with HQ still up, and a synchronous
-            # cluster's coordinator would downgrade that primary to async
-            # and record it - into the snapshot.
+        abort = threading.Event()
+
+        def stop_and_archive() -> None:
+            # One worker thread for the whole stopped window. The stop is
+            # inside: one that fails half way has still stopped some
+            # databases, and they come back below. HQ goes FIRST: the
+            # coordinator acts only with exactly one reachable writable
+            # HQ, so with HQ down it decides nothing while the regions
+            # stop. Stopped all at once, Compose stops a standby before
+            # its primary with HQ still up, and a synchronous cluster's
+            # coordinator would downgrade that primary to async and
+            # record it - into the snapshot.
+            nonlocal published
             hq_nodes = [node for node in services if node in (HQ_PRIMARY, HQ_STANDBY)]
-            await asyncio.to_thread(docker.stop, hq_nodes)
-            await asyncio.to_thread(docker.stop, [n for n in services if n not in hq_nodes])
+            docker.stop(hq_nodes)
+            docker.stop([node for node in services if node not in hq_nodes])
             for node in services:
-                await asyncio.to_thread(docker.archive, volume_name(node), partial, image)
+                if abort.is_set():
+                    raise SnapshotError("cancelled")
+                docker.archive(volume_name(node), partial, image)
+            if abort.is_set():
+                raise SnapshotError("cancelled")
             (partial / SNAPSHOT_FILE).write_text(
                 json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
             )
             partial.rename(final)
             published = True
-        except BaseException as error:  # noqa: BLE001 - re-raised once the databases are back
-            first_error = error
+
+        # Cancelled meanwhile (Ctrl-C), the worker still runs: a thread
+        # cannot be stopped. It is told to stop at its next step and
+        # waited for, so bringing the databases back and removing
+        # partial/ never race it; the cancellation is re-raised at the end.
+        first_error, cancelled = await _to_completion(stop_and_archive, on_cancel=abort.set)
         # whatever happened after the stop began, the databases come back
         # (`up --wait`: healthy) before anything else
-        try:
-            await asyncio.to_thread(docker.start, services)
-        except Exception as start_error:
+        start_error, cancelled_again = await _to_completion(docker.start, services)
+        cancelled = cancelled or cancelled_again
+        if start_error is not None:
             before = f" after {_describe(first_error)}" if first_error is not None else ""
             saved = "was saved" if published else "was not saved"
             raise SnapshotError(
@@ -677,6 +713,8 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
                 f"up -d --wait {' '.join(services)}"
             ) from start_error
         databases_back = True
+        if cancelled is not None:
+            raise cancelled
         if first_error is not None:
             raise first_error
         failed = False
