@@ -105,6 +105,26 @@ def test_via_control_posts_the_run_body(monkeypatch) -> None:
     }
 
 
+def test_via_control_forwards_skip_first_restock(monkeypatch) -> None:
+    """A snapshot restore's replay sets the flag; it is the run's own,
+    so it must travel with the start body (not stay on the CLI)."""
+    sent: dict = {}
+
+    async def fake_control_command(args, *, method, body):
+        sent.update(method=method, body=body)
+        return 0
+
+    monkeypatch.setattr(playback_cli, "control_command", fake_control_command)
+    code = app(["playback", "start", "--via-control", "--from-day", "21", "--skip-first-restock"])
+    assert code == 0
+    assert sent["body"]["skip_first_restock"] is True
+
+    sent.clear()
+    code = app(["playback", "start", "--via-control", "--from-day", "21"])
+    assert code == 0
+    assert "skip_first_restock" not in sent["body"]
+
+
 def _args(argv: list[str]) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 

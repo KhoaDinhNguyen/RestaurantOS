@@ -559,3 +559,141 @@ async def test_a_punycode_origin_passes_guard_and_cors(punycode_app_and_client) 
     )
     assert preflight.status_code == 200
     assert preflight.headers["Access-Control-Allow-Origin"] == origin
+
+
+# --- the check and snapshot job routes (the WP6b join) -----------------------
+
+
+class _NoHost:
+    """A PlaybackClient stand-in: no playback host answers."""
+
+    def __init__(self, base_url: str, **kwargs) -> None:
+        pass
+
+    async def status(self):
+        return None
+
+
+async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_path) -> None:
+    """The join commit: rosctl check and rosctl snapshot save|restore as
+    jobs on the control runner - one at a time, polled through
+    /sim/jobs/{id} - and GET /sim/snapshots as a plain read. The work is
+    faked here; the CLI tests cover the real code."""
+    import restaurantos.common.cluster as common_cluster
+    import restaurantos.common.config as common_config
+    import restaurantos.sim.checker as checker
+    import restaurantos.sim.config as sim_config
+    import restaurantos.sim.snapshot as snapshot
+    from restaurantos.sim.control_api import add_sim_jobs
+
+    seen: dict = {}
+
+    async def fake_save(name, ctx):
+        seen["saved"] = name
+        return {"name": name}
+
+    async def fake_restore(name, ctx, *, replace_cluster_file=False):
+        seen["restored"] = (name, replace_cluster_file)
+        return {"name": name}
+
+    def fake_run_check(cluster, run_ids, **kwargs):
+        seen["checked"] = (list(run_ids), kwargs.get("allow_unacked"), kwargs.get("live_run"))
+        return {"passed": True}
+
+    monkeypatch.setattr(snapshot, "save", fake_save)
+    monkeypatch.setattr(snapshot, "restore", fake_restore)
+    monkeypatch.setattr(checker, "run_check", fake_run_check)
+    monkeypatch.setattr(snapshot, "default_context", lambda cf, sim, **kw: object())
+    monkeypatch.setattr(snapshot, "PlaybackClient", _NoHost)
+    monkeypatch.setattr(common_cluster, "load_cluster", lambda path: CLUSTER)
+    monkeypatch.setattr(
+        common_config,
+        "get_settings",
+        lambda: type("S", (), {"cluster_file": str(tmp_path / "cluster.toml")})(),
+    )
+    monkeypatch.setenv("ROS_SIM_SNAPSHOT_DIR", str(tmp_path / "snapshots"))
+    sim_config.get_sim_settings.cache_clear()
+
+    from restaurantos.sim.config import get_sim_settings  # noqa: F401 - cache warmed
+
+    app = FastAPI()
+    jobs = JobRunner()
+    add_control_routes(
+        app,
+        faults=FaultLayer(server.client(), link_groups(CLUSTER)),
+        nodes=Nodes(CLUSTER),
+        jobs=jobs,
+    )
+    add_sim_jobs(app)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://control.test"
+    ) as client:
+
+        async def done(job_id: str) -> dict:
+            await jobs.wait(job_id)
+            return (await client.get(f"/sim/jobs/{job_id}")).json()
+
+        # the check: 202 with the job, the result through the job
+        posted = await client.post("/sim/check", json={"runs": ["run-a"]})
+        assert posted.status_code == 202
+        body = posted.json()
+        assert body["kind"] == "check" and body["name"] is None
+        assert (await done(body["job_id"]))["result"] == {"passed": True}
+        assert seen["checked"] == (["run-a"], False, None)
+        posted = await client.post("/sim/check", json={"runs": ["run-b"], "allow_unacked": True})
+        assert (await done(posted.json()["job_id"]))["result"] == {"passed": True}
+        assert seen["checked"] == (["run-b"], True, None)
+
+        # the listing is a plain read of the snapshot directory
+        listed = await client.get("/sim/snapshots")
+        assert listed.status_code == 200 and listed.json() == {"snapshots": []}
+
+        # save and restore are jobs too; a bad name answers 422
+        posted = await client.post("/sim/snapshots", json={"name": "evening"})
+        assert posted.status_code == 202 and posted.json()["kind"] == "snapshot"
+        assert posted.json()["name"] == "evening"
+        await done(posted.json()["job_id"])
+        assert seen["saved"] == "evening"
+        bad = await client.post("/sim/snapshots", json={"name": "../escape"})
+        assert bad.status_code == 422
+        posted = await client.post(
+            "/sim/snapshots/day7/restore", json={"replace_cluster_file": True}
+        )
+        assert posted.status_code == 202 and posted.json()["kind"] == "restore"
+        assert posted.json()["name"] == "day7"
+        await done(posted.json()["job_id"])
+        assert seen["restored"] == ("day7", True)
+
+        # one job at a time: a busy runner answers 409 with the job id
+        release = asyncio.Event()
+
+        async def blocked() -> None:
+            await release.wait()
+
+        running = app.state.jobs.submit("check", None, blocked)
+        busy = await client.post("/sim/check", json={"runs": ["run-a"]})
+        assert busy.status_code == 409
+        assert busy.json()["error"] == "busy" and busy.json()["job_id"] == running.job_id
+        release.set()
+        await jobs.wait(running.job_id)
+    await jobs.aclose()
+    sim_config.get_sim_settings.cache_clear()
+    monkeypatch.delenv("ROS_SIM_SNAPSHOT_DIR")
+
+
+async def test_sim_jobs_mount_with_the_control_process(server) -> None:
+    """`rosctl control` serves them: _add_control_extras mounts the sim
+    jobs beside the control routes."""
+    from pathlib import Path
+
+    import restaurantos.sim.playback_cli as playback_cli
+
+    app = FastAPI()
+    extras = playback_cli._add_control_extras(app, Path("infra/cluster.toml"))
+    paths = {getattr(route, "path", None) for route in app.routes}
+    assert {
+        "/sim/check",
+        "/sim/snapshots",
+        "/sim/snapshots/{name}/restore",
+    } <= paths
+    await extras.aclose()

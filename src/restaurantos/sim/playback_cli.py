@@ -667,7 +667,7 @@ def _add_control_extras(app: Any, cluster_file: Path) -> _ControlExtras:
     routes. The cluster file decides the link groups and the nodes - use
     the file bootstrap ran with."""
     from restaurantos.common.cluster import link_groups
-    from restaurantos.sim.control_api import add_control_routes
+    from restaurantos.sim.control_api import add_control_routes, add_sim_jobs
     from restaurantos.sim.faults import FaultLayer
     from restaurantos.sim.nodes import Nodes
 
@@ -676,6 +676,7 @@ def _add_control_extras(app: Any, cluster_file: Path) -> _ControlExtras:
     toxiproxy = Toxiproxy()
     jobs = JobRunner()
     add_control_routes(app, faults=FaultLayer(toxiproxy, groups), nodes=Nodes(cluster), jobs=jobs)
+    add_sim_jobs(app)
     return _ControlExtras(toxiproxy, jobs, cluster_file, len(groups))
 
 
@@ -770,6 +771,10 @@ async def start_via_control(args: argparse.Namespace) -> int:
         value = getattr(args, key)
         if value is not None:
             body[key] = value
+    if getattr(args, "skip_first_restock", False):
+        # a snapshot restore's replay sets this; it is the run's own
+        # flag even though a plain start leaves it off
+        body["skip_first_restock"] = True
     return await control_command(args, method="POST", body=body)
 
 

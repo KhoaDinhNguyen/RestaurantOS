@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from restaurantos.sim.config import get_sim_settings, normalise_origin, parse_allowed_origins
 from restaurantos.sim.faults import FaultError, FaultExistsError, FaultLayer
-from restaurantos.sim.jobs import JobRunner, UnknownJobError
+from restaurantos.sim.jobs import BusyError, JobRunner, UnknownJobError
 from restaurantos.sim.nodes import NodeError, Nodes, UnknownNodeError
 from restaurantos.sim.toxiproxy import ToxiproxyError
 
@@ -198,3 +198,109 @@ def add_control_routes(app: FastAPI, *, faults: FaultLayer, nodes: Nodes, jobs: 
 
     # added after the guard: CORS must be the outermost middleware
     configure_control_cors(app)
+
+
+class CheckBody(BaseModel):
+    """POST /sim/check: the runs to check and whether parked-but-unacked
+    orders count as failures (the CLI's --allow-unacked)."""
+
+    runs: list[str]
+    allow_unacked: bool = False
+
+
+class SaveSnapshotBody(BaseModel):
+    # the same shape a run id allows: one path component, no traversal
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class RestoreSnapshotBody(BaseModel):
+    replace_cluster_file: bool = False
+
+
+def add_sim_jobs(app: FastAPI) -> None:
+    """Mount the check and snapshot job routes: `rosctl check` and
+    `rosctl snapshot save|restore` as jobs on the runner that
+    `add_control_routes` left on `app.state` (one job at a time;
+    GET /sim/jobs/{job_id} polls). `GET /sim/snapshots` is a plain read.
+    The jobs run the same code the CLI commands run, against the
+    checkout the control process was started from."""
+    import asyncio
+    from pathlib import Path
+
+    from restaurantos.common.cluster import load_cluster
+    from restaurantos.common.config import get_settings
+    from restaurantos.sim.checker import run_check
+    from restaurantos.sim.replaydata import CHANNEL
+    from restaurantos.sim.snapshot import (
+        LIVE_STATES,
+        PlaybackClient,
+        default_context,
+        list_snapshots,
+        restore,
+        save,
+    )
+
+    sim = get_sim_settings()
+
+    async def _live_run() -> str | None:
+        """The run this process's own playback host is still running,
+        pausing or stopping; None when there is none or no answer."""
+        client = PlaybackClient(
+            f"http://{sim.control_host}:{sim.control_port}", timeout_s=sim.http_timeout_s
+        )
+        try:
+            status = await client.status()
+        except Exception:  # noqa: BLE001 - reported through the job instead
+            return None
+        if status and status.get("state") in (*LIVE_STATES, "stopping"):
+            return status.get("run_id")
+        return None
+
+    def _submit(kind: str, name: str | None, work) -> Any:
+        try:
+            return app.state.jobs.submit(kind, name, work).as_dict()
+        except BusyError as error:
+            return error_response(409, "busy", str(error), job_id=error.job_id)
+
+    @app.post("/sim/check", status_code=202)
+    async def sim_check(body: CheckBody) -> Any:
+        async def work() -> Any:
+            # read inside the job: an earlier job in the queue (a
+            # restore) may have replaced the cluster file or moved the
+            # live run on
+            cluster = load_cluster(Path(get_settings().cluster_file))
+            return await asyncio.to_thread(
+                run_check,
+                cluster,
+                body.runs,
+                runs_dir=Path("runs"),
+                channel=CHANNEL,
+                allow_unacked=body.allow_unacked,
+                drain_timeout_s=sim.check_drain_timeout_s,
+                poll_s=sim.check_poll_s,
+                live_run=await _live_run(),
+            )
+
+        return _submit("check", None, work)
+
+    @app.get("/sim/snapshots")
+    async def sim_snapshots() -> Any:
+        return {"snapshots": list_snapshots(sim.snapshot_dir)}
+
+    @app.post("/sim/snapshots", status_code=202)
+    async def sim_snapshot_save(body: SaveSnapshotBody) -> Any:
+        async def work() -> Any:
+            ctx = default_context(Path(get_settings().cluster_file), sim)
+            return await save(body.name, ctx)
+
+        return _submit("snapshot", body.name, work)
+
+    @app.post("/sim/snapshots/{name}/restore", status_code=202)
+    async def sim_snapshot_restore(name: str, body: RestoreSnapshotBody | None = None) -> Any:
+        replace = bool(body and body.replace_cluster_file)
+
+        async def work() -> Any:
+            ctx = default_context(Path(get_settings().cluster_file), sim)
+            return await restore(name, ctx, replace_cluster_file=replace)
+
+        return _submit("restore", name, work)

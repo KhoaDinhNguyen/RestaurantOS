@@ -973,7 +973,7 @@ async def _wait_until_stopped(ctx: Context, run_id: Any) -> None:
         left = deadline - ctx.clock()
         try:
             status = await asyncio.wait_for(ctx.playback.status(), timeout=max(left, 0.001))
-        except (TimeoutError, httpx.HTTPError):
+        except TimeoutError, httpx.HTTPError:
             status = {"state": "unknown"}
         if (
             status is None
@@ -1020,11 +1020,12 @@ async def _cut(ctx: Context, names: Sequence[str]) -> None:
 
 async def _restore_toxiproxy(
     ctx: Context, cluster: Cluster, saved: list[dict], *, later: Sequence[str] = ()
-) -> tuple[list[str], list[str]]:
-    """Put the saved proxy state back; returns (the toxics it could not,
-    the proxies it cut again). The cuts named in `later` are left for the
-    caller to apply once the services are up (gateway_hq_cuts)."""
-    skipped: list[str] = []
+) -> list[str]:
+    """Put the saved proxy state back; returns the proxies it cut again.
+    The cuts named in `later` are left for the caller to apply once the
+    services are up (gateway_hq_cuts). Restored cuts and toxics are not
+    the control process's faults: it lists them as unexplained in
+    `links()` and its heal-all clears them."""
     cut: list[str] = []
     toxiproxy = ctx.toxiproxy_factory()
     try:
@@ -1041,14 +1042,18 @@ async def _restore_toxiproxy(
             if not proxy.get("enabled", True) and name not in later:
                 await toxiproxy.set_enabled(name, False)
                 cut.append(name)
-            # TODO(wp6b/faults-control): re-add the saved toxics with
-            # Toxiproxy.add_toxic once that PR is on main; until then a
-            # restore puts back cut proxies only and reports the toxics.
             for toxic in proxy.get("toxics") or []:
-                skipped.append(f"{name}/{toxic.get('name')}")
+                await toxiproxy.add_toxic(
+                    name,
+                    str(toxic.get("type")),
+                    dict(toxic.get("attributes") or {}),
+                    stream=str(toxic.get("stream") or "downstream"),
+                    name=str(toxic["name"]) if toxic.get("name") else None,
+                    toxicity=float(toxic.get("toxicity", 1.0)),
+                )
     finally:
         await toxiproxy.aclose()
-    return skipped, cut
+    return cut
 
 
 # the engine facts a replay must share with the run it continues; inflight
@@ -1109,21 +1114,26 @@ def replay_command(
     sim: SimSettings,
     cluster: Cluster,
 ) -> tuple[str, list[str]]:
-    """The `rosctl playback start` that resumes a restored run by hand,
-    and notes for what no flag can set.
+    """The `rosctl playback start --via-control` that resumes a restored
+    run by hand, and notes for what no start flag can set.
 
     Minimal but exact: the flags with no meaningful default for a replay
     are always there (the day, the window, the seed, the run id, the
-    speed, the restock skip); every other setting gets a flag only where
-    the saved run differs from what a start would pick up from the
+    speed, the restock skip); every other run setting gets a flag only
+    where the saved run differs from what a start would pick up from the
     current settings (ROS_SIM_*, .env) - the settings this restore just
     loaded, the same ones the command will see when run from this
-    checkout and shell."""
+    checkout and shell. The command goes through the control process,
+    which the resume hint's `--via-control` needs running: the run's own
+    flags travel, and the engine-wide settings (which hold for every run
+    the control process hosts and no start body can change) become a
+    `restart rosctl control with ...` note instead of a start flag."""
     flags = [f"--from-day {day}", f"--to-day {run['to_day']}", f"--seed {run['seed']}"]
     flags += [f"--run-id {run_id}", f"--speed {_num(speed)}"]
     if skip_first_restock:
         flags.append("--skip-first-restock")
     notes: list[str] = []
+    control_flags: list[str] = []
     rate = float(run.get("duplicate_rate", 0.0))
     if rate != sim.playback_duplicate_rate:
         flags.append(f"--duplicate-rate {_num(rate)}")
@@ -1137,9 +1147,9 @@ def replay_command(
     sequential = bool(engine.get("sequential"))
     region = engine.get("region")
     if sequential:
-        flags.append("--sequential")
+        control_flags.append("--sequential")
     if region is not None:
-        flags.append(f"--region {region}")
+        control_flags.append(f"--region {region}")
     target = engine.get("target_url")
     if target:
         base = _api_base(str(target))
@@ -1149,62 +1159,70 @@ def replay_command(
 
             edge = _api_base(edge_target_url(cluster, region))
         if base == edge:
-            flags.append("--target edge")
+            control_flags.append("--target edge")
         elif base != _api_base(sim.playback_target_url):
-            flags.append(f"--target {base}")
+            control_flags.append(f"--target {base}")
     inflight = engine.get("inflight")
     if inflight is not None and not sequential and inflight != sim.playback_inflight:
-        flags.append(f"--inflight {inflight}")
+        control_flags.append(f"--inflight {inflight}")
     events = engine.get("events")
     if events:
         if bool(events.get("enabled")) != sim.playback_status_events:
-            flags.append("--events" if events.get("enabled") else "--no-events")
+            control_flags.append("--events" if events.get("enabled") else "--no-events")
         if events.get("enabled") and events.get("sample_rate") != sim.playback_event_sample_rate:
-            flags.append(f"--event-sample-rate {_num(events.get('sample_rate'))}")
+            control_flags.append(f"--event-sample-rate {_num(events.get('sample_rate'))}")
         if events.get("enabled") and events.get("jitter_s") != sim.playback_event_jitter_s:
             notes.append(
-                f"set ROS_SIM_PLAYBACK_EVENT_JITTER_S={_num(events.get('jitter_s'))} first "
-                "(it has no flag)"
+                "restart `rosctl control` with "
+                f"ROS_SIM_PLAYBACK_EVENT_JITTER_S={_num(events.get('jitter_s'))} "
+                "first (it has no flag)"
             )
     if "restock_every" in engine:
         every = engine.get("restock_every")
         if every is None:
-            notes.append("the saved run had no restock, which rosctl playback start cannot set")
+            notes.append("the saved run had no restock, which no start flag can set")
         elif every != sim.stock_restock_days:
-            flags.append(f"--restock-days {every}")
+            control_flags.append(f"--restock-days {every}")
     offset = engine.get("duplicate_offset_s")
     if offset is not None and offset != sim.playback_duplicate_offset_s:
-        flags.append(f"--duplicate-offset-s {_num(offset)}")
+        control_flags.append(f"--duplicate-offset-s {_num(offset)}")
     window = engine.get("shuffle_window")
     if window is not None and window != sim.shuffle_window:
-        flags.append(f"--shuffle-window {window}")
+        control_flags.append(f"--shuffle-window {window}")
     kitchen = engine.get("kitchen") or {}
     if kitchen.get("mode") == "override":
-        flags.append(f"--kitchen-target {kitchen.get('url')}")
+        control_flags.append(f"--kitchen-target {kitchen.get('url')}")
     elif kitchen.get("mode") == "edge":
         from restaurantos.sim.playback_cli import kitchen_urls
 
         if kitchen.get("urls") != kitchen_urls(cluster, sim.playback_edge_host):
             notes.append(
-                f"the saved run sent kitchen calls to {kitchen.get('urls')}: set "
-                "ROS_SIM_PLAYBACK_EDGE_HOST to match first (it has no flag)"
+                f"the saved run sent kitchen calls to {kitchen.get('urls')}: restart "
+                "`rosctl control` with ROS_SIM_PLAYBACK_EDGE_HOST set to match "
+                "(it has no flag)"
             )
     elif kitchen.get("mode") == "target":
         notes.append(
-            "the saved run sent kitchen calls to its order target, which "
-            "rosctl playback start cannot set"
+            "the saved run sent kitchen calls to its order target, which no start flag can set"
+        )
+    if control_flags:
+        notes.append(
+            "restart `rosctl control` with "
+            + " ".join(control_flags)
+            + " first (they hold for every run it hosts)"
         )
     if engine is not run.get("engine"):
         notes.append(
             "this snapshot predates the recorded engine settings: add any other "
-            "start flag the original run used"
+            "`rosctl control` engine flag the original run used"
         )
     else:
         notes.append(
-            "flags left out match your current settings (ROS_SIM_*, .env); if you "
-            "change those first, add the flags back"
+            "flags left out match your current settings (ROS_SIM_*, .env), which "
+            "`rosctl control` runs with; if you change those first, restart it "
+            "with them"
         )
-    return "rosctl playback start " + " ".join(flags), notes
+    return "rosctl playback start --via-control " + " ".join(flags), notes
 
 
 async def _resume(
@@ -1296,7 +1314,8 @@ async def _resume(
     if host is None:
         resume["started"] = False
         resume["warnings"].append(
-            f"no playback host at {ctx.playback.base_url}; resume with: {manual}"
+            f"no playback host at {ctx.playback.base_url}; start `rosctl control`, "
+            f"then resume with: {manual}"
         )
         resume["warnings"].append(linked)
         resume["warnings"] += notes
@@ -1426,7 +1445,7 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         shutil.copytree(snap / "run" / run_id, target)
     await asyncio.to_thread(docker.start, services)
     later = gateway_hq_cuts(snapshot_cluster, saved)
-    skipped_toxics, cut = await _restore_toxiproxy(ctx, snapshot_cluster, saved, later=later)
+    cut = await _restore_toxiproxy(ctx, snapshot_cluster, saved, later=later)
     if containers:
         # every service entry of the snapshot's shape (the generated file
         # was rebuilt from it); a container has no precheck - its
@@ -1451,10 +1470,6 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         "resume": None,
         "warnings": [],
     }
-    if skipped_toxics:
-        result["warnings"].append(
-            f"not restored (needs the faults-control PR): toxics {', '.join(skipped_toxics)}"
-        )
     if differs:
         result["warnings"].append(
             f"{ctx.cluster_file} now holds the snapshot's cluster shape; restart any "

@@ -1115,12 +1115,13 @@ async def test_restore_puts_everything_back_and_replays_the_day(world: World) ->
     assert (ctx.generated_dir / "compose.yaml").is_file()
     # the run log is the snapshot's again: order 2 came after it
     assert '"external_order_id": "2"' not in log.read_text()
-    # Toxiproxy: healed, then the cut proxy is cut again; the toxic is
-    # reported until the faults-control PR brings add_toxic
+    # Toxiproxy: healed, then the cut proxy is cut again and the saved
+    # toxic is back - the control process lists both as unexplained, and
+    # its heal-all clears them
     assert host.healed
     assert server.proxies[SHARED]["enabled"] is False
-    assert server.proxies[SHARED]["toxics"] == []
-    assert any(f"{SHARED}/f1-latency-up" in warning for warning in result["warnings"])
+    assert server.toxic_names(SHARED) == ["f1-latency-up"]
+    assert not any(f"{SHARED}/f1-latency-up" in warning for warning in result["warnings"])
     # the resume: the snapshot's day from midnight, as a new run
     start = next(body for body in host.commands if body["action"] == "start")
     assert start["from_day"] == 23 and start["to_day"] == 28 and start["seed"] == 7
@@ -1233,7 +1234,7 @@ async def test_restore_without_a_playback_host_says_how_to_resume(world: World) 
     result = await restore("snap", ctx)
     resume = result["resume"]
     assert resume["started"] is False
-    assert "rosctl playback start --from-day 23" in resume["warnings"][0]
+    assert "rosctl playback start --via-control --from-day 23" in resume["warnings"][0]
 
 
 async def test_restore_does_not_start_on_a_host_with_other_engine_settings(world: World) -> None:
@@ -1291,10 +1292,11 @@ def _command(run: dict, sim: SimSettings | None = None, **kwargs) -> tuple[str, 
 def test_a_run_on_the_current_settings_gets_the_minimal_command() -> None:
     command, notes = _command({"duplicate_rate": 0.0, "shuffle": False, "engine": ENGINE})
     minimal = "--from-day 23 --to-day 28 --seed 7 --run-id run-a-r1 --speed 1000"
-    assert command == f"rosctl playback start {minimal}"
+    assert command == f"rosctl playback start --via-control {minimal}"
     assert notes == [
-        "flags left out match your current settings (ROS_SIM_*, .env); if you "
-        "change those first, add the flags back"
+        "flags left out match your current settings (ROS_SIM_*, .env), which "
+        "`rosctl control` runs with; if you change those first, restart it "
+        "with them"
     ]
 
 
@@ -1333,6 +1335,9 @@ def test_the_engine_flags_of_a_sequential_edge_run() -> None:
         "kitchen": {"mode": "override", "url": "http://127.0.0.1:8900/api/v1"},
     }
     command, notes = _command({"engine": engine})
+    # engine-wide settings hold for every run the control process hosts:
+    # they cannot travel with the start, so they are a restart note
+    restart = next(note for note in notes if "--sequential" in note)
     for flag in (
         "--sequential",
         "--region r1",
@@ -1342,12 +1347,14 @@ def test_the_engine_flags_of_a_sequential_edge_run() -> None:
         "--shuffle-window 4",
         "--kitchen-target http://127.0.0.1:8900/api/v1",
     ):
-        assert flag in command
-    assert "--inflight" not in command  # sequential means 1
+        assert flag in restart
+    assert "--inflight" not in restart  # sequential means 1
+    assert "--sequential" not in command and "--region" not in command
     assert any("ROS_SIM_PLAYBACK_EVENT_JITTER_S=30" in note for note in notes)
 
 
 def test_a_snapshot_without_engine_facts_falls_back_to_its_three() -> None:
     command, notes = _command({"sequential": True, "region": "r1", "target_url": None})
-    assert "--sequential --region r1" in command
+    assert any("--sequential --region r1" in note for note in notes)
+    assert "--sequential" not in command
     assert any("predates" in note for note in notes)
