@@ -1265,7 +1265,12 @@ def replay_command(
 
 
 async def _resume(
-    ctx: Context, record: dict[str, Any], snap: Path, cluster: Cluster
+    ctx: Context,
+    record: dict[str, Any],
+    snap: Path,
+    cluster: Cluster,
+    *,
+    services_started: bool = True,
 ) -> dict[str, Any]:
     run = record["run"]
     day = int(record["sim_day"])
@@ -1349,6 +1354,16 @@ async def _resume(
         f"the link to the parent run is written ({new_dir / RESUMED_FROM}): start with "
         f"exactly --run-id {new_run}, and rosctl check --run {new_run} covers the whole run"
     )
+    if not services_started:
+        # every order of the replay would fail against services that are down
+        resume["started"] = False
+        resume["warnings"].append(
+            f"the replay was not started, as the services are not: start them, then "
+            f"resume with: {manual}"
+        )
+        resume["warnings"].append(linked)
+        resume["warnings"] += notes
+        return resume
     host = await ctx.playback.status()
     if host is None:
         resume["started"] = False
@@ -1413,7 +1428,17 @@ async def _resume(
     return resume
 
 
-async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False) -> dict[str, Any]:
+# How restore starts the services afterwards. auto: the way they ran
+# before it (host processes or containers), and none if none ran - it
+# never guesses; the others choose explicitly.
+SERVICE_MODES = ("auto", "host", "containers", "none")
+
+
+async def restore(
+    name: str, ctx: Context, *, replace_cluster_file: bool = False, services: str = "auto"
+) -> dict[str, Any]:
+    if services not in SERVICE_MODES:
+        raise SnapshotError(f"services must be one of {', '.join(SERVICE_MODES)}, not {services!r}")
     check_name(name)
     snap = ctx.snapshot_dir / name
     record_file = snap / SNAPSHOT_FILE
@@ -1449,11 +1474,11 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     running = await asyncio.to_thread(docker.container_image, HQ_PRIMARY)
     if running is not None:
         _check_image(saved_image, running, "nothing was changed")
-    # Which way do the services run? Restore restarts them the same way
-    # (they cache epochs and primaries the restore makes stale): host
-    # processes through rosctl down/up, or the generated file's
-    # `services` profile containers (container mode). Never both: they
-    # share ports.
+    # Which way do the services run? Restore stops them whichever way they
+    # run (they cache epochs and primaries the restore makes stale), and
+    # starts them again the way `services` says: host processes through
+    # rosctl down/up, or the generated file's `services` profile
+    # containers (container mode). Never both: they share ports.
     from restaurantos.sim.services import service_specs
 
     entries = [spec.name for spec in service_specs(current_cluster or snapshot_cluster)]
@@ -1465,10 +1490,17 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
             f"({', '.join(containers)}), on the same ports: stop one set first; nothing "
             "was changed"
         )
+    running = "containers" if containers else "host" if host else None
+    if services in ("host", "containers") and running not in (None, services):
+        raise SnapshotError(
+            f"the services run as {running} now, not {services}: stop them first, or "
+            f"restore with --services {running}; nothing was changed"
+        )
+    start = running if services == "auto" else None if services == "none" else services
     await _stop_live_run(ctx)
     if containers:
         await asyncio.to_thread(docker.stop_service_containers, containers)
-    elif ctx.services_down is not None:
+    elif host and ctx.services_down is not None:
         await asyncio.to_thread(ctx.services_down)
     if current_cluster is not None:
         # the databases of the shape running now, from today's generated file
@@ -1480,8 +1512,8 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     from restaurantos.sim.generator import generate
 
     generate(snapshot_cluster, ctx.generated_dir, snapshot_toml)
-    services = database_services(snapshot_cluster)
-    await asyncio.to_thread(docker.create_missing, services)
+    databases = database_services(snapshot_cluster)
+    await asyncio.to_thread(docker.create_missing, databases)
     found = await asyncio.to_thread(docker.container_image, HQ_PRIMARY)
     if found is None:
         raise SnapshotError(f"no {HQ_PRIMARY} container after compose up --no-start")
@@ -1490,7 +1522,7 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     abort = threading.Event()
 
     def unpack_all() -> None:
-        for node in services:
+        for node in databases:
             if abort.is_set():
                 raise SnapshotError("cancelled")
             docker.unpack(volume_name(node), snap, image)
@@ -1509,16 +1541,16 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         if target.exists():
             shutil.rmtree(target)
         shutil.copytree(snap / "run" / run_id, target)
-    await asyncio.to_thread(docker.start, services)
+    await asyncio.to_thread(docker.start, databases)
     later = gateway_hq_cuts(snapshot_cluster, saved)
     cut = await _restore_toxiproxy(ctx, snapshot_cluster, saved, later=later)
-    if containers:
+    if start == "containers":
         # every service entry of the snapshot's shape (the generated file
         # was rebuilt from it); a container has no precheck - its
         # healthcheck is its readiness route
         names = [spec.name for spec in service_specs(snapshot_cluster)]
         await asyncio.to_thread(docker.start_service_containers, names)
-    elif ctx.services_up is not None:
+    elif start == "host" and ctx.services_up is not None:
         # A cut proxy does not listen, and rosctl up's precheck dials every
         # proxy the services use: name the cut ones so it skips them. The
         # cut stays in place - starting healed and cutting afterwards would
@@ -1533,9 +1565,23 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         "sim_day": record.get("sim_day"),
         "sim_time": record.get("sim_time"),
         "cluster_file_replaced": differs,
+        "services": start or "none",
         "resume": None,
         "warnings": [],
     }
+    if start is None:
+        why = "none were running" if services == "auto" else "--services none"
+        result["warnings"].append(
+            f"the services were not started ({why}): start them with rosctl up (host "
+            "processes) or docker compose -p restaurantos -f infra/generated/compose.yaml "
+            "--profile services up -d --wait (containers)"
+        )
+        if later:
+            result["warnings"].append(
+                f"the gateway's links to HQ are cut as saved ({', '.join(later)}): a gateway "
+                "started now cannot load its routing - heal them first, or restore again "
+                "with --services host or --services containers"
+            )
     if differs:
         result["warnings"].append(
             f"{ctx.cluster_file} now holds the snapshot's cluster shape; restart any "
@@ -1550,7 +1596,9 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
                     f"{', '.join(left)} (not in the snapshot's shape; nothing deletes them)"
                 )
     if record.get("run"):
-        result["resume"] = await _resume(ctx, record, snap, snapshot_cluster)
+        result["resume"] = await _resume(
+            ctx, record, snap, snapshot_cluster, services_started=start is not None
+        )
     return result
 
 

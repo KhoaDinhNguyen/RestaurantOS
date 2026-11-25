@@ -9,7 +9,7 @@ body-validation 422s keep FastAPI's default shape, as on the gateway.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -215,6 +215,9 @@ class SaveSnapshotBody(BaseModel):
 
 class RestoreSnapshotBody(BaseModel):
     replace_cluster_file: bool = False
+    # how to start the services afterwards (snapshot.SERVICE_MODES): auto
+    # starts them the way they ran before, and none if none ran
+    services: Literal["auto", "host", "containers", "none"] = "auto"
 
 
 def add_sim_jobs(app: FastAPI) -> None:
@@ -297,10 +300,15 @@ def add_sim_jobs(app: FastAPI) -> None:
 
     @app.post("/sim/snapshots/{name}/restore", status_code=202)
     async def sim_snapshot_restore(name: str, body: RestoreSnapshotBody | None = None) -> Any:
-        replace = bool(body and body.replace_cluster_file)
+        options = body or RestoreSnapshotBody()
 
         async def work() -> Any:
             ctx = default_context(Path(get_settings().cluster_file), sim)
-            return await restore(name, ctx, replace_cluster_file=replace)
+            return await restore(
+                name,
+                ctx,
+                replace_cluster_file=options.replace_cluster_file,
+                services=options.services,
+            )
 
         return _submit("restore", name, work)

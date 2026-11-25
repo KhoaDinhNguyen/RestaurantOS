@@ -347,6 +347,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="write the snapshot's cluster.toml over the current one when they differ",
     )
+    srestore.add_argument(
+        "--services",
+        # snapshot.SERVICE_MODES (not imported here: the CLI loads lazily)
+        choices=("auto", "host", "containers", "none"),
+        default="auto",
+        help="how to start the services afterwards: auto (default) starts them the way "
+        "they ran before, and none if none ran; host, containers or none choose",
+    )
     for sparser in (ssave, srestore):
         sparser.add_argument(
             "--config",

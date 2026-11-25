@@ -19,6 +19,11 @@ def test_parsers() -> None:
         parser.parse_args(["check"])
     restore = parser.parse_args(["snapshot", "restore", "s1", "--replace-cluster-file"])
     assert restore.name == "s1" and restore.replace_cluster_file
+    assert restore.services == "auto"
+    restore = parser.parse_args(["snapshot", "restore", "s1", "--services", "containers"])
+    assert restore.services == "containers"
+    with pytest.raises(SystemExit):
+        parser.parse_args(["snapshot", "restore", "s1", "--services", "both"])
     assert parser.parse_args(["snapshot", "list"]).snapshot_command == "list"
     assert parser.parse_args(["playback", "start", "--skip-first-restock"]).skip_first_restock
 
@@ -87,3 +92,25 @@ def test_snapshot_list_with_none(monkeypatch, capsys, tmp_path) -> None:
         assert json.loads(capsys.readouterr().out) == []
     finally:
         get_sim_settings.cache_clear()
+
+
+def test_snapshot_restore_passes_the_services_mode(monkeypatch, capsys, tmp_path) -> None:
+    from restaurantos.sim.snapshot import SERVICE_MODES
+
+    # the parser takes every mode the restore has
+    for mode in SERVICE_MODES:
+        args = build_parser().parse_args(["snapshot", "restore", "s1", "--services", mode])
+        assert args.services == mode
+    cluster_file = tmp_path / "cluster.toml"
+    cluster_file.write_text("[cluster]\nregions = 1\n", encoding="utf-8")
+    seen: dict = {}
+
+    async def restore(name, ctx, *, replace_cluster_file=False, services="auto"):
+        seen.update(name=name, services=services)
+        return {"name": name, "warnings": []}
+
+    monkeypatch.setattr(jobs_cli, "restore", restore)
+    monkeypatch.setattr(jobs_cli, "default_context", lambda *a, **kw: object())
+    argv = ["snapshot", "restore", "s1", "--services", "none", "--config", str(cluster_file)]
+    assert app(argv) == 0
+    assert seen == {"name": "s1", "services": "none"}

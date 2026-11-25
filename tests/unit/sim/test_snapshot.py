@@ -414,6 +414,8 @@ def world(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> World:
         clock=lambda: host.wall,
         services_down=lambda: services.append("down"),
         services_up=lambda cluster, path, down: services.append(f"up {list(down)}"),
+        # host processes run, unless a test runs the services as containers
+        host_services=lambda: [] if docker.running_containers else ["gateway"],
     )
     return ctx, host, docker, server, services
 
@@ -1004,6 +1006,72 @@ async def test_restore_refuses_services_running_both_ways(world: World) -> None:
     with pytest.raises(SnapshotError, match="both as host processes"):
         await restore("snap", ctx)
     assert docker.calls == [] and host.commands == [] and services == []
+
+
+async def test_restore_starts_no_services_when_none_ran(world: World) -> None:
+    """auto never guesses: nothing ran, nothing is started, the replay is
+    not resumed against services that are down, and it says how to go on."""
+    ctx, host, docker, _, services = world
+    await save("snap", ctx)
+    host.commands.clear()
+    ctx.host_services = lambda: []
+    result = await restore("snap", ctx)
+    assert services == []
+    assert not any(call[0] in ("stop_services", "start_services") for call in docker.calls)
+    assert result["services"] == "none"
+    assert any("not started (none were running)" in w for w in result["warnings"])
+    resume = result["resume"]
+    assert resume["started"] is False
+    assert not any(body["action"] == "start" for body in host.commands)
+    assert "the replay was not started, as the services are not" in resume["warnings"][0]
+    # the link is kept: the manual command resumes the same chain
+    assert [p.name for p in (ctx.runs_dir / "run-a-r1").iterdir()] == ["resumed_from.json"]
+
+
+async def test_restore_with_services_none_stops_them_and_starts_none(world: World) -> None:
+    ctx, _, _, server, services = world
+    hq_link = proxy_name("gateway", "hq-primary")
+    server.proxies[hq_link]["enabled"] = False
+    await save("snap", ctx)
+    result = await restore("snap", ctx, services="none")
+    assert services == ["down"]
+    assert result["services"] == "none" and result["resume"]["started"] is False
+    assert any("(--services none)" in w for w in result["warnings"])
+    # the saved cuts still hold, and the gateway's are called out
+    assert server.proxies[hq_link]["enabled"] is False
+    assert any(hq_link in w and "cannot load its routing" in w for w in result["warnings"])
+
+
+async def test_restore_refuses_services_another_way_than_they_run(world: World) -> None:
+    ctx, host, docker, _, services = world
+    await save("snap", ctx)
+    docker.calls.clear()
+    host.commands.clear()
+    with pytest.raises(SnapshotError, match="--services host"):
+        await restore("snap", ctx, services="containers")
+    assert docker.calls == [] and host.commands == [] and services == []
+    with pytest.raises(SnapshotError, match="must be one of"):
+        await restore("snap", ctx, services="both")
+
+
+@pytest.mark.parametrize("mode", ["host", "containers"])
+async def test_restore_starts_the_services_it_is_told_to_when_none_ran(
+    world: World, mode: str
+) -> None:
+    from restaurantos.sim.services import service_specs
+
+    ctx, host, docker, _, services = world
+    await save("snap", ctx)
+    docker.calls.clear()
+    ctx.host_services = lambda: []
+    result = await restore("snap", ctx, services=mode)
+    assert result["services"] == mode and result["resume"]["started"] is True
+    started = [call for call in docker.calls if call[0] == "start_services"]
+    if mode == "host":
+        assert services == ["up []"] and started == []
+    else:
+        entries = tuple(spec.name for spec in service_specs(CLUSTER))
+        assert services == [] and started == [("start_services", entries)]
 
 
 async def test_cancelling_a_restore_waits_for_its_unpack_worker(world: World) -> None:

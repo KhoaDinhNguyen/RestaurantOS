@@ -85,7 +85,12 @@ def snapshot_command(args: argparse.Namespace) -> int:
             result = asyncio.run(save(args.name, ctx))
         else:
             result = asyncio.run(
-                restore(args.name, ctx, replace_cluster_file=args.replace_cluster_file)
+                restore(
+                    args.name,
+                    ctx,
+                    replace_cluster_file=args.replace_cluster_file,
+                    services=args.services,
+                )
             )
     except (SnapshotError, OSError, ValueError) as error:
         print(f"rosctl snapshot {command}: {error}", file=sys.stderr)

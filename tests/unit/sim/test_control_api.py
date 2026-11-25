@@ -592,8 +592,8 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
         seen["saved"] = name
         return {"name": name}
 
-    async def fake_restore(name, ctx, *, replace_cluster_file=False):
-        seen["restored"] = (name, replace_cluster_file)
+    async def fake_restore(name, ctx, *, replace_cluster_file=False, services="auto"):
+        seen["restored"] = (name, replace_cluster_file, services)
         return {"name": name}
 
     def fake_run_check(cluster, run_ids, **kwargs):
@@ -657,12 +657,18 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
         bad = await client.post("/sim/snapshots", json={"name": "../escape"})
         assert bad.status_code == 422
         posted = await client.post(
-            "/sim/snapshots/day7/restore", json={"replace_cluster_file": True}
+            "/sim/snapshots/day7/restore",
+            json={"replace_cluster_file": True, "services": "none"},
         )
         assert posted.status_code == 202 and posted.json()["kind"] == "restore"
         assert posted.json()["name"] == "day7"
         await done(posted.json()["job_id"])
-        assert seen["restored"] == ("day7", True)
+        assert seen["restored"] == ("day7", True, "none")
+        posted = await client.post("/sim/snapshots/day7/restore")
+        await done(posted.json()["job_id"])
+        assert seen["restored"] == ("day7", False, "auto")  # no body: the defaults
+        bad = await client.post("/sim/snapshots/day7/restore", json={"services": "both"})
+        assert bad.status_code == 422
 
         # one job at a time: a busy runner answers 409 with the job id
         release = asyncio.Event()
