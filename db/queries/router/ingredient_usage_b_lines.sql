@@ -1,16 +1,12 @@
 SELECT
-    pd.dish_id,
-    pd.multiplier,
+    oi.vendor_id,
+    oi.product_id,
     oi.quantity
 FROM orders AS o
 INNER JOIN order_items AS oi
     ON
         o.order_day = oi.order_day
         AND o.order_id = oi.order_id
-INNER JOIN product_dish AS pd
-    ON
-        oi.vendor_id = pd.vendor_id
-        AND oi.product_id = pd.product_id
 WHERE
     (
         (
@@ -39,6 +35,6 @@ WHERE
         )
     )
 ORDER BY
-    pd.dish_id ASC,
-    pd.multiplier ASC,
+    oi.vendor_id ASC,
+    oi.product_id ASC,
     oi.quantity ASC;

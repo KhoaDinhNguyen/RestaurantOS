@@ -592,7 +592,7 @@ def create_app() -> FastAPI:
             "to_day": window.to_day,
             "from_time": (window.from_time.isoformat() if window.from_time is not None else None),
             "to_time": (window.to_time.isoformat() if window.to_time is not None else None),
-            "strategy": strategy,
+            "strategy": strategy if mode == "live" else None,
             "results": result.results,
             "meta": result.meta.model_dump(mode="json"),
         }

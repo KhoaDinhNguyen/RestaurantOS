@@ -111,8 +111,8 @@ async def query_strategy_b_lines(
 
         return [
             {
-                "dish_id": row[0],
-                "multiplier": row[1],
+                "vendor_id": row[0],
+                "product_id": row[1],
                 "quantity": row[2],
             }
             for row in rows
@@ -158,25 +158,36 @@ def join_lines_with_recipes(
     lines: list[dict[str, Any]],
     recipes: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Join shipped order lines with HQ recipes and aggregate usage."""
+    """Join shipped order lines with HQ product links and recipes."""
 
-    by_dish: dict[str, list[dict[str, Any]]] = {}
+    by_product: dict[
+        tuple[str, str],
+        list[dict[str, Any]],
+    ] = {}
 
     for recipe in recipes:
-        by_dish.setdefault(
-            recipe["dish_id"],
-            [],
-        ).append(recipe)
+        key = (
+            recipe["vendor_id"],
+            recipe["product_id"],
+        )
+        by_product.setdefault(key, []).append(recipe)
 
     totals: dict[tuple[str, str], int] = {}
 
     for line in lines:
-        for recipe in by_dish.get(line["dish_id"], []):
+        product_key = (
+            line["vendor_id"],
+            line["product_id"],
+        )
+
+        for recipe in by_product.get(product_key, []):
             key = (
                 recipe["ingredient_id"],
                 recipe["unit"],
             )
-            used = line["quantity"] * line["multiplier"] * recipe["amount"]
+
+            used = line["quantity"] * recipe["multiplier"] * recipe["amount"]
+
             totals[key] = totals.get(key, 0) + used
 
     rows = [
@@ -245,11 +256,9 @@ async def ingredient_usage_b_live(
 
         lines.extend(rows)
 
-    dish_ids = sorted({row["dish_id"] for row in lines})
-
-    recipes = await query_recipes(
+    recipes = await query_product_recipes(
         hq_pool,
-        dish_ids,
+        lines,
     )
 
     results = join_lines_with_recipes(
@@ -567,3 +576,47 @@ async def ingredient_usage_single(
             elapsed_ms=(perf_counter() - started) * 1000,
         ),
     )
+
+
+async def query_product_recipes(
+    pool: AsyncConnectionPool,
+    lines: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Read HQ product links and recipes for shipped order lines."""
+
+    keys = sorted(
+        {
+            (
+                row["vendor_id"],
+                row["product_id"],
+            )
+            for row in lines
+        }
+    )
+
+    if not keys:
+        return []
+
+    async def work(conn) -> list[dict[str, Any]]:
+        cursor = await conn.execute(
+            load_query("router/ingredient_product_recipes"),
+            {
+                "vendor_ids": [vendor_id for vendor_id, _ in keys],
+                "product_ids": [product_id for _, product_id in keys],
+            },
+        )
+        rows = await cursor.fetchall()
+
+        return [
+            {
+                "vendor_id": row[0],
+                "product_id": row[1],
+                "multiplier": row[2],
+                "ingredient_id": row[3],
+                "amount": row[4],
+                "unit": row[5],
+            }
+            for row in rows
+        ]
+
+    return await run_on(pool, work)

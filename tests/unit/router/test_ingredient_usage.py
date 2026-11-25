@@ -77,20 +77,24 @@ def test_strategy_b_router_join() -> None:
     result = join_lines_with_recipes(
         [
             {
-                "dish_id": "d_rice",
-                "multiplier": 2,
+                "vendor_id": "v1",
+                "product_id": "p_rice",
                 "quantity": 3,
             }
         ],
         [
             {
-                "dish_id": "d_rice",
+                "vendor_id": "v1",
+                "product_id": "p_rice",
+                "multiplier": 2,
                 "ingredient_id": "rice",
                 "amount": 250,
                 "unit": "gram",
             },
             {
-                "dish_id": "d_rice",
+                "vendor_id": "v1",
+                "product_id": "p_rice",
+                "multiplier": 2,
                 "ingredient_id": "beef",
                 "amount": 2,
                 "unit": "kg",
@@ -136,31 +140,44 @@ async def test_strategy_b_live_ships_lines_and_joins_hq_recipes(
         if region_id == "r1":
             return [
                 {
-                    "dish_id": "d_rice",
-                    "multiplier": 2,
+                    "vendor_id": "v1",
+                    "product_id": "p_rice_set",
                     "quantity": 3,
                 }
             ]
 
         return [
             {
-                "dish_id": "d_rice",
-                "multiplier": 1,
+                "vendor_id": "v2",
+                "product_id": "p_rice_single",
                 "quantity": 2,
             }
         ]
 
-    async def fake_recipes(pool, dish_ids):
+    async def fake_product_recipes(pool, lines):
         assert pool is hq_pool
-        assert dish_ids == ["d_rice"]
+        assert {(row["vendor_id"], row["product_id"], row["quantity"]) for row in lines} == {
+            ("v1", "p_rice_set", 3),
+            ("v2", "p_rice_single", 2),
+        }
 
         return [
             {
-                "dish_id": "d_rice",
+                "vendor_id": "v1",
+                "product_id": "p_rice_set",
+                "multiplier": 2,
                 "ingredient_id": "rice",
                 "amount": 250,
                 "unit": "gram",
-            }
+            },
+            {
+                "vendor_id": "v2",
+                "product_id": "p_rice_single",
+                "multiplier": 1,
+                "ingredient_id": "rice",
+                "amount": 250,
+                "unit": "gram",
+            },
         ]
 
     monkeypatch.setattr(
@@ -170,8 +187,8 @@ async def test_strategy_b_live_ships_lines_and_joins_hq_recipes(
     )
     monkeypatch.setattr(
         ingredient_usage,
-        "query_recipes",
-        fake_recipes,
+        "query_product_recipes",
+        fake_product_recipes,
     )
 
     result = await ingredient_usage.ingredient_usage_b_live(
@@ -227,16 +244,19 @@ async def test_strategy_b_live_keeps_partial_results(
 
         return [
             {
-                "dish_id": "d_rice",
-                "multiplier": 2,
+                "vendor_id": "v1",
+                "product_id": "p_rice",
                 "quantity": 3,
             }
         ]
 
-    async def fake_recipes(pool, dish_ids):
+    async def fake_product_recipes(pool, lines):
+        assert pool is hq_pool
         return [
             {
-                "dish_id": "d_rice",
+                "vendor_id": "v1",
+                "product_id": "p_rice",
+                "multiplier": 2,
                 "ingredient_id": "rice",
                 "amount": 250,
                 "unit": "gram",
@@ -250,8 +270,8 @@ async def test_strategy_b_live_keeps_partial_results(
     )
     monkeypatch.setattr(
         ingredient_usage,
-        "query_recipes",
-        fake_recipes,
+        "query_product_recipes",
+        fake_product_recipes,
     )
 
     result = await ingredient_usage.ingredient_usage_b_live(

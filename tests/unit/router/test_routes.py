@@ -253,6 +253,7 @@ def test_ingredient_usage_hq_ignores_strategy(monkeypatch) -> None:
 
     assert response.status_code == 200
     assert response.json()["meta"]["mode"] == "hq"
+    assert response.json()["strategy"] is None
 
     single.assert_awaited_once()
     c_query.assert_not_awaited()

@@ -17,13 +17,18 @@ from restaurantos.gateway.router.ingredient_usage import (
     ingredient_usage_single,
     join_lines_with_recipes,
     merge_ingredient_usage,
+    query_product_recipes,
     query_recipes,
     query_strategy_a_region,
     query_strategy_b_lines,
     query_strategy_c_aggregate,
     query_strategy_c_dishes,
 )
-from restaurantos.gateway.router.nearby import nearby_live
+from restaurantos.gateway.router.nearby import (
+    nearby_cells,
+    nearby_live,
+    query_region,
+)
 from restaurantos.gateway.router.top_dishes import (
     merge_top_dishes,
     query_top_dishes_node,
@@ -411,12 +416,10 @@ async def test_ingredient_strategy_b_matches_baseline(
     )
 
     lines = [*r1_lines, *r2_lines]
-    dish_ids = sorted({row["dish_id"] for row in lines})
 
-    # Baseline has the same shared recipe reference data as HQ.
-    recipes = await query_recipes(
-        mini_cluster.baseline,
-        dish_ids,
+    recipes = await query_product_recipes(
+        mini_cluster.hq,
+        lines,
     )
 
     live = join_lines_with_recipes(
@@ -520,14 +523,13 @@ async def test_all_ingredient_strategies_return_same_numbers(
     )
     lines = [*b1, *b2]
 
-    dish_ids = sorted({row["dish_id"] for row in lines})
-    recipes = await query_recipes(
-        mini_cluster.baseline,
-        dish_ids,
+    product_recipes = await query_product_recipes(
+        mini_cluster.hq,
+        lines,
     )
     strategy_b = join_lines_with_recipes(
         lines,
-        recipes,
+        product_recipes,
     )
 
     # C
@@ -541,6 +543,19 @@ async def test_all_ingredient_strategies_return_same_numbers(
         window,
         region_id="r2",
     )
+
+    c_dish_ids = sorted(set(c1_dishes) | set(c2_dishes))
+    recipes = await query_recipes(
+        mini_cluster.hq,
+        c_dish_ids,
+    )
+
+    recipes_by_dish: dict[str, list[dict]] = {}
+    for recipe in recipes:
+        recipes_by_dish.setdefault(
+            recipe["dish_id"],
+            [],
+        ).append(recipe)
 
     recipes_by_dish: dict[str, list[dict]] = {}
     for recipe in recipes:
@@ -686,3 +701,35 @@ async def test_ingredient_usage_hq_matches_cluster_and_baseline(
     )
 
     assert live == baseline == hq.results
+
+
+async def test_nearby_cluster_matches_baseline(
+    mini_cluster,
+) -> None:
+    geohash = "w21z7"
+    dish_id = "d007"
+    limit = 10
+
+    live = await nearby_live(
+        geohash,
+        dish_id,
+        limit,
+        mini_directory(),
+        MiniRegionPools(mini_cluster),
+    )
+
+    cells = nearby_cells(geohash)
+
+    baseline_rows = await query_region(
+        mini_cluster.baseline,
+        "baseline",
+        cells,
+        dish_id,
+        limit,
+    )
+
+    # Execution location differs, but the query results should not.
+    def comparable(rows):
+        return [{key: value for key, value in row.items() if key != "region_id"} for row in rows]
+
+    assert comparable(live.results) == comparable(baseline_rows)
