@@ -9,7 +9,7 @@ body-validation 422s keep FastAPI's default shape, as on the gateway.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -200,17 +200,21 @@ def add_control_routes(app: FastAPI, *, faults: FaultLayer, nodes: Nodes, jobs: 
     configure_control_cors(app)
 
 
-class CheckBody(BaseModel):
-    """POST /sim/check: the runs to check and whether parked-but-unacked
-    orders count as failures (the CLI's --allow-unacked)."""
+# what a run id or snapshot name may be: one path component, no traversal
+ONE_COMPONENT = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
 
-    runs: list[str]
+
+class CheckBody(BaseModel):
+    """POST /sim/check: the runs to check (at least one, each a run id the
+    playback host could have made) and whether parked-but-unacked orders
+    count as failures (the CLI's --allow-unacked)."""
+
+    runs: list[Annotated[str, Field(pattern=ONE_COMPONENT)]] = Field(min_length=1)
     allow_unacked: bool = False
 
 
 class SaveSnapshotBody(BaseModel):
-    # the same shape a run id allows: one path component, no traversal
-    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+    name: str = Field(pattern=ONE_COMPONENT)
 
 
 class RestoreSnapshotBody(BaseModel):

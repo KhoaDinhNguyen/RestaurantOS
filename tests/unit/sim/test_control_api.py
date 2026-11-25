@@ -643,6 +643,10 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
         posted = await client.post("/sim/check", json={"runs": ["run-b"], "allow_unacked": True})
         assert (await done(posted.json()["job_id"]))["result"] == {"passed": True}
         assert seen["checked"] == (["run-b"], True, None)
+        # the runs are run ids: at least one, each one path component
+        for runs in ([], ["../etc"], ["run-a", "a/b"], [".hidden"], [""]):
+            bad = await client.post("/sim/check", json={"runs": runs})
+            assert bad.status_code == 422, runs
 
         # the listing is a plain read of the snapshot directory
         listed = await client.get("/sim/snapshots")
