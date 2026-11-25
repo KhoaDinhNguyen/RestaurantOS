@@ -830,6 +830,42 @@ async def test_save_refuses_a_run_whose_history_is_missing(world: World) -> None
     assert [body["action"] for body in host.commands] == ["pause", "resume"]
 
 
+async def test_a_manual_resume_is_linked_to_its_parent(world: World) -> None:
+    """No playback host: restore cannot start the replay, but it writes
+    the link first, so a check of the run started by hand covers the
+    whole run."""
+    ctx, host, _, _, _ = world
+    await save("snap", ctx)
+    host.alive = False
+    result = await restore("snap", ctx)
+    resume = result["resume"]
+    assert resume["started"] is False
+    link = json.loads((ctx.runs_dir / "run-a-r1" / "resumed_from.json").read_text())
+    assert link["parent_run"] == "run-a" and link["snapshot"] == "snap"
+    assert any("--run-id run-a-r1" in w and "link" in w for w in resume["warnings"])
+    # the reserved id: the next restore picks -r2
+    from restaurantos.sim.snapshot import next_run_id
+
+    assert next_run_id(ctx.runs_dir, "run-a") == "run-a-r2"
+
+
+async def test_a_failed_automatic_start_drops_the_reserved_link(world: World) -> None:
+    ctx, host, _, _, _ = world
+    await save("snap", ctx)
+    real_command = host.command
+
+    async def command(body: dict) -> httpx.Response:
+        if body["action"] == "start":
+            host.commands.append(body)
+            return httpx.Response(409, json={"message": "busy"})
+        return await real_command(body)
+
+    host.command = command  # type: ignore[method-assign]
+    result = await restore("snap", ctx)
+    assert result["resume"]["started"] is False and result["resume"]["link"] is None
+    assert not (ctx.runs_dir / "run-a-r1").exists()
+
+
 async def test_save_without_a_run_records_no_run(world: World) -> None:
     ctx, host, _, _, _ = world
     host.alive = False
@@ -1074,7 +1110,8 @@ async def test_restore_does_not_start_on_a_host_with_other_engine_settings(world
     resume = result["resume"]
     assert resume["started"] is False
     assert not any(body["action"] == "start" for body in host.commands)
-    assert not (ctx.runs_dir / "run-a-r1").exists()
+    # nothing started; the folder holds only the link, for the run by hand
+    assert [p.name for p in (ctx.runs_dir / "run-a-r1").iterdir()] == ["resumed_from.json"]
     warnings = resume["warnings"]
     assert any("sequential is True" in warning for warning in warnings)
     assert any("region is 'r1'" in warning for warning in warnings)

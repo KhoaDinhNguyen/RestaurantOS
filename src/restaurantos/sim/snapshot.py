@@ -1179,12 +1179,40 @@ async def _resume(
         cluster=cluster,
     )
     resume["manual_command"] = manual
+    # The link to the parent run goes in BEFORE anything starts, on every
+    # path: the checker follows it to the days before the snapshot, and a
+    # run started by hand would otherwise have none - `rosctl check --run
+    # <new>` would then quietly cover only the replayed day onward. The
+    # engine takes a run folder that exists already (it reserves a run id
+    # by creating orders.jsonl, not the folder), so the link also
+    # reserves the id: start the run with exactly this --run-id.
+    new_dir = ctx.runs_dir / new_run
+    new_dir.mkdir(parents=True)
+    (new_dir / RESUMED_FROM).write_text(
+        json.dumps(
+            {
+                "parent_run": run["run_id"],
+                "snapshot": record["name"],
+                "sim_day": record["sim_day"],
+                "sim_time": record["sim_time"],
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    resume["link"] = str(new_dir / RESUMED_FROM)
+    linked = (
+        f"the link to the parent run is written ({new_dir / RESUMED_FROM}): start with "
+        f"exactly --run-id {new_run}, and rosctl check --run {new_run} covers the whole run"
+    )
     host = await ctx.playback.status()
     if host is None:
         resume["started"] = False
         resume["warnings"].append(
             f"no playback host at {ctx.playback.base_url}; resume with: {manual}"
         )
+        resume["warnings"].append(linked)
         resume["warnings"] += notes
         return resume
     # The host's engine settings are fixed when it starts; a start body
@@ -1198,29 +1226,19 @@ async def _resume(
         resume["warnings"].append(
             "the replay was not started: stop that playback host and resume with: " + manual
         )
+        resume["warnings"].append(linked)
         resume["warnings"] += notes
         return resume
     response = await ctx.playback.command(body)
     if response.status_code != 200:
         resume["started"] = False
         resume["warnings"].append(f"the resumed run did not start: {_message(response)}")
+        # nothing was started: drop the reserved folder (it holds only the link)
+        if [entry.name for entry in new_dir.iterdir()] == [RESUMED_FROM]:
+            shutil.rmtree(new_dir)
+            resume["link"] = None
         return resume
     resume["started"] = True
-    new_dir = ctx.runs_dir / new_run
-    if new_dir.is_dir():
-        (new_dir / RESUMED_FROM).write_text(
-            json.dumps(
-                {
-                    "parent_run": run["run_id"],
-                    "snapshot": record["name"],
-                    "sim_day": record["sim_day"],
-                    "sim_time": record["sim_time"],
-                },
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
     if catchup > saved_speed:
         switch_at = point - ctx.sim.snapshot_catchup_margin_s
         while True:
