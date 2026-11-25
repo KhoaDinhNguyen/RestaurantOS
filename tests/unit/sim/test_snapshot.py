@@ -900,9 +900,7 @@ async def test_a_failed_automatic_start_drops_the_reserved_link(world: World) ->
         '[{"name": "x", "toxics": [{"type": "latency"}]}]',
     ],
 )
-async def test_restore_refuses_a_malformed_toxiproxy_file_first(
-    world: World, content: str
-) -> None:
+async def test_restore_refuses_a_malformed_toxiproxy_file_first(world: World, content: str) -> None:
     ctx, host, docker, _, services = world
     await save("snap", ctx)
     (ctx.snapshot_dir / "snap" / "toxiproxy.json").write_text(content)
@@ -1217,7 +1215,6 @@ async def test_restore_with_the_flag_replaces_the_cluster_file(world: World) -> 
     assert ctx.cluster_file.read_text() == TOML
     assert result["cluster_file_replaced"] is True
     assert "restart any process" in result["warnings"][0]
-
 
 
 async def test_restore_names_the_old_shapes_databases_it_leaves(world: World) -> None:
