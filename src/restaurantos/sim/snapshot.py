@@ -1460,6 +1460,14 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
             f"{ctx.cluster_file} now holds the snapshot's cluster shape; restart any "
             "process that read the old one"
         )
+        if current_cluster is not None:
+            kept = set(database_services(snapshot_cluster))
+            left = [node for node in database_services(current_cluster) if node not in kept]
+            if left:
+                result["warnings"].append(
+                    f"the old shape's databases are stopped and kept, with their volumes: "
+                    f"{', '.join(left)} (not in the snapshot's shape; nothing deletes them)"
+                )
     if record.get("run"):
         result["resume"] = await _resume(ctx, record, snap, snapshot_cluster)
     return result

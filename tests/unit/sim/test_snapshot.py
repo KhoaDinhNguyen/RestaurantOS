@@ -1208,6 +1208,16 @@ async def test_restore_with_the_flag_replaces_the_cluster_file(world: World) -> 
     assert "restart any process" in result["warnings"][0]
 
 
+
+async def test_restore_names_the_old_shapes_databases_it_leaves(world: World) -> None:
+    ctx, *_ = world
+    await save("snap", ctx)
+    ctx.cluster_file.write_text("[cluster]\nregions = 2\nstandbys = true\n", encoding="utf-8")
+    result = await restore("snap", ctx, replace_cluster_file=True)
+    left = next(w for w in result["warnings"] if "stopped and kept" in w)
+    assert "r2-primary" in left and "r2-standby" in left and "r1-primary" not in left
+
+
 async def test_restore_without_a_playback_host_says_how_to_resume(world: World) -> None:
     ctx, host, _, _, _ = world
     await save("snap", ctx)
