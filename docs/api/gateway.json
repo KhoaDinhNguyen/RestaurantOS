@@ -245,6 +245,365 @@
                 }
             }
         },
+        "/api/v1/query/nearby": {
+            "get": {
+                "summary": "Query Nearby",
+                "operationId": "query_nearby_api_v1_query_nearby_get",
+                "parameters": [
+                    {
+                        "name": "geohash",
+                        "in": "query",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "minLength": 5,
+                            "maxLength": 5,
+                            "title": "Geohash"
+                        }
+                    },
+                    {
+                        "name": "dish",
+                        "in": "query",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Dish"
+                        }
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "maximum": 100,
+                            "minimum": 1,
+                            "default": 10,
+                            "title": "Limit"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/query/top-dishes": {
+            "get": {
+                "summary": "Query Top Dishes",
+                "operationId": "query_top_dishes_api_v1_query_top_dishes_get",
+                "parameters": [
+                    {
+                        "name": "day",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "integer",
+                                    "minimum": 0
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Day"
+                        }
+                    },
+                    {
+                        "name": "from_day",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "integer",
+                                    "minimum": 0
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "From Day"
+                        }
+                    },
+                    {
+                        "name": "to_day",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "integer",
+                                    "minimum": 0
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "To Day"
+                        }
+                    },
+                    {
+                        "name": "from_time",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "format": "time"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "From Time"
+                        }
+                    },
+                    {
+                        "name": "to_time",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "format": "time"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "To Time"
+                        }
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "maximum": 100,
+                            "minimum": 1,
+                            "default": 10,
+                            "title": "Limit"
+                        }
+                    },
+                    {
+                        "name": "rank_by",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "enum": [
+                                "units",
+                                "quantity",
+                                "order_lines",
+                                "sales_units"
+                            ],
+                            "type": "string",
+                            "default": "units",
+                            "title": "Rank By"
+                        }
+                    },
+                    {
+                        "name": "mode",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "enum": [
+                                "live",
+                                "hq",
+                                "baseline"
+                            ],
+                            "type": "string",
+                            "default": "live",
+                            "title": "Mode"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/query/ingredient-usage": {
+            "get": {
+                "summary": "Query Ingredient Usage",
+                "operationId": "query_ingredient_usage_api_v1_query_ingredient_usage_get",
+                "parameters": [
+                    {
+                        "name": "day",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "integer",
+                                    "minimum": 0
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Day"
+                        }
+                    },
+                    {
+                        "name": "from_day",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "integer",
+                                    "minimum": 0
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "From Day"
+                        }
+                    },
+                    {
+                        "name": "to_day",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "integer",
+                                    "minimum": 0
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "To Day"
+                        }
+                    },
+                    {
+                        "name": "from_time",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "format": "time"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "From Time"
+                        }
+                    },
+                    {
+                        "name": "to_time",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string",
+                                    "format": "time"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "To Time"
+                        }
+                    },
+                    {
+                        "name": "strategy",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "enum": [
+                                "A",
+                                "B",
+                                "C"
+                            ],
+                            "type": "string",
+                            "default": "A",
+                            "title": "Strategy"
+                        }
+                    },
+                    {
+                        "name": "mode",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "enum": [
+                                "live",
+                                "hq",
+                                "baseline"
+                            ],
+                            "type": "string",
+                            "default": "live",
+                            "title": "Mode"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
         "/api/v1/vendors/{vendor_id}/stock": {
             "get": {
                 "summary": "Vendor Stock",
