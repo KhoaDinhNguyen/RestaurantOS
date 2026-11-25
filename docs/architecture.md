@@ -798,7 +798,27 @@ It answers `201` with the fault; `404` for an unknown link group; `409` with `{"
   "proxies": ["gateway__r1-primary", "gateway__r1-standby"], "created_at": "..." }
 ```
 
-`DELETE /sim/faults/{fault_id}` answers `200`, or `404`. `POST /sim/faults/heal-all` answers `200` with `{"healed": 3}`. `GET /sim/links` lists every link group as `{"group", "proxies", "faults"}`, each fault in the shape above.
+`DELETE /sim/faults/{fault_id}` answers `200`, or `404`. `POST /sim/faults/heal-all` answers `200` with `{"healed": 3}`. `GET /sim/links` lists every link group as `{"group", "proxies", "faults", "preexisting_disabled", "unexplained"}`, each fault in the shape above. `unexplained` is `{"disabled", "toxics", "missing"}`: the group's proxies that are disabled with no known `cut` holding them, its toxics no known fault added (`{"proxy", "name", "type", "stream"}`), and proxies Toxiproxy does not have at all.
+
+**Proxies a cut does not own.** A cut never disables a proxy that was already disabled when the cut arrived (a leftover from an earlier control process, or a manual change) and never re-enables it on heal: the state is not the cut's to change. The create answer carries it as `"already_disabled": [...]`; the heal answer for a cut carries what it left alone as `"left_disabled": [...]`; `GET /sim/links` lists the proxies a live cut holds that will stay disabled as `"preexisting_disabled"`. A heal leaves them disabled either way, so they show up under `unexplained` once no known cut owns them. Like fault ids, the already-disabled mark lives in the control process only and is lost on restart; `heal-all` (Toxiproxy's own reset) enables every proxy, including those.
+
+```json
+{ "fault_id": "f1", "target": "repl:r1", "fault": "cut", "params": {}, "proxies": ["r1-standby__r1-primary", "coordinator__r1-standby"], "created_at": "...", "already_disabled": ["r1-standby__r1-primary"] }
+```
+
+`rosctl fault add` and `rosctl fault heal` print a warning when these lists are not empty.
+
+- Fault ids live in the control process only. After a restart the ids are gone but Toxiproxy keeps the toxics and disabled proxies; they show under `unexplained`, and `heal-all` (Toxiproxy's own reset) clears them.
+- The link groups overlap (`node:r1-primary` and `repl:r1` share `r1-standby__r1-primary`). A proxy stays disabled until the last `cut` holding it is healed, and every toxic is named after its fault (`f3-latency-up`), so a heal never undoes another fault.
+- Errors answer `{"error", "message"}`: `unknown_group`, `unknown_fault`, `unknown_node`, `unknown_job` (`404`), `fault_exists` (`409`, with the existing `fault_id`), `invalid_params` (`422`), and `toxiproxy_error` / `docker_error` (`502`) when Toxiproxy or Docker fails.
+
+**The control process.** `rosctl control` serves all of this on port 8002 and hosts playback in the same process (the same engine flags as `rosctl playback start`, fixed for every run it hosts); runs are started through `POST /sim/playback`, or `rosctl playback start --via-control --from-day N`. A standalone `rosctl playback start` still works when no control process runs; only one of the two can own the port. The `rosctl` clients are `rosctl links`, `rosctl fault add|heal|heal-all|list`, `rosctl node kill|start` and `rosctl job <job_id>`.
+
+**Cross-origin requests.** A browser client (WP7) served from an origin listed in `ROS_SIM_CONTROL_ALLOWED_ORIGINS` can call the control API directly: the API answers CORS preflights and sends CORS headers for listed origins only - exact match, no wildcard, no credentials. Listing an origin does two things: it lets the browser read responses (CORS), and it lets state-changing requests past the origin guard.
+
+The origin guard checks the state-changing methods only - POST, PUT, PATCH and DELETE, including the embedded playback routes. A state-changing request marked `Sec-Fetch-Site: cross-site` is rejected even when its Origin is allowlisted, and this check runs before the allowlist: a request with no Origin is rejected too when it is marked cross-site; "missing Origin passes" applies only to unmarked requests. `GET`/`HEAD`/`OPTIONS` pass the guard whatever their Origin, `null` included. An unlisted origin's state-changing request is refused with `403 {"detail": "cross-origin request rejected"}`, and its preflight fails with 400; requests the guard lets through (for example GETs) still get no CORS headers, so the browser will not let that page's JavaScript read the answer. Requests without `Origin` - what `rosctl`, curl and every CLI client send - are never affected. The `null` origin is always rejected.
+
+Browsers decide same-site by scheme + registrable domain, ignoring the port: `http://app.example.test` to `http://api.example.test` is same-site, `http://` to `https://` is cross-site, and for `localhost` and IP addresses (no registrable domain) the site is the exact host - `localhost` and `127.0.0.1` are different sites. In dev, use the same scheme and hostname for the UI and the API (both `http://localhost` or both `http://127.0.0.1`); otherwise the browser marks the calls cross-site and they get 403 even when listed. Separately from same-site, the origin the browser sends (scheme + host + port) must be on the allowlist exactly. A same-origin proxy also works, but its origin - what the browser shows - must still be listed, because browsers send `Origin` on POST. An empty allowlist (the default) means CLI-only: no CORS headers at all.
 
 **Nodes.** `POST /sim/nodes/{node_id}/kill` and `/start` answer `200` with `{"node_id": "r1-primary", "running": false}`, or `404` for an unknown node. Killing a stopped node or starting a running one changes nothing.
 

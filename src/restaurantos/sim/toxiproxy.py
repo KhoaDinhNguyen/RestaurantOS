@@ -1,8 +1,9 @@
-"""A small async client for the Toxiproxy HTTP API: the proxy half.
+"""A small async client for the Toxiproxy HTTP API.
 
-Bootstrap uses it to make the running server's proxy list equal the
-cluster's. WP6b adds the toxic methods to this same class. It is our own
-client over httpx; do not add a third-party Toxiproxy library.
+Bootstrap uses the proxy half to make the running server's proxy list
+equal the cluster's; the fault layer (`sim/faults.py`, WP6b) uses the
+toxic half. It is our own client over httpx; do not add a third-party
+Toxiproxy library.
 """
 
 from __future__ import annotations
@@ -149,3 +150,57 @@ class Toxiproxy:
     async def reset(self) -> None:
         """Re-enable every proxy and remove every toxic."""
         await self._request("POST", "/reset")
+
+    # --- toxics (WP6b) -----------------------------------------------------
+
+    async def add_toxic(
+        self,
+        proxy: str,
+        type: str,
+        attributes: dict[str, object],
+        stream: str = "downstream",
+        name: str | None = None,
+        toxicity: float = 1.0,
+    ) -> dict[str, object]:
+        """Add one toxic to one proxy and return it as the server stored it.
+
+        `stream` is "downstream" (server to client) or "upstream" (client
+        to server). Toxiproxy names an unnamed toxic "<type>_<stream>", so
+        two unnamed toxics of one type on one proxy collide (409); the
+        fault layer always passes a name.
+        """
+        if stream not in STREAMS:
+            raise ValueError(f"stream {stream!r} must be one of {', '.join(STREAMS)}")
+        body: dict[str, object] = {
+            "type": type,
+            "stream": stream,
+            "toxicity": toxicity,
+            "attributes": dict(attributes),
+        }
+        if name is not None:
+            body["name"] = name
+        answer = await self._request("POST", f"/proxies/{proxy}/toxics", json=body)
+        return answer if isinstance(answer, dict) else body
+
+    async def list_toxics(self, proxy: str) -> list[dict[str, object]]:
+        """Every toxic on one proxy, as the server lists them."""
+        answer = await self._request("GET", f"/proxies/{proxy}/toxics")
+        if answer is None:
+            return []
+        if not isinstance(answer, list):
+            raise ToxiproxyError(
+                f"GET /proxies/{proxy}/toxics: unexpected answer {type(answer).__name__}"
+            )
+        return answer
+
+    async def remove_toxic(self, proxy: str, name: str) -> None:
+        """Remove one toxic. A toxic (or proxy) that is already gone is not an error."""
+        try:
+            await self._request("DELETE", f"/proxies/{proxy}/toxics/{name}")
+        except ToxiproxyError as error:
+            if error.status != 404:
+                raise
+
+
+STREAMS = ("upstream", "downstream")
+"""Toxiproxy's two directions: client to server, and server to client."""

@@ -7,7 +7,9 @@ drives playback's restock events, so it lives here with them.
 
 from __future__ import annotations
 
+import ipaddress
 from functools import cache
+from urllib.parse import urlsplit
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -90,11 +92,73 @@ class SimSettings(BaseSettings):
     # (http://127.0.0.1:8900) until the gateway exists.
     playback_target_url: str = "http://127.0.0.1:8000/api/v1"
     http_timeout_s: float = Field(default=5.0, gt=0)
-    # Where the /sim control routes listen while a playback run is live
-    # (architecture Section 6.3 puts them on the control process, port
-    # 8002; until WP6b exists the playback process hosts them).
+    # Where the /sim control routes listen (architecture Section 6.3):
+    # the control process (`rosctl control`, port 8002), or a standalone
+    # `rosctl playback start` while its run is live.
     control_host: str = "127.0.0.1"
     control_port: int = Field(default=8002, ge=1, le=65535)
+    # Exact origins (scheme://host[:port], comma-separated) allowed to
+    # call the control API from a browser: they get CORS headers and
+    # pass the origin guard. CLI clients (rosctl, curl) send no Origin
+    # and need nothing. Empty means CLI-only. Entries are validated by
+    # parse_allowed_origins: an invalid one stops the process at startup.
+    control_allowed_origins: str = ""
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def normalise_origin(raw: str) -> str:
+    """The canonical form of an origin: lowercase scheme and host, no
+    trailing slash, no default port. This is exactly the string a
+    browser sends in an Origin header, so both the CORS middleware and
+    the origin guard can compare origins as plain strings."""
+    parsed = urlsplit(raw.strip().rstrip("/"))
+    if (
+        parsed.scheme not in _DEFAULT_PORTS
+        or not parsed.hostname
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(f"invalid origin: {raw!r}")
+    host = parsed.hostname  # urlsplit already lower-cases it
+    if not host.isascii():
+        # browsers always send the ASCII/punycode form in Origin; a
+        # Unicode entry could only match itself, never a real request
+        raise ValueError(
+            f"non-ASCII hostname in ROS_SIM_CONTROL_ALLOWED_ORIGINS: {raw!r}; "
+            "write it in ASCII/punycode form (xn--...), as browsers send it in Origin"
+        )
+    if ":" in host:
+        # an IPv6 literal: canonicalise the way browsers write it, so an
+        # expanded entry matches what the browser actually sends
+        try:
+            addr = ipaddress.IPv6Address(host)
+        except ValueError:
+            raise ValueError(f"invalid origin: {raw!r}") from None
+        if addr.scope_id is not None or addr.ipv4_mapped is not None:
+            # browsers never send zone ids in Origin; IPv4-mapped forms
+            # serialise differently in Python (::ffff:127.0.0.1) and
+            # browsers (::ffff:7f00:1), so they can never reliably match
+            raise ValueError(f"unsupported IPv6 origin: {raw!r}") from None
+        host = f"[{addr.compressed}]"
+    port = parsed.port
+    if port is None or port == _DEFAULT_PORTS[parsed.scheme]:
+        return f"{parsed.scheme}://{host}"
+    return f"{parsed.scheme}://{host}:{port}"
+
+
+def parse_allowed_origins(value: str) -> tuple[str, ...]:
+    """The allowlist setting as normalised origins (deduped, order kept).
+
+    Raises ValueError on an invalid entry - so a process that builds a
+    control app fails at startup instead of silently ignoring part of
+    its configuration."""
+    items = [item for item in (entry.strip() for entry in value.split(",")) if item]
+    return tuple(dict.fromkeys(normalise_origin(item) for item in items))
 
 
 @cache

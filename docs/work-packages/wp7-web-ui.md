@@ -38,7 +38,9 @@ Three services, plus one extra API per region. All answer JSON, none needs a log
 | Coordinator | 8001 | `/admin/...`: node health, lag, events, exceptions, manual failover | Section 6.2 |
 | Control plane | 8002 | `/sim/...`: clock, playback, faults, snapshots, checker | Section 6.3 |
 
-**Reaching them from the browser.** No brief asks the services to send CORS headers, so assume a page served from the Vite dev server cannot call `localhost:8000` directly. The simplest fix stays inside your folder: let the dev server forward the calls (Vite's `server.proxy`), for example `/api` to 8000, `/admin` to 8001, `/sim` to 8002, and one prefix per region for the edge APIs. Your code then only uses relative paths, and the same build works behind any reverse proxy later.
+**Reaching them from the browser.** No brief asks the gateway, edge or coordinator services to send CORS headers, so assume a page served from the Vite dev server cannot call `localhost:8000` directly. The simplest fix stays inside your folder: let the dev server forward the calls (Vite's `server.proxy`), for example `/api` to 8000, `/admin` to 8001, `/sim` to 8002, and one prefix per region for the edge APIs. Your code then only uses relative paths, and the same build works behind any reverse proxy later.
+
+The one exception is the control API (8002): WP6b sends CORS headers and answers preflights for origins listed in `ROS_SIM_CONTROL_ALLOWED_ORIGINS` (architecture Section 6.3), so your page may also call it directly. List your dev origin (for example `http://localhost:5173`) and use the same scheme and hostname as the control API (both `localhost` or both `127.0.0.1`; browsers decide same-site by scheme + registrable domain, so a marked-cross-site call gets 403 even when its origin is listed). Proxied `/sim` calls work too, but the page's origin is still what reaches the API on POST, so it must be listed either way.
 
 **Which API for the Region view.** Use the region's own edge API, not the gateway. The point of the edge API is that a region keeps working when it is cut off from head office (test T2). During that test the gateway answers `503` for the region while its edge API still serves the kitchen board. A Region view that talks to the edge API shows exactly that.
 
@@ -113,7 +115,7 @@ uv run rosctl up                              # gateway, coordinator, HQ worker,
 cd frontend && npm run dev
 ```
 
-`README.md` in this folder ("Running things") and `docs/setup.md` have the ports and what must be free. `rosctl up` starts every backend service at once; it does **not** serve the `/sim` routes. Until WP6b's control process exists, `rosctl playback start` serves only `/sim/clock` and `/sim/playback` on 8002, and only while a run is live. The other `/sim` routes (`/sim/links`, `/sim/faults`, `/sim/nodes`, and the optional `/sim/scenarios`, `/sim/snapshots`, `/sim/checker`) come with WP6b (architecture Section 6.3); each backend brief also shows the one command that starts its service alone.
+`README.md` in this folder ("Running things") and `docs/setup.md` have the ports and what must be free. `rosctl up` starts every backend service at once; it does **not** serve the `/sim` routes. `rosctl control` (WP6b) serves every `/sim` route on 8002 - playback, `/sim/links`, `/sim/faults`, `/sim/nodes`, `/sim/jobs`, and the optional jobs routes as they land - and keeps serving between runs; a standalone `rosctl playback start` serves only `/sim/clock` and `/sim/playback`, and only while its run is live (architecture Section 6.3); each backend brief also shows the one command that starts its service alone.
 
 ## Done when
 

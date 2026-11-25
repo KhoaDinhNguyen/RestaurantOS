@@ -31,7 +31,7 @@ def _host_like(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_up_and_down_left_the_not_built_list() -> None:
     assert "up" not in NOT_BUILT and "down" not in NOT_BUILT
-    assert "control" in NOT_BUILT  # WP6b keeps its placeholder
+    assert "control" not in NOT_BUILT  # WP6b built it
 
 
 def test_parser_takes_positional_service_names() -> None:
@@ -170,7 +170,3 @@ def test_a_badly_shaped_cluster_file_is_a_message_not_a_traceback(
     assert code == 1
     assert "rosctl up: cluster file: regions must be an int" in capsys.readouterr().err
     assert not (tmp_path / "runs").exists()
-
-
-def test_control_is_still_not_built(capsys: pytest.CaptureFixture[str]) -> None:
-    assert app(["control"]) == 2

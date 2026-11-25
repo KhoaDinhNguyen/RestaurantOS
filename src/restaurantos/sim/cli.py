@@ -1,10 +1,11 @@
 """The rosctl command line (WP6a). pyproject.toml points the `rosctl`
 script at app().
 
-`bootstrap`, `playback`, `baseline sync`, `up` and `down` exist; the
-other subcommands are the rest of WP6a/WP6b and are registered so that
-`rosctl --help` shows the full shape of the tool while it is being
-built.
+`bootstrap`, `playback`, `oracle`, `baseline sync`, `up`, `down` and
+`hq` are WP6a's and WP5's. `control` (the control process on port 8002)
+and its clients `links`, `fault`, `node` and `job` are WP6b's. Anything
+still unbuilt is listed in NOT_BUILT and registered so that
+`rosctl --help` shows the full shape of the tool.
 """
 
 from __future__ import annotations
@@ -15,9 +16,135 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-NOT_BUILT = {
-    "control": "the control API for the fault tests (WP6b)",
-}
+NOT_BUILT: dict[str, str] = {}
+
+
+def _add_engine_args(parser: argparse.ArgumentParser) -> None:
+    """The playback flags that hold for every run on one engine: they are
+    fixed when the process starts (`rosctl playback start` for one run,
+    `rosctl control` for every run it hosts)."""
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="cluster description to route kitchen calls with - use the "
+        "file bootstrap ran with (default: ROS_CLUSTER_FILE setting, "
+        "infra/cluster.toml)",
+    )
+    parser.add_argument(
+        "--region",
+        type=str,
+        default=None,
+        help="only send this region's orders (the vendor-to-region split bootstrap uses)",
+    )
+    parser.add_argument(
+        "--target",
+        type=str,
+        default=None,
+        help="API base to POST orders to, or 'edge' for the chosen region's own "
+        "edge API (needs --region) (default ROS_SIM_PLAYBACK_TARGET_URL)",
+    )
+    parser.add_argument(
+        "--sequential",
+        action="store_true",
+        help="one order at a time: wait for each response before the next (inflight 1)",
+    )
+    parser.add_argument(
+        "--kitchen-target",
+        type=str,
+        default=None,
+        help="send every status event and restock to this one API base "
+        "instead of each region's own edge - required for stub runs "
+        "(pass the stub's URL); default: the per-region edge APIs",
+    )
+    parser.add_argument(
+        "--inflight",
+        type=int,
+        default=None,
+        help="requests kept in flight at once (default ROS_SIM_PLAYBACK_INFLIGHT)",
+    )
+    parser.add_argument(
+        "--events",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="send each accepted order its four status events "
+        "(default ROS_SIM_PLAYBACK_STATUS_EVENTS, on)",
+    )
+    parser.add_argument(
+        "--event-sample-rate",
+        type=float,
+        default=None,
+        help="share of orders that get their full event set, 0 to 1 "
+        "(default ROS_SIM_PLAYBACK_EVENT_SAMPLE_RATE)",
+    )
+    parser.add_argument(
+        "--restock-days",
+        type=int,
+        default=None,
+        help="restock every R days at 00:00:00 of days W+R, W+2R, ... "
+        "(default ROS_SIM_STOCK_RESTOCK_DAYS)",
+    )
+    parser.add_argument(
+        "--duplicate-offset-s",
+        type=float,
+        default=None,
+        help="a resend lands this many simulated seconds after its order, at "
+        "most - a hash-drawn offset in [0, N) (default "
+        "ROS_SIM_PLAYBACK_DUPLICATE_OFFSET_S)",
+    )
+    parser.add_argument(
+        "--shuffle-window",
+        type=int,
+        default=None,
+        help="how far shuffle may reorder delivery; 1 means no reorder "
+        "(default ROS_SIM_SHUFFLE_WINDOW)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="control-route port (default ROS_SIM_CONTROL_PORT)",
+    )
+
+
+def _add_run_args(parser: argparse.ArgumentParser) -> None:
+    """The playback flags of one run (the POST /sim/playback start body)."""
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=None,
+        help="simulated seconds per wall-clock second (default ROS_SIM_PLAYBACK_SPEED)",
+    )
+    parser.add_argument(
+        "--from-day",
+        type=int,
+        default=None,
+        help="first replay day (default: the first day after the warm-up window)",
+    )
+    parser.add_argument(
+        "--to-day",
+        type=int,
+        default=None,
+        help="last replay day (default: the last day in the cache)",
+    )
+    parser.add_argument(
+        "--duplicate-rate",
+        type=float,
+        default=None,
+        help="share of orders to resend, 0 to 1 - a hash threshold per order, so "
+        "the same seed resends the same orders; the resent share comes close to "
+        "the rate over a long run (default ROS_SIM_PLAYBACK_DUPLICATE_RATE, off)",
+    )
+    parser.add_argument(
+        "--shuffle",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="reorder delivery inside a bounded window - the next delivery "
+        "is the smallest shuffle key among the next N stream items "
+        "(default ROS_SIM_PLAYBACK_SHUFFLE, off; refused with --sequential)",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="run seed (default 0)")
+    parser.add_argument("--run-id", type=str, default=None, help="runs/<run_id>/ to write")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -55,123 +182,13 @@ def build_parser() -> argparse.ArgumentParser:
         "start",
         help="run a replay in the foreground and serve its /sim control routes",
     )
+    _add_engine_args(pstart)
+    _add_run_args(pstart)
     pstart.add_argument(
-        "--config",
-        type=Path,
-        default=None,
-        help="cluster description to route kitchen calls with - use the "
-        "file bootstrap ran with (default: ROS_CLUSTER_FILE setting, "
-        "infra/cluster.toml)",
-    )
-    pstart.add_argument(
-        "--speed",
-        type=float,
-        default=None,
-        help="simulated seconds per wall-clock second (default ROS_SIM_PLAYBACK_SPEED)",
-    )
-    pstart.add_argument(
-        "--from-day",
-        type=int,
-        default=None,
-        help="first replay day (default: the first day after the warm-up window)",
-    )
-    pstart.add_argument(
-        "--to-day",
-        type=int,
-        default=None,
-        help="last replay day (default: the last day in the cache)",
-    )
-    pstart.add_argument("--seed", type=int, default=0, help="run seed (default 0)")
-    pstart.add_argument("--run-id", type=str, default=None, help="runs/<run_id>/ to write")
-    pstart.add_argument(
-        "--region",
-        type=str,
-        default=None,
-        help="only send this region's orders (the vendor-to-region split bootstrap uses)",
-    )
-    pstart.add_argument(
-        "--target",
-        type=str,
-        default=None,
-        help="API base to POST orders to, or 'edge' for the chosen region's own "
-        "edge API (needs --region) (default ROS_SIM_PLAYBACK_TARGET_URL)",
-    )
-    pstart.add_argument(
-        "--sequential",
+        "--via-control",
         action="store_true",
-        help="one order at a time: wait for each response before the next (inflight 1)",
-    )
-    pstart.add_argument(
-        "--kitchen-target",
-        type=str,
-        default=None,
-        help="send every status event and restock to this one API base "
-        "instead of each region's own edge - required for stub runs "
-        "(pass the stub's URL); default: the per-region edge APIs",
-    )
-    pstart.add_argument(
-        "--inflight",
-        type=int,
-        default=None,
-        help="requests kept in flight at once (default ROS_SIM_PLAYBACK_INFLIGHT)",
-    )
-    pstart.add_argument(
-        "--events",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="send each accepted order its four status events "
-        "(default ROS_SIM_PLAYBACK_STATUS_EVENTS, on)",
-    )
-    pstart.add_argument(
-        "--event-sample-rate",
-        type=float,
-        default=None,
-        help="share of orders that get their full event set, 0 to 1 "
-        "(default ROS_SIM_PLAYBACK_EVENT_SAMPLE_RATE)",
-    )
-    pstart.add_argument(
-        "--restock-days",
-        type=int,
-        default=None,
-        help="restock every R days at 00:00:00 of days W+R, W+2R, ... "
-        "(default ROS_SIM_STOCK_RESTOCK_DAYS)",
-    )
-    pstart.add_argument(
-        "--duplicate-rate",
-        type=float,
-        default=None,
-        help="share of orders to resend, 0 to 1 - a hash threshold per order, so "
-        "the same seed resends the same orders; the resent share comes close to "
-        "the rate over a long run (default ROS_SIM_PLAYBACK_DUPLICATE_RATE, off)",
-    )
-    pstart.add_argument(
-        "--duplicate-offset-s",
-        type=float,
-        default=None,
-        help="a resend lands this many simulated seconds after its order, at "
-        "most - a hash-drawn offset in [0, N) (default "
-        "ROS_SIM_PLAYBACK_DUPLICATE_OFFSET_S)",
-    )
-    pstart.add_argument(
-        "--shuffle",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="reorder delivery inside a bounded window - the next delivery "
-        "is the smallest shuffle key among the next N stream items "
-        "(default ROS_SIM_PLAYBACK_SHUFFLE, off; refused with --sequential)",
-    )
-    pstart.add_argument(
-        "--shuffle-window",
-        type=int,
-        default=None,
-        help="how far shuffle may reorder delivery; 1 means no reorder "
-        "(default ROS_SIM_SHUFFLE_WINDOW)",
-    )
-    pstart.add_argument(
-        "--port",
-        type=int,
-        default=None,
-        help="control-route port (default ROS_SIM_CONTROL_PORT)",
+        help="start the run on the running `rosctl control` process instead of "
+        "in this one (needs --from-day; the engine flags belong to rosctl control)",
     )
     for name, helptext in (
         ("pause", "pause the live run"),
@@ -349,6 +366,64 @@ def build_parser() -> argparse.ArgumentParser:
             help="authorize this HQ operation and possible async data loss",
         )
 
+    # --- control process and its clients (WP6b) -------------------------
+    control = sub.add_parser(
+        "control",
+        help="the control process on port 8002: hosts playback (start runs with "
+        "`rosctl playback start --via-control`), faults, nodes and jobs",
+    )
+    _add_engine_args(control)
+    # control starts no run itself; the run flags arrive per run through
+    # POST /sim/playback, so the shared start code sees their defaults
+    control.set_defaults(
+        speed=None,
+        from_day=None,
+        to_day=None,
+        seed=0,
+        run_id=None,
+        duplicate_rate=None,
+        shuffle=None,
+    )
+
+    links = sub.add_parser(
+        "links", help="every link group, its faults, and what no known fault explains"
+    )
+    links.add_argument("--port", type=int, default=None, help="control port")
+
+    fault = sub.add_parser("fault", help="break and heal link groups (rosctl control must run)")
+    fsub = fault.add_subparsers(dest="fault_command", required=True)
+    fadd = fsub.add_parser(
+        "add",
+        help="break one link group; quote groups with <-> in them: 'link:r1<->hq'",
+    )
+    fadd.add_argument("target", help="link group, e.g. node:r1-primary, 'link:r1<->hq', repl:r1")
+    fadd.add_argument("kind", choices=("cut", "silence", "latency", "reset"))
+    fadd.add_argument("--latency-ms", type=int, default=None, help="latency: added delay")
+    fadd.add_argument("--jitter-ms", type=int, default=None, help="latency: +/- jitter")
+    fadd.add_argument(
+        "--timeout-ms", type=int, default=None, help="reset: wait before resetting (default 0)"
+    )
+    fheal = fsub.add_parser("heal", help="undo one fault by its id")
+    fheal.add_argument("fault_id")
+    fsub.add_parser("heal-all", help="reset Toxiproxy: every proxy on, every toxic gone")
+    fsub.add_parser("list", help="the faults this control process knows")
+    for fparser in fsub.choices.values():
+        fparser.add_argument("--port", type=int, default=None, help="control port")
+
+    node = sub.add_parser("node", help="crash and restart a database node (docker compose)")
+    nsub = node.add_subparsers(dest="node_command", required=True)
+    for action, helptext in (
+        ("kill", "kill the node's container (a real crash)"),
+        ("start", "start the node's container again"),
+    ):
+        nparser = nsub.add_parser(action, help=helptext)
+        nparser.add_argument("node_id", help="e.g. r1-primary")
+        nparser.add_argument("--port", type=int, default=None, help="control port")
+
+    job = sub.add_parser("job", help="progress of a control-process job")
+    job.add_argument("job_id")
+    job.add_argument("--port", type=int, default=None, help="control port")
+
     for name, helptext in NOT_BUILT.items():
         sub.add_parser(name, help=helptext)
 
@@ -470,5 +545,17 @@ def app(argv: Sequence[str] | None = None) -> int:
         for step in steps:
             print(f"{step.name}: {step.outcome} - {step.detail}")
         return up_exit_code(steps) if args.command == "up" else down_exit_code(steps)
+    if args.command == "control":
+        from restaurantos.sim.playback_cli import run_control
+
+        try:
+            return run_control(args)
+        except ValueError as error:
+            print(f"rosctl control: {error}", file=sys.stderr)
+            return 1
+    if args.command in ("links", "fault", "node", "job"):
+        from restaurantos.sim.control_cli import run as run_control_client
+
+        return run_control_client(args)
     print(f"rosctl {args.command}: not built yet ({NOT_BUILT[args.command]})", file=sys.stderr)
     return 2
