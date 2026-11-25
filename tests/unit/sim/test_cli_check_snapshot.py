@@ -61,6 +61,22 @@ def test_check_errors_are_messages(monkeypatch, capsys, tmp_path) -> None:
     assert "rosctl check: the queues did not drain" in capsys.readouterr().err
 
 
+def test_check_asks_the_playback_host_for_the_live_run(monkeypatch, capsys, tmp_path) -> None:
+    cluster_file = tmp_path / "cluster.toml"
+    cluster_file.write_text("[cluster]\nregions = 1\n", encoding="utf-8")
+    seen: dict = {}
+
+    def run_check(*args, **kwargs):
+        seen.update(kwargs)
+        raise CheckError("run a is still live on the playback host")
+
+    monkeypatch.setattr(jobs_cli, "_live_run", lambda sim: "a")
+    monkeypatch.setattr(jobs_cli, "run_check", run_check)
+    assert app(["check", "--run", "a", "--config", str(cluster_file)]) == 1
+    assert seen["live_run"] == "a"
+    assert "still live" in capsys.readouterr().err
+
+
 def test_snapshot_list_with_none(monkeypatch, capsys, tmp_path) -> None:
     from restaurantos.sim.config import get_sim_settings
 

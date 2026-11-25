@@ -579,9 +579,20 @@ def run_check(
     allow_unacked: bool = False,
     drain_timeout_s: float = 300.0,
     poll_s: float = 1.0,
+    live_run: str | None = None,
 ) -> dict[str, Any]:
-    """Drain, read, evaluate. Blocking: run it in a thread from async code."""
+    """Drain, read, evaluate. Blocking: run it in a thread from async code.
+
+    `live_run` is the run the playback host is still running, pausing or
+    stopping, if any: a live run's log trails the databases by whatever
+    is in flight, and its sends race the drain, so checking it would
+    report orders that are simply on their way - refused instead."""
     runs = read_runs(runs_dir, run_ids, channel)
+    if live_run is not None and live_run in runs.run_ids:
+        raise CheckError(
+            f"run {live_run} is still live on the playback host: check it once it has "
+            "stopped (rosctl playback status)"
+        )
     refuse_edge_runs(cluster, runs)
     wait_for_drain(cluster, timeout_s=drain_timeout_s, poll_s=poll_s, scope=runs.region)
     return evaluate(runs, collect(cluster, runs), allow_unacked=allow_unacked)

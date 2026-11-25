@@ -21,6 +21,29 @@ def _cluster_file(args: argparse.Namespace) -> Path:
     return Path(args.config or get_settings().cluster_file)
 
 
+def _live_run(sim) -> str | None:
+    """The run the playback host is still running, pausing or stopping;
+    None when there is none or no host listens. A host that cannot be
+    asked is said, and the check goes on."""
+    from restaurantos.sim.snapshot import LIVE_STATES, PlaybackClient
+
+    client = PlaybackClient(
+        f"http://{sim.control_host}:{sim.control_port}", timeout_s=sim.http_timeout_s
+    )
+    try:
+        status = asyncio.run(client.status())
+    except Exception as error:  # noqa: BLE001 - reported, the check goes on
+        print(
+            f"rosctl check: could not ask the playback host whether the run is still live "
+            f"({type(error).__name__}: {error})",
+            file=sys.stderr,
+        )
+        return None
+    if status and status.get("state") in (*LIVE_STATES, "stopping"):
+        return status.get("run_id")
+    return None
+
+
 def check_command(args: argparse.Namespace) -> int:
     from restaurantos.common.cluster import load_cluster
     from restaurantos.sim.replaydata import CHANNEL
@@ -35,6 +58,7 @@ def check_command(args: argparse.Namespace) -> int:
             allow_unacked=args.allow_unacked,
             drain_timeout_s=sim.check_drain_timeout_s,
             poll_s=sim.check_poll_s,
+            live_run=_live_run(sim),
         )
     except (CheckError, OSError, ValueError) as error:
         print(f"rosctl check: {error}", file=sys.stderr)

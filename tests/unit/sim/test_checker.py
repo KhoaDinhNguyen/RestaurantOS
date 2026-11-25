@@ -253,6 +253,19 @@ def test_an_hq_only_failed_order_needs_a_failover_after_its_first_send(tmp_path)
     assert early["lost_at_failover"]["order_ids"] == ["1"]
 
 
+def test_a_live_run_is_refused(tmp_path) -> None:
+    """A run still playing (or its restored child) trails the databases
+    by what is in flight: the check refuses it before reading a node."""
+    from restaurantos.sim.checker import run_check
+
+    write_run(tmp_path, "parent", [])
+    write_run(tmp_path, "child", [])
+    (tmp_path / "child" / RESUMED_FROM).write_text(json.dumps({"parent_run": "parent"}))
+    for live in ("child", "parent"):
+        with pytest.raises(CheckError, match=f"run {live} is still live"):
+            run_check(Cluster(regions=1), ["child"], runs_dir=tmp_path, channel=CH, live_run=live)
+
+
 def test_the_window_ends_at_the_last_day_the_runs_sent(tmp_path) -> None:
     """meta.json says days 14-20, but the run stopped during day 15: the
     days it never reached are not its to account for."""
