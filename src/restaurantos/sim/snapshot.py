@@ -968,11 +968,41 @@ async def _wait_until_stopped(ctx: Context, run_id: Any) -> None:
         await ctx.sleep(min(0.2, left))
 
 
+def gateway_hq_cuts(cluster: Cluster, saved: list[dict]) -> list[str]:
+    """The saved cuts on the gateway's links to HQ. The gateway loads its
+    routing table from HQ's one writable node when it STARTS, so with
+    that link cut it never becomes ready - the original run's gateway
+    was already up when the cut came. Restore applies these right after
+    the services are up instead: the same order as in the run. Nothing
+    flows through them meanwhile (playback is stopped, and the gateway's
+    HQ link carries no backlog, unlike a relay's)."""
+    gateway_hq = {
+        proxy.name
+        for proxy in proxies(cluster)
+        if proxy.client == "gateway" and proxy.target in (HQ_PRIMARY, HQ_STANDBY)
+    }
+    return [
+        str(proxy["name"])
+        for proxy in saved
+        if proxy["name"] in gateway_hq and not proxy.get("enabled", True)
+    ]
+
+
+async def _cut(ctx: Context, names: Sequence[str]) -> None:
+    toxiproxy = ctx.toxiproxy_factory()
+    try:
+        for name in names:
+            await toxiproxy.set_enabled(name, False)
+    finally:
+        await toxiproxy.aclose()
+
+
 async def _restore_toxiproxy(
-    ctx: Context, cluster: Cluster, saved: list[dict]
+    ctx: Context, cluster: Cluster, saved: list[dict], *, later: Sequence[str] = ()
 ) -> tuple[list[str], list[str]]:
     """Put the saved proxy state back; returns (the toxics it could not,
-    the proxies it cut again)."""
+    the proxies it cut again). The cuts named in `later` are left for the
+    caller to apply once the services are up (gateway_hq_cuts)."""
     skipped: list[str] = []
     cut: list[str] = []
     toxiproxy = ctx.toxiproxy_factory()
@@ -987,7 +1017,7 @@ async def _restore_toxiproxy(
             name = str(proxy.get("name"))
             if name not in existing:
                 continue
-            if not proxy.get("enabled", True):
+            if not proxy.get("enabled", True) and name not in later:
                 await toxiproxy.set_enabled(name, False)
                 cut.append(name)
             # TODO(wp6b/faults-control): re-add the saved toxics with
@@ -1356,7 +1386,8 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
             shutil.rmtree(target)
         shutil.copytree(snap / "run" / run_id, target)
     await asyncio.to_thread(docker.start, services)
-    skipped_toxics, cut = await _restore_toxiproxy(ctx, snapshot_cluster, saved)
+    later = gateway_hq_cuts(snapshot_cluster, saved)
+    skipped_toxics, cut = await _restore_toxiproxy(ctx, snapshot_cluster, saved, later=later)
     if ctx.services_up is not None:
         # A cut proxy does not listen, and rosctl up's precheck dials every
         # proxy the services use: name the cut ones so it skips them. The
@@ -1365,6 +1396,8 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
         ports = {proxy.name: proxy.port for proxy in proxies(snapshot_cluster)}
         expected_down = sorted(ports[name] for name in cut if name in ports)
         await asyncio.to_thread(ctx.services_up, snapshot_cluster, ctx.cluster_file, expected_down)
+    # the gateway is up (it loaded its routing from HQ): now its HQ cuts
+    await _cut(ctx, later)
     result: dict[str, Any] = {
         "name": name,
         "sim_day": record.get("sim_day"),

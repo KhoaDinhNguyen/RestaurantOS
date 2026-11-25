@@ -889,6 +889,34 @@ async def test_restore_refuses_a_malformed_toxiproxy_file_first(
     assert docker.calls == [] and host.commands == [] and services == []
 
 
+async def test_restore_cuts_the_gateways_hq_links_after_the_services_start(
+    world: World,
+) -> None:
+    """The gateway loads its routing from HQ when it starts: with its HQ
+    links cut it never becomes ready. Restore starts the services with
+    those links up and cuts them right after - other cuts stay in place
+    throughout."""
+    ctx, _, _, server, services = world
+    hq_links = [proxy_name("gateway", "hq-primary"), proxy_name("gateway", "hq-standby")]
+    for name in [*hq_links, SHARED]:
+        server.proxies[name]["enabled"] = False
+    await save("hq-cut", ctx)
+    for name in hq_links:
+        server.proxies[name]["enabled"] = True
+    seen: dict[str, bool] = {}
+
+    def up(cluster, path, down) -> None:
+        seen.update({name: server.proxies[name]["enabled"] for name in [*hq_links, SHARED]})
+        services.append(f"up {list(down)}")
+
+    ctx.services_up = up
+    await restore("hq-cut", ctx)
+    # while the services started: the gateway's HQ links up, the other cut cut
+    assert seen == {hq_links[0]: True, hq_links[1]: True, SHARED: False}
+    # afterwards: everything as saved
+    assert all(server.proxies[name]["enabled"] is False for name in [*hq_links, SHARED])
+
+
 async def test_save_without_a_run_records_no_run(world: World) -> None:
     ctx, host, _, _, _ = world
     host.alive = False
