@@ -1254,6 +1254,26 @@ async def test_restore_does_not_start_on_a_host_with_other_engine_settings(world
     assert any(resume["manual_command"] in warning for warning in warnings)
 
 
+async def test_restore_does_not_start_on_a_host_with_another_warm_up(world: World) -> None:
+    """The restock days are W + R, W + 2R, ...: a host whose data cache was
+    built with another warm-up restocks on other days."""
+    ctx, host, _, _, _ = world
+    host.engine = {**host.engine, "warm_up_days": 14}
+    await save("snap", ctx)
+    host.engine = {**host.engine, "warm_up_days": 21}
+    result = await restore("snap", ctx)
+    assert result["resume"]["started"] is False
+    assert any("warm_up_days is 21" in w for w in result["resume"]["warnings"])
+
+
+async def test_a_snapshot_from_before_a_fact_existed_is_not_refused_for_it(world: World) -> None:
+    ctx, host, _, _, _ = world
+    await save("snap", ctx)  # the fake host's engine has no warm_up_days yet
+    host.engine = {**host.engine, "warm_up_days": 14}
+    result = await restore("snap", ctx)
+    assert result["resume"]["started"] is True
+
+
 async def test_a_host_with_another_inflight_still_replays(world: World) -> None:
     ctx, host, _, _, _ = world
     await save("snap", ctx)

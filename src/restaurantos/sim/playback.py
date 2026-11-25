@@ -894,6 +894,9 @@ class Playback:
                 "sample_rate": self._event_sample_rate,
                 "jitter_s": self._event_jitter_s,
             },
+            # the restock days are W + R, W + 2R, ...: another warm-up
+            # (another data cache) restocks on other days
+            "warm_up_days": self._warm_up_days,
             "restock_every": self._restock_every,
             "duplicate_offset_s": self._duplicate_offset_s,
             "shuffle_window": self._shuffle_window,

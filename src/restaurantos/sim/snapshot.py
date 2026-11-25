@@ -1063,6 +1063,7 @@ ENGINE_KEYS = (
     "region",
     "target_url",
     "events",
+    "warm_up_days",
     "restock_every",
     "duplicate_offset_s",
     "shuffle_window",
@@ -1080,6 +1081,8 @@ def engine_mismatches(run: dict[str, Any], host: dict[str, Any] | None) -> list[
     saved = saved or run
     lines = []
     for key in keys:
+        if run.get("engine") and key not in saved:
+            continue  # a fact added after this snapshot was saved
         want, have = saved.get(key), host.get(key)
         if key == "sequential":
             want, have = bool(want), bool(have)
@@ -1177,6 +1180,12 @@ def replay_command(
                 f"ROS_SIM_PLAYBACK_EVENT_JITTER_S={_num(events.get('jitter_s'))} "
                 "first (it has no flag)"
             )
+    warm_up = engine.get("warm_up_days")
+    if warm_up is not None and warm_up != sim.stock_warm_up_days:
+        notes.append(
+            f"the saved run's data cache used a warm-up of {warm_up} days: rebuild it with "
+            f"rosctl playback build-cache --warm-up-days {warm_up} first (it has no start flag)"
+        )
     if "restock_every" in engine:
         every = engine.get("restock_every")
         if every is None:
