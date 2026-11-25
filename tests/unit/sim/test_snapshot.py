@@ -796,6 +796,40 @@ async def test_a_failed_snapshot_and_a_failed_resume_are_both_named(world: World
     assert "resume timed out" in message
 
 
+def _make_parent(ctx: Context, parent: str = "run-0") -> Path:
+    """Make run-a a restored run that continues `parent`."""
+    parent_dir = ctx.runs_dir / parent
+    parent_dir.mkdir()
+    (parent_dir / "meta.json").write_text(json.dumps({"run_id": parent, "from_day": 14}))
+    (parent_dir / "orders.jsonl").write_text('{"kind":"order","external_order_id":"p1"}\n')
+    (ctx.runs_dir / "run-a" / "resumed_from.json").write_text(json.dumps({"parent_run": parent}))
+    return parent_dir
+
+
+async def test_a_snapshot_carries_and_restores_the_runs_whole_history(world: World) -> None:
+    ctx, _, _, _, _ = world
+    parent_dir = _make_parent(ctx)
+    record = await save("history", ctx)
+    assert record["run"]["chain"] == ["run-0", "run-a"]
+    snap = ctx.snapshot_dir / "history"
+    assert (snap / "run" / "run-0" / "orders.jsonl").is_file()
+    # a later restore of an older snapshot puts the parent's log back to
+    # an earlier point ...
+    (parent_dir / "orders.jsonl").write_text("")
+    await restore("history", ctx)
+    # ... and this one puts it back as it was at THIS snapshot
+    assert "p1" in (parent_dir / "orders.jsonl").read_text()
+
+
+async def test_save_refuses_a_run_whose_history_is_missing(world: World) -> None:
+    ctx, host, docker, _, _ = world
+    _make_parent(ctx).joinpath("meta.json").unlink()
+    with pytest.raises(SnapshotError, match="continues run-0, missing"):
+        await save("partial-history", ctx)
+    assert not any(call[0] == "stop" for call in docker.calls)
+    assert [body["action"] for body in host.commands] == ["pause", "resume"]
+
+
 async def test_save_without_a_run_records_no_run(world: World) -> None:
     ctx, host, _, _, _ = world
     host.alive = False

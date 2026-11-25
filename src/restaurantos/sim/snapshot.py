@@ -633,7 +633,22 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
                 # every engine fact, from the live host (GET /sim/playback)
                 "engine": status.get("engine"),
             }
-            shutil.copytree(run_dir, partial / "run" / run_id)
+            # The run AND every run it continues (a restored run's parent,
+            # its parent, ...): the checker reads them all, and restore
+            # puts them all back, so every snapshot carries its whole
+            # history. Linked folders change after the fact otherwise - a
+            # restore of an older snapshot puts an ancestor's log back to
+            # an earlier point - and a later check would miss days.
+            chain = run_chain(ctx.runs_dir, [run_id])
+            missing = [r for r in chain if not (ctx.runs_dir / r / "meta.json").is_file()]
+            if missing:
+                raise SnapshotError(
+                    f"run {run_id} continues {', '.join(missing)}, missing from "
+                    f"{ctx.runs_dir}: the snapshot would not hold the run's whole history"
+                )
+            record["run"]["chain"] = chain
+            for chain_run in chain:
+                shutil.copytree(ctx.runs_dir / chain_run, partial / "run" / chain_run)
         shutil.copy2(ctx.cluster_file, partial / "cluster.toml")
         toxiproxy = ctx.toxiproxy_factory()
         try:
@@ -843,14 +858,23 @@ def _check_complete(name: str, snap: Path, record: dict[str, Any], cluster: Clus
             missing.append(archive.name)
     if not (snap / "toxiproxy.json").is_file():
         missing.append("toxiproxy.json")
-    run = record.get("run")
-    if run and not (snap / "run" / run["run_id"] / "meta.json").is_file():
-        missing.append(f"run/{run['run_id']}/meta.json")
+    for run_id in _saved_runs(record):
+        if not (snap / "run" / run_id / "meta.json").is_file():
+            missing.append(f"run/{run_id}/meta.json")
     if missing:
         raise SnapshotError(
             f"snapshot {name!r} is incomplete, nothing was changed: missing or empty "
             + ", ".join(missing)
         )
+
+
+def _saved_runs(record: dict[str, Any]) -> list[str]:
+    """The runs a snapshot holds: the run and every run it continues (a
+    snapshot from before the chain was recorded holds its run alone)."""
+    run = record.get("run")
+    if not run:
+        return []
+    return list(run.get("chain") or [run["run_id"]])
 
 
 def _saved_image(snap: Path) -> dict[str, str] | None:
@@ -1271,8 +1295,8 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     image = found[0]
     for node in services:
         await asyncio.to_thread(docker.unpack, volume_name(node), snap, image)
-    if record.get("run"):
-        run_id = record["run"]["run_id"]
+    # the run and its whole history, as they were at the snapshot
+    for run_id in _saved_runs(record):
         target = ctx.runs_dir / run_id
         if target.exists():
             shutil.rmtree(target)
