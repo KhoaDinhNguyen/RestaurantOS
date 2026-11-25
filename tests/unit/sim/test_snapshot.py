@@ -187,6 +187,7 @@ class FakeHost:
         # resume answers 500
         self.fail_status_when_paused = False
         self.fail_resume = False
+        self.resume_times_out = False
         self.status_drains = True
         # None: pause answers; True/False: the request times out, after
         # the host did / did not pause
@@ -274,6 +275,8 @@ class FakeHost:
         action = body["action"]
         if action == "resume" and self.fail_resume:
             return httpx.Response(500, json={"message": "resume broke"})
+        if action == "resume" and self.resume_times_out:
+            raise httpx.ReadTimeout("resume timed out")
         if action == "pause" and self.pause_times_out is not None:
             # the request times out; whether the host paused is the case
             if self.pause_times_out:
@@ -770,6 +773,27 @@ async def test_cancelling_a_save_waits_for_its_docker_worker(world: World) -> No
     assert not (ctx.snapshot_dir / ".cancelled.partial").exists()
     assert not (ctx.snapshot_dir / "cancelled").exists()
     assert [body["action"] for body in host.commands] == ["pause", "resume"]
+
+
+async def test_a_saved_snapshot_whose_resume_fails_says_so(world: World) -> None:
+    ctx, host, _, _, _ = world
+    host.resume_times_out = True
+    with pytest.raises(SnapshotError, match="saved, but playback did not resume") as caught:
+        await save("kept", ctx)
+    assert "ReadTimeout" in str(caught.value)
+    assert (ctx.snapshot_dir / "kept").is_dir()
+
+
+async def test_a_failed_snapshot_and_a_failed_resume_are_both_named(world: World) -> None:
+    ctx, host, docker, _, _ = world
+    docker.fail_archive = volume_name("r1-standby")
+    host.resume_times_out = True
+    with pytest.raises(SnapshotError) as caught:
+        await save("lost", ctx)
+    message = str(caught.value)
+    assert message.startswith("disk full")
+    assert "was not saved" in message and "did NOT resume" in message
+    assert "resume timed out" in message
 
 
 async def test_save_without_a_run_records_no_run(world: World) -> None:

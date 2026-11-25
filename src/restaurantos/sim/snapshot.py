@@ -591,6 +591,7 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
     # were never stopped: a run resumed against stopped databases fails
     # every send. `published` is the rename: the snapshot exists from then.
     stop_begun = databases_back = published = False
+    save_error: BaseException | None = None
     try:
         partial.mkdir(parents=True)
         record: dict[str, Any] = {
@@ -718,17 +719,28 @@ async def save(name: str, ctx: Context) -> dict[str, Any]:
         if first_error is not None:
             raise first_error
         failed = False
+    except BaseException as error:
+        save_error = error
+        raise
     finally:
         if failed and not published:
             shutil.rmtree(partial, ignore_errors=True)
         if was_running and (databases_back or not stop_begun):
-            response = await ctx.playback.command({"action": "resume"})
-            # a failed snapshot keeps its own error; a saved one reports
-            # a resume that did not happen
-            if response.status_code != 200 and not failed:
+            # the guarded resume: an HTTP error or a timeout is reported,
+            # never allowed to replace the snapshot's own outcome
+            problem = await _resume_quietly(ctx)
+            if problem is not None and save_error is None:
                 raise SnapshotError(
-                    f"snapshot {name!r} saved, but playback did not resume: {_message(response)}"
+                    f"snapshot {name!r} saved, but playback did not resume (it is left "
+                    f"paused): {problem}"
                 )
+            if problem is not None and isinstance(save_error, Exception):
+                saved = "was saved" if published else "was not saved"
+                raise SnapshotError(
+                    f"{_describe(save_error)}; snapshot {name!r} {saved}, and playback did "
+                    f"NOT resume (it is left paused): {problem}"
+                ) from save_error
+            # a cancellation goes on as it is
     return record
 
 
