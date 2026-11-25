@@ -183,6 +183,8 @@ class FakeHost:
         # None: pause answers; True/False: the request times out, after
         # the host did / did not pause
         self.pause_times_out: bool | None = None
+        # status polls a stop stays "stopping" for (None: never ends)
+        self.stopping_polls: int | None = 0
         self.status_fails = False
         # GET /sim/playback's engine block (what every run on it shares)
         self.engine: dict[str, Any] = {
@@ -227,6 +229,11 @@ class FakeHost:
             return None
         if self.status_fails or (self.fail_status_when_paused and self.state == "paused"):
             raise httpx.ReadTimeout("status timed out")
+        if self.state == "stopping" and self.stopping_polls is not None:
+            if self.stopping_polls:
+                self.stopping_polls -= 1
+            else:
+                self.state = "stopped"
         day, rest = divmod(self.frontier(), 86400)
         answer = {
             "state": self.state,
@@ -269,11 +276,14 @@ class FakeHost:
         elif action == "resume":
             self.state = "running"
         elif action == "stop":
-            self.state = "stopped"
+            # the engine answers a stop once the drain is over; a host
+            # whose stop outlives the request keeps "stopping" a while
+            self.state = "stopping" if self.stopping_polls != 0 else "stopped"
         elif action == "start":
             self.run_id = body["run_id"]
             run_dir = self.runs_dir / self.run_id
-            run_dir.mkdir(parents=True)
+            run_dir.mkdir(parents=True, exist_ok=True)  # restore may write the link first
+            assert not (run_dir / "orders.jsonl").exists()  # the engine's exclusive create
             skip = body.get("skip_first_restock", False)
             meta = {
                 **self.engine_meta,
@@ -615,6 +625,43 @@ async def test_a_timed_out_pause_with_an_unreadable_state_says_so(world: World) 
     with pytest.raises(SnapshotError, match="may still be paused"):
         await save("flaky", ctx)
     assert [body["action"] for body in host.commands] == ["pause"]
+
+
+async def test_save_refuses_a_run_that_is_stopping(world: World) -> None:
+    ctx, host, docker, _, _ = world
+    host.state, host.stopping_polls = "stopping", None
+    with pytest.raises(SnapshotError, match="playback is stopping"):
+        await save("late", ctx)
+    assert docker.calls == [] and host.commands == []
+
+
+async def test_restore_waits_until_the_live_run_has_stopped(world: World) -> None:
+    """The stop outlives its request: the run stays 'stopping' (still
+    writing its log) for a while, and restore waits before it touches
+    anything."""
+    ctx, host, _, _, services = world
+    await save("snap", ctx)
+    host.stopping_polls = 5
+    seen: list[str] = []
+    ctx.services_down = lambda: seen.append(host.state)
+    await restore("snap", ctx)
+    assert seen == ["stopped"]
+
+
+async def test_restore_gives_up_on_a_run_that_does_not_stop(world: World) -> None:
+    ctx, host, docker, _, services = world
+    await save("snap", ctx)
+    docker.calls.clear()
+    host.stopping_polls = None
+    ctx.sim = SimSettings(
+        _env_file=None,
+        snapshot_dir=ctx.snapshot_dir,
+        playback_drain_timeout_s=0.5,
+        http_timeout_s=0.1,
+    )
+    with pytest.raises(SnapshotError, match="has not stopped"):
+        await restore("snap", ctx)
+    assert docker.calls == [] and services == []
 
 
 async def test_save_refuses_a_paused_run_that_dispatched_nothing(world: World) -> None:

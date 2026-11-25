@@ -389,6 +389,13 @@ async def _pause_for_snapshot(ctx: Context) -> tuple[dict[str, Any] | None, bool
     of N would never be sent. The wait and the recorded point both use
     the frontier: it must stand at least `minimum` into its own day."""
     status = await ctx.playback.status()
+    if status is not None and status.get("state") == "stopping":
+        # still sending while it drains: stopping the databases under it
+        # would fail its sends, and its end state is not a chosen point
+        raise SnapshotError(
+            f"playback is stopping (run {status.get('run_id')}); snapshot once it has "
+            "stopped (rosctl playback status)"
+        )
     if status is None or status.get("state") not in LIVE_STATES:
         return None, False
     was_running = status["state"] == "running"
@@ -799,12 +806,47 @@ def _check_image(saved: dict[str, str] | None, found: tuple[str, str], state: st
 
 
 async def _stop_live_run(ctx: Context) -> None:
+    """Stop the live run and wait until it HAS stopped - a run still
+    stopping keeps writing its log, and restore is about to put the
+    snapshot's copy of that log back (the same run when a snapshot of
+    the live run is restored). A run already stopping is waited for."""
     status = await ctx.playback.status()
     if status is None or status.get("state") not in (*LIVE_STATES, "stopping"):
         return
-    response = await ctx.playback.command({"action": "stop"})
-    if response.status_code not in (200, 409):
-        raise SnapshotError(f"cannot stop the live run: {_message(response)}")
+    run_id = status.get("run_id")
+    if status.get("state") != "stopping":
+        try:
+            response = await ctx.playback.command({"action": "stop"})
+        except httpx.TimeoutException:
+            pass  # the stop outlived the request: it is still stopping
+        else:
+            if response.status_code not in (200, 409):
+                raise SnapshotError(f"cannot stop the live run: {_message(response)}")
+    await _wait_until_stopped(ctx, run_id)
+
+
+async def _wait_until_stopped(ctx: Context, run_id: Any) -> None:
+    # the engine's own drain bound, plus a request's worth of slack
+    limit = ctx.sim.playback_drain_timeout_s + ctx.sim.http_timeout_s + 5.0
+    deadline = ctx.clock() + limit
+    while True:
+        left = deadline - ctx.clock()
+        try:
+            status = await asyncio.wait_for(ctx.playback.status(), timeout=max(left, 0.001))
+        except (TimeoutError, httpx.HTTPError):
+            status = {"state": "unknown"}
+        if (
+            status is None
+            or status.get("run_id") not in (None, run_id)
+            or status.get("state") not in (*LIVE_STATES, "stopping", "unknown")
+        ):
+            return
+        if left <= 0:
+            raise SnapshotError(
+                f"run {run_id} has not stopped after {limit:g} s ({status.get('state')}); "
+                "restore changed nothing else - try again once it has"
+            )
+        await ctx.sleep(min(0.2, left))
 
 
 async def _restore_toxiproxy(
