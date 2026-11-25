@@ -114,6 +114,8 @@ class FakeDocker:
         self.fail_start = False
         # set: archive blocks on it (a worker thread mid-archive)
         self.gate: threading.Event | None = None
+        # container mode: the service entries running as containers
+        self.running_containers: set[str] = set()
         self.archiving = threading.Event()
         # (image id, name) of hq-primary's container; None: no container
         self.image: tuple[str, str] | None = ("sha256:pg18", "postgres:18-test")
@@ -130,6 +132,17 @@ class FakeDocker:
 
     def create_missing(self, services: list[str]) -> None:
         self.calls.append(("create_missing", tuple(services)))
+
+    def service_containers(self, names: list[str]) -> list[str]:
+        return [name for name in names if name in self.running_containers]
+
+    def stop_service_containers(self, names: list[str]) -> None:
+        self.calls.append(("stop_services", tuple(names)))
+        self.running_containers -= set(names)
+
+    def start_service_containers(self, names: list[str]) -> None:
+        self.calls.append(("start_services", tuple(names)))
+        self.running_containers |= set(names)
 
     def container_image(self, node: str) -> tuple[str, str] | None:
         assert node == "hq-primary"
@@ -915,6 +928,59 @@ async def test_restore_cuts_the_gateways_hq_links_after_the_services_start(
     assert seen == {hq_links[0]: True, hq_links[1]: True, SHARED: False}
     # afterwards: everything as saved
     assert all(server.proxies[name]["enabled"] is False for name in [*hq_links, SHARED])
+
+
+async def test_restore_restarts_container_mode_services_as_containers(world: World) -> None:
+    """Container mode: the services are the generated file's profile
+    containers. Restore stops and starts THEM (their caches go stale),
+    never rosctl down/up - those would start host processes on the same
+    ports."""
+    from restaurantos.sim.services import service_specs
+
+    entries = tuple(spec.name for spec in service_specs(CLUSTER))
+    ctx, _, docker, server, services = world
+    docker.running_containers = set(entries)
+    hq_link = proxy_name("gateway", "hq-primary")
+    server.proxies[hq_link]["enabled"] = False
+    await save("snap", ctx)
+    docker.calls.clear()
+    await restore("snap", ctx)
+    assert services == []  # no rosctl down/up
+    kinds = [call[0] for call in docker.calls]
+    assert kinds.index("stop_services") < kinds.index("unpack")
+    assert docker.calls[-1] == ("start_services", entries)
+    # the gateway's HQ cut is applied after the containers are up
+    assert server.proxies[hq_link]["enabled"] is False
+
+
+def test_the_container_mode_compose_calls() -> None:
+    from restaurantos.sim.snapshot import Docker
+
+    calls: list[tuple[str, ...]] = []
+
+    def compose(*args: str):
+        calls.append(args)
+        return subprocess.CompletedProcess(list(args), 0, "gateway\nhq-primary\ntoxiproxy\n", "")
+
+    docker = Docker(compose=compose)
+    assert docker.service_containers(["gateway", "coordinator"]) == ["gateway"]
+    docker.stop_service_containers(["gateway"])
+    docker.start_service_containers(["gateway", "coordinator"])
+    assert calls[0][:2] == ("--profile", "services")
+    assert calls[1] == ("--profile", "services", "stop", "gateway")
+    assert calls[2] == ("--profile", "services", "up", "-d", "--wait", "gateway", "coordinator")
+
+
+async def test_restore_refuses_services_running_both_ways(world: World) -> None:
+    ctx, host, docker, _, services = world
+    await save("snap", ctx)
+    docker.calls.clear()
+    host.commands.clear()
+    docker.running_containers = {"gateway"}
+    ctx.host_services = lambda: ["coordinator"]
+    with pytest.raises(SnapshotError, match="both as host processes"):
+        await restore("snap", ctx)
+    assert docker.calls == [] and host.commands == [] and services == []
 
 
 async def test_save_without_a_run_records_no_run(world: World) -> None:

@@ -223,6 +223,24 @@ class Docker:
         # Compose, without starting anything
         self.compose("up", "--no-start", *services)
 
+    def service_containers(self, names: list[str]) -> list[str]:
+        """Which of the service entries `names` run as containers now (the
+        generated file's `services` profile: container mode)."""
+        running = set(
+            self.compose(
+                "--profile", "services", "ps", "--services", "--status", "running"
+            ).stdout.split()
+        )
+        return [name for name in names if name in running]
+
+    def stop_service_containers(self, names: list[str]) -> None:
+        self.compose("--profile", "services", "stop", *names)
+
+    def start_service_containers(self, names: list[str]) -> None:
+        # healthy when it returns: each entry's healthcheck is its
+        # readiness route
+        self.compose("--profile", "services", "up", "-d", "--wait", *names)
+
     def container_image(self, node: str) -> tuple[str, str] | None:
         """(image id, image name) the node's container was created from,
         or None when it has no container. The id is what the database
@@ -372,6 +390,9 @@ class Context:
     # wall time for the waits' deadlines (monotonic; tests pass a fake
     # that their sleep advances)
     clock: Callable[[], float] = time.monotonic
+    # the host-mode services running now (rosctl up's pid files); None:
+    # not checked
+    host_services: Callable[[], list[str]] | None = None
     services_down: Callable[[], None] | None = None
     # (cluster, cluster file, ports the precheck must skip: the listeners
     # of the proxies a restore cut again)
@@ -1357,8 +1378,26 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     running = await asyncio.to_thread(docker.container_image, HQ_PRIMARY)
     if running is not None:
         _check_image(saved_image, running, "nothing was changed")
+    # Which way do the services run? Restore restarts them the same way
+    # (they cache epochs and primaries the restore makes stale): host
+    # processes through rosctl down/up, or the generated file's
+    # `services` profile containers (container mode). Never both: they
+    # share ports.
+    from restaurantos.sim.services import service_specs
+
+    entries = [spec.name for spec in service_specs(current_cluster or snapshot_cluster)]
+    containers = await asyncio.to_thread(docker.service_containers, entries)
+    host = await asyncio.to_thread(ctx.host_services) if ctx.host_services else []
+    if containers and host:
+        raise SnapshotError(
+            f"services run both as host processes ({', '.join(host)}) and as containers "
+            f"({', '.join(containers)}), on the same ports: stop one set first; nothing "
+            "was changed"
+        )
     await _stop_live_run(ctx)
-    if ctx.services_down is not None:
+    if containers:
+        await asyncio.to_thread(docker.stop_service_containers, containers)
+    elif ctx.services_down is not None:
         await asyncio.to_thread(ctx.services_down)
     if current_cluster is not None:
         # the databases of the shape running now, from today's generated file
@@ -1388,7 +1427,13 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
     await asyncio.to_thread(docker.start, services)
     later = gateway_hq_cuts(snapshot_cluster, saved)
     skipped_toxics, cut = await _restore_toxiproxy(ctx, snapshot_cluster, saved, later=later)
-    if ctx.services_up is not None:
+    if containers:
+        # every service entry of the snapshot's shape (the generated file
+        # was rebuilt from it); a container has no precheck - its
+        # healthcheck is its readiness route
+        names = [spec.name for spec in service_specs(snapshot_cluster)]
+        await asyncio.to_thread(docker.start_service_containers, names)
+    elif ctx.services_up is not None:
         # A cut proxy does not listen, and rosctl up's precheck dials every
         # proxy the services use: name the cut ones so it skips them. The
         # cut stays in place - starting healed and cutting afterwards would
@@ -1423,6 +1468,12 @@ async def restore(name: str, ctx: Context, *, replace_cluster_file: bool = False
 # --- the services, through rosctl up/down's own code ---------------------------------
 
 
+def host_services() -> list[str]:
+    from restaurantos.sim.services import RUNS_DIR, running_names
+
+    return running_names(RUNS_DIR)
+
+
 def services_down() -> None:
     from restaurantos.sim.services import RUNS_DIR, down_exit_code, down_services, require_proc
 
@@ -1455,6 +1506,7 @@ def default_context(cluster_file: Path, sim: SimSettings, *, port: int | None = 
             timeout_s=sim.http_timeout_s,
             stop_timeout_s=sim.playback_drain_timeout_s + sim.http_timeout_s + 5.0,
         ),
+        host_services=host_services,
         services_down=services_down,
         services_up=services_up,
     )
