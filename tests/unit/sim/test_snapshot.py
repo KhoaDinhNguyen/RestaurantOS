@@ -1502,6 +1502,17 @@ def test_a_setting_the_run_overrode_comes_back_as_a_flag() -> None:
     assert "--skip-first-restock" in command
 
 
+def test_another_warm_up_is_a_restart_note_not_a_flag() -> None:
+    command, notes = _command({"engine": {**ENGINE, "warm_up_days": 21}})
+    assert "warm-up" not in command
+    (note,) = [note for note in notes if "warm-up of 21 days" in note]
+    assert "restart `rosctl control` with ROS_SIM_STOCK_WARM_UP_DAYS=21" in note
+    assert "rosctl playback build-cache --warm-up-days 21" in note
+    # the current warm-up: no note
+    _, notes = _command({"engine": {**ENGINE, "warm_up_days": 14}})
+    assert not any("warm-up" in note for note in notes)
+
+
 def test_the_manual_command_keeps_numbers_exact() -> None:
     import shlex
 

@@ -1233,9 +1233,15 @@ def replay_command(
             )
     warm_up = engine.get("warm_up_days")
     if warm_up is not None and warm_up != sim.stock_warm_up_days:
+        # The control process loads its data cache once, when it starts,
+        # for ROS_SIM_STOCK_WARM_UP_DAYS (and rebuilds it when the cached
+        # warm-up differs): a cache rebuilt under a running one changes
+        # nothing, and its next start would rebuild it back.
         notes.append(
-            f"the saved run's data cache used a warm-up of {warm_up} days: rebuild it with "
-            f"rosctl playback build-cache --warm-up-days {warm_up} first (it has no start flag)"
+            f"the saved run used a warm-up of {warm_up} days: restart `rosctl control` with "
+            f"ROS_SIM_STOCK_WARM_UP_DAYS={warm_up} first (it has no flag); it rebuilds the "
+            f"data cache for that warm-up as it starts, or build it beforehand with "
+            f"rosctl playback build-cache --warm-up-days {warm_up}"
         )
     if "restock_every" in engine:
         every = engine.get("restock_every")
