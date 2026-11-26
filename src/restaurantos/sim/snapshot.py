@@ -930,6 +930,12 @@ def _saved_proxies(name: str, snap: Path) -> list[dict[str, Any]]:
         if not isinstance(toxics, list):
             raise bad(f"{proxy['name']}: toxics is not a list")
         proxy["toxics"] = [_saved_toxic(proxy["name"], toxic, bad) for toxic in toxics]
+        # Toxiproxy refuses a second toxic of the same name on one proxy;
+        # the same name on two proxies is fine
+        names = [toxic["name"] for toxic in proxy["toxics"]]
+        repeated = sorted({name for name in names if names.count(name) > 1})
+        if repeated:
+            raise bad(f"{proxy['name']}: more than one toxic named {', '.join(repeated)}")
     return saved
 
 

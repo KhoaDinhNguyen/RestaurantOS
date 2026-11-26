@@ -914,6 +914,8 @@ async def test_a_failed_automatic_start_drops_the_reserved_link(world: World) ->
         '[{"name": "x", "toxics": [{"name": "t", "type": "latency", "toxicity": 1.5}]}]',
         '[{"name": "x", "toxics": [{"name": "t", "type": "latency", "toxicity": "all"}]}]',
         '[{"name": "x", "toxics": [{"name": "t", "type": "latency", "attributes": [1]}]}]',
+        '[{"name": "x", "toxics": [{"name": "t", "type": "latency"}, '
+        '{"name": "t", "type": "timeout"}]}]',
     ],
 )
 async def test_restore_refuses_a_malformed_toxiproxy_file_first(world: World, content: str) -> None:
@@ -1346,6 +1348,16 @@ async def test_restore_with_the_flag_replaces_the_cluster_file(world: World) -> 
     assert ctx.cluster_file.read_text() == TOML
     assert result["cluster_file_replaced"] is True
     assert "restart any process" in result["warnings"][0]
+
+
+def test_one_toxic_name_may_appear_on_two_proxies(tmp_path: Path) -> None:
+    from restaurantos.sim.snapshot import _saved_proxies
+
+    toxic = {"name": "slow", "type": "latency"}
+    saved = [{"name": "a", "toxics": [toxic]}, {"name": "b", "toxics": [dict(toxic)]}]
+    (tmp_path / "toxiproxy.json").write_text(json.dumps(saved))
+    proxies = _saved_proxies("s", tmp_path)
+    assert [proxy["toxics"][0]["name"] for proxy in proxies] == ["slow", "slow"]
 
 
 def test_saved_toxics_are_normalised_to_what_add_toxic_takes(tmp_path: Path) -> None:
