@@ -1601,11 +1601,21 @@ async def restore(
             "processes) or docker compose -p restaurantos -f infra/generated/compose.yaml "
             "--profile services up -d --wait (containers)"
         )
+        if cut:
+            # a cut proxy does not listen, and a plain `rosctl up` dials
+            # every proxy its services use before it starts them
+            result["warnings"].append(
+                f"links are cut as saved ({', '.join(cut)}): a plain rosctl up refuses, as its "
+                "precheck finds them closed. Restore again with --services host (the "
+                "precheck then skips the cut ports, and the cuts stay), or run rosctl up "
+                "--no-precheck; healing them first also works, but drops the saved faults"
+            )
         if later:
             result["warnings"].append(
                 f"the gateway's links to HQ are cut as saved ({', '.join(later)}): a gateway "
-                "started now cannot load its routing - heal them first, or restore again "
-                "with --services host or --services containers"
+                "started now cannot load its routing - restore again with --services host "
+                "or --services containers (they start the gateway first and cut these "
+                "after), or heal them first, which drops the saved faults"
             )
     if differs:
         result["warnings"].append(

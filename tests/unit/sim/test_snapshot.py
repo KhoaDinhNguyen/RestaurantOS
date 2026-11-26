@@ -1034,14 +1034,27 @@ async def test_restore_with_services_none_stops_them_and_starts_none(world: Worl
     ctx, _, _, server, services = world
     hq_link = proxy_name("gateway", "hq-primary")
     server.proxies[hq_link]["enabled"] = False
+    server.proxies[SHARED]["enabled"] = False
     await save("snap", ctx)
     result = await restore("snap", ctx, services="none")
     assert services == ["down"]
     assert result["services"] == "none" and result["resume"]["started"] is False
     assert any("(--services none)" in w for w in result["warnings"])
-    # the saved cuts still hold, and the gateway's are called out
+    # the saved cuts still hold, and both kinds are called out: a plain
+    # rosctl up refuses on the region link, the gateway cannot start on HQ's
     assert server.proxies[hq_link]["enabled"] is False
+    assert server.proxies[SHARED]["enabled"] is False
+    (plain,) = [w for w in result["warnings"] if "a plain rosctl up refuses" in w]
+    assert SHARED in plain and hq_link not in plain
+    assert "--services host" in plain and "--no-precheck" in plain
     assert any(hq_link in w and "cannot load its routing" in w for w in result["warnings"])
+
+
+async def test_restore_without_cuts_warns_only_that_nothing_started(world: World) -> None:
+    ctx, _, _, _, _ = world
+    await save("snap", ctx)
+    result = await restore("snap", ctx, services="none")
+    assert not any("cut as saved" in w for w in result["warnings"])
 
 
 async def test_restore_refuses_services_another_way_than_they_run(world: World) -> None:
