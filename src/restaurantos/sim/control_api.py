@@ -224,13 +224,15 @@ class RestoreSnapshotBody(BaseModel):
     services: Literal["auto", "host", "containers", "none"] = "auto"
 
 
-def add_sim_jobs(app: FastAPI) -> None:
+def add_sim_jobs(app: FastAPI, *, port: int | None = None) -> None:
     """Mount the check and snapshot job routes: `rosctl check` and
     `rosctl snapshot save|restore` as jobs on the runner that
     `add_control_routes` left on `app.state` (one job at a time;
     GET /sim/jobs/{job_id} polls). `GET /sim/snapshots` is a plain read.
     The jobs run the same code the CLI commands run, against the
-    checkout the control process was started from."""
+    checkout the control process was started from, and reach its own
+    playback on `port`: the port it listens on (default
+    ROS_SIM_CONTROL_PORT)."""
     import asyncio
     from pathlib import Path
 
@@ -257,7 +259,7 @@ def add_sim_jobs(app: FastAPI) -> None:
         """The run this process's own playback host is still running,
         pausing or stopping; None when there is none or no answer."""
         client = PlaybackClient(
-            f"http://{sim.control_host}:{sim.control_port}", timeout_s=sim.http_timeout_s
+            f"http://{sim.control_host}:{port or sim.control_port}", timeout_s=sim.http_timeout_s
         )
         try:
             status = await client.status()
@@ -308,7 +310,7 @@ def add_sim_jobs(app: FastAPI) -> None:
             return error_response(error.status, error.code, str(error))
 
         async def work() -> Any:
-            ctx = default_context(Path(get_settings().cluster_file), sim)
+            ctx = default_context(Path(get_settings().cluster_file), sim, port=port)
             return await save(body.name, ctx)
 
         return _submit("snapshot", body.name, work)
@@ -327,7 +329,7 @@ def add_sim_jobs(app: FastAPI) -> None:
             return error_response(error.status, error.code, str(error))
 
         async def work() -> Any:
-            ctx = default_context(Path(get_settings().cluster_file), sim)
+            ctx = default_context(Path(get_settings().cluster_file), sim, port=port)
             return await restore(
                 name,
                 ctx,

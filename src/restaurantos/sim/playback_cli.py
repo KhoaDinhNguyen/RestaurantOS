@@ -415,7 +415,7 @@ async def _run_start(
     extras: _ControlExtras | None = None
     if control:
         try:
-            extras = _add_control_extras(app, args.config or common.cluster_file)
+            extras = _add_control_extras(app, args.config or common.cluster_file, port=args.port)
         except (OSError, ValueError) as error:
             print(f"rosctl control: {error}", file=sys.stderr)
             return 1
@@ -662,10 +662,11 @@ class _ControlExtras:
         await self.toxiproxy.aclose()
 
 
-def _add_control_extras(app: Any, cluster_file: Path) -> _ControlExtras:
+def _add_control_extras(app: Any, cluster_file: Path, *, port: int | None = None) -> _ControlExtras:
     """Mount the links, faults, nodes and jobs routes beside the playback
     routes. The cluster file decides the link groups and the nodes - use
-    the file bootstrap ran with."""
+    the file bootstrap ran with. `port` is the one the control process
+    listens on: its check and snapshot jobs reach its playback there."""
     from restaurantos.common.cluster import link_groups
     from restaurantos.sim.control_api import add_control_routes, add_sim_jobs
     from restaurantos.sim.faults import FaultLayer
@@ -676,7 +677,7 @@ def _add_control_extras(app: Any, cluster_file: Path) -> _ControlExtras:
     toxiproxy = Toxiproxy()
     jobs = JobRunner()
     add_control_routes(app, faults=FaultLayer(toxiproxy, groups), nodes=Nodes(cluster), jobs=jobs)
-    add_sim_jobs(app)
+    add_sim_jobs(app, port=port)
     return _ControlExtras(toxiproxy, jobs, cluster_file, len(groups))
 
 

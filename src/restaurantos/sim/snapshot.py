@@ -413,6 +413,9 @@ class Context:
     # (cluster, cluster file, ports the precheck must skip: the listeners
     # of the proxies a restore cut again)
     services_up: Callable[[Cluster, Path, Sequence[int]], None] | None = None
+    # the control port `playback` is reached on, when not
+    # ROS_SIM_CONTROL_PORT: the manual replay command names it
+    port: int | None = None
 
     def __post_init__(self) -> None:
         if self.docker is None:
@@ -1167,6 +1170,7 @@ def replay_command(
     skip_first_restock: bool,
     sim: SimSettings,
     cluster: Cluster,
+    port: int | None = None,
 ) -> tuple[str, list[str]]:
     """The `rosctl playback start --via-control` that resumes a restored
     run by hand, and notes for what no start flag can set.
@@ -1186,6 +1190,10 @@ def replay_command(
     flags += [f"--run-id {run_id}", f"--speed {_num(speed)}"]
     if skip_first_restock:
         flags.append("--skip-first-restock")
+    # the playback host restore asked: the command goes to the same one
+    other_port = port is not None and port != sim.control_port
+    if other_port:
+        flags.append(f"--port {port}")
     notes: list[str] = []
     control_flags: list[str] = []
     rate = float(run.get("duplicate_rate", 0.0))
@@ -1277,6 +1285,8 @@ def replay_command(
             + " ".join(control_flags)
             + " first (they hold for every run it hosts)"
         )
+    if other_port and any("restart `rosctl control`" in note for note in notes):
+        notes.append(f"restart it on the same port: add --port {port}")
     if engine is not run.get("engine"):
         notes.append(
             "this snapshot predates the recorded engine settings: add any other "
@@ -1352,6 +1362,7 @@ async def _resume(
         skip_first_restock=skip,
         sim=ctx.sim,
         cluster=cluster,
+        port=ctx.port,
     )
     resume["manual_command"] = manual
     # The link to the parent run goes in BEFORE anything starts, on every
@@ -1681,4 +1692,5 @@ def default_context(cluster_file: Path, sim: SimSettings, *, port: int | None = 
         host_services=host_services,
         services_down=services_down,
         services_up=services_up,
+        port=port,
     )

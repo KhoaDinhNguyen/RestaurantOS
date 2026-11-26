@@ -567,8 +567,10 @@ async def test_a_punycode_origin_passes_guard_and_cors(punycode_app_and_client) 
 class _NoHost:
     """A PlaybackClient stand-in: no playback host answers."""
 
+    bases: list[str] = []
+
     def __init__(self, base_url: str, **kwargs) -> None:
-        pass
+        self.bases.append(base_url)
 
     async def status(self):
         return None
@@ -603,8 +605,15 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
     monkeypatch.setattr(snapshot, "save", fake_save)
     monkeypatch.setattr(snapshot, "restore", fake_restore)
     monkeypatch.setattr(checker, "run_check", fake_run_check)
-    monkeypatch.setattr(snapshot, "default_context", lambda cf, sim, **kw: object())
+    ports: list = []
+
+    def fake_context(cluster_file, sim, **kwargs):
+        ports.append(kwargs.get("port"))
+        return object()
+
+    monkeypatch.setattr(snapshot, "default_context", fake_context)
     monkeypatch.setattr(snapshot, "PlaybackClient", _NoHost)
+    _NoHost.bases.clear()
     monkeypatch.setattr(common_cluster, "load_cluster", lambda path: CLUSTER)
     monkeypatch.setattr(
         common_config,
@@ -624,7 +633,8 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
         nodes=Nodes(CLUSTER),
         jobs=jobs,
     )
-    add_sim_jobs(app)
+    # a control process on another port: its jobs reach its own playback there
+    add_sim_jobs(app, port=8099)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://control.test"
     ) as client:
@@ -685,6 +695,9 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
         posted = await client.post("/sim/snapshots/day7/restore")
         await done(posted.json()["job_id"])
         assert seen["restored"] == ("day7", False, "auto")  # no body: the defaults
+        # every job asked the control process's own port, never the default
+        assert ports and set(ports) == {8099}
+        assert _NoHost.bases and all(base.endswith(":8099") for base in _NoHost.bases)
         bad = await client.post("/sim/snapshots/day7/restore", json={"services": "both"})
         assert bad.status_code == 422
 

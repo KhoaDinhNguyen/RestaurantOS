@@ -240,9 +240,10 @@ def test_control_serves_playback_and_control_routes(tmp_path, monkeypatch, fresh
 
     real_extras = playback_cli._add_control_extras
 
-    def capture_extras(app_, path):
+    def capture_extras(app_, path, **kwargs):
         captured["app"] = app_
-        return real_extras(app_, path)
+        captured["extras_port"] = kwargs.get("port")
+        return real_extras(app_, path, **kwargs)
 
     paths: set[str] = set()
 
@@ -275,6 +276,8 @@ def test_control_serves_playback_and_control_routes(tmp_path, monkeypatch, fresh
     } <= paths
     # control starts no run of its own
     assert "start_kwargs" not in captured
+    # its jobs reach its playback on the port it listens on
+    assert captured["extras_port"] == 1
 
 
 def test_cut_warnings_are_printed(capsys) -> None:

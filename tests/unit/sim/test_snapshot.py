@@ -1491,6 +1491,7 @@ def _command(run: dict, sim: SimSettings | None = None, **kwargs) -> tuple[str, 
         skip_first_restock=kwargs.pop("skip", False),
         sim=sim or SimSettings(_env_file=None),
         cluster=CLUSTER,
+        port=kwargs.pop("port", None),
     )
 
 
@@ -1513,6 +1514,37 @@ def test_a_setting_the_run_overrode_comes_back_as_a_flag() -> None:
     command, _ = _command({"duplicate_rate": 0.05, "shuffle": True, "engine": ENGINE}, skip=True)
     assert "--duplicate-rate 0.05" in command and command.count("--shuffle") == 1
     assert "--skip-first-restock" in command
+
+
+def test_the_manual_command_keeps_the_playback_port() -> None:
+    sim = SimSettings(_env_file=None)
+    command, notes = _command({"engine": ENGINE}, port=8099)
+    assert command.endswith("--port 8099")
+    assert not any("--port" in note for note in notes)  # nothing to restart
+    # the configured port, or none given: no flag
+    for port in (None, sim.control_port):
+        command, _ = _command({"engine": ENGINE}, port=port)
+        assert "--port" not in command
+    # a restart note: on the same port
+    command, notes = _command({"engine": {**ENGINE, "shuffle_window": 3}}, port=8099)
+    assert "restart it on the same port: add --port 8099" in notes
+
+
+async def test_restore_names_the_port_it_reached_playback_on(world: World) -> None:
+    ctx, host, _, _, _ = world
+    await save("snap", ctx)
+    host.alive = False  # no host answers: the manual command is the way on
+    ctx.port = 8099
+    result = await restore("snap", ctx)
+    assert " --port 8099" in result["resume"]["manual_command"]
+
+
+def test_default_context_keeps_the_port(tmp_path: Path) -> None:
+    from restaurantos.sim.snapshot import default_context
+
+    sim = SimSettings(_env_file=None)
+    assert default_context(tmp_path / "c.toml", sim, port=8099).port == 8099
+    assert default_context(tmp_path / "c.toml", sim).port is None
 
 
 def test_another_warm_up_is_a_restart_note_not_a_flag() -> None:
