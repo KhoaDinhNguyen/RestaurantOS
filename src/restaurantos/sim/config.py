@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ipaddress
 from functools import cache
+from pathlib import Path
 from urllib.parse import urlsplit
 
 from pydantic import Field
@@ -103,6 +104,32 @@ class SimSettings(BaseSettings):
     # and need nothing. Empty means CLI-only. Entries are validated by
     # parse_allowed_origins: an invalid one stops the process at startup.
     control_allowed_origins: str = ""
+
+    # The invariant checker (WP6b, architecture 7.5): how long it waits
+    # for the outbox and the holding queue to drain before it gives up
+    # and fails, and how often it looks.
+    check_drain_timeout_s: float = Field(default=300.0, gt=0)
+    check_poll_s: float = Field(default=1.0, gt=0)
+
+    # Snapshot and restore (WP6b, architecture 7.4).
+    snapshot_dir: Path = Path("snapshots")
+    # A snapshot waits until its dispatch frontier is this many simulated
+    # seconds into the day before it pauses, so every status event of the
+    # previous day's late orders (+25 min plus the jitter) and the midnight
+    # restock batch are done: the restored day is replayed from its
+    # midnight. Save refuses a value below the floor of the engine that
+    # runs the run (snapshot.offset_floor: the schedule's last offset plus
+    # that engine's jitter, about 26-27 min; 1 s with events off) - checked
+    # against the live host, since it may run with another jitter.
+    snapshot_min_day_offset_s: int = Field(default=1800, ge=0, le=86399)
+    # How long a snapshot waits for in-flight requests after the pause.
+    snapshot_drain_timeout_s: float = Field(default=60.0, gt=0)
+    # Restore replays the snapshot's day from midnight at this speed when
+    # the saved speed is slower, and switches back to the saved speed this
+    # many simulated seconds before the snapshot point (early is harmless:
+    # the replayed part is all duplicates).
+    snapshot_catchup_speed: float = Field(default=5000.0, gt=0)
+    snapshot_catchup_margin_s: float = Field(default=600.0, ge=0)
 
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}

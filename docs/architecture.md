@@ -744,7 +744,7 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
 | --- | --- | --- |
 | `GET /sim/clock` | current simulated day and time, speed, state | built (WP6a) |
 | `GET /sim/playback` | the run's state and counters | built (WP6a) |
-| `POST /sim/playback` | `{action: start\|pause\|resume\|stop, from_day, to_day, speed, seed, run_id, duplicate_rate, shuffle}` | built (WP6a) |
+| `POST /sim/playback` | `{action: start\|pause\|resume\|stop, from_day, to_day, speed, seed, run_id, duplicate_rate, shuffle, skip_first_restock}` | built (WP6a) |
 | `PATCH /sim/playback` | `{speed}`: change speed on the fly (UI slider) | built (WP6a) |
 | `GET /sim/links` | link groups and the faults on them | required |
 | `POST /sim/faults` | break a link group | required |
@@ -766,11 +766,23 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
   "state": "running", "run_id": "2026-11-20-a", "seed": 0, "from_day": 14, "to_day": 20, "speed": 1000.0,
   "orders_sent": 0, "orders_acked": 0, "orders_parked": 0, "orders_refused": 0, "orders_failed": 0,
   "events_sent": 0, "events_acked": 0, "events_duplicate": 0, "events_conflicted": 0, "events_failed": 0, "events_skipped": 0,
-  "restocks_sent": 0, "restocks_acked": 0, "restocks_failed": 0, "inflight": 0
+  "restocks_sent": 0, "restocks_acked": 0, "restocks_failed": 0, "inflight": 0,
+  "dispatched_sim_day": 14, "dispatched_sim_time": "09:41:07",
+  "held_sim_day": 14, "held_sim_time": "09:40:55", "next_due_sim_day": 14, "next_due_sim_time": "09:40:55",
+  "engine": {
+    "sequential": false, "region": null, "target_url": "http://127.0.0.1:8000/api/v1/orders", "inflight": 64,
+    "events": {"enabled": true, "sample_rate": 1.0, "jitter_s": 60.0}, "warm_up_days": 14, "restock_every": 7,
+    "duplicate_offset_s": 1.0, "shuffle_window": 8, "kitchen": {"mode": "edge", "urls": {"r1": "http://127.0.0.1:8011/api/v1"}}
+  }
 }
 ```
 
+- `dispatched_sim_day` / `dispatched_sim_time` is the dispatch frontier: the simulated instant of the last item the engine sent (`null` before the run's first dispatch). The clock runs on wall time and can run ahead of it, because a status event waits for its order's answer before it goes out; a snapshot takes its point from the frontier (Section 7.4).
+- `held_sim_day` / `held_sim_time` is the earliest order pulled from the stream but not sent yet (with shuffle on, up to a window of them wait, possibly earlier than the frontier); `next_due_sim_day` / `next_due_sim_time` is the earliest item of any kind still waiting to go out. Both `null` when nothing waits. A snapshot uses them to wait for held orders of the previous day and to tell a stalled dispatch from one with nothing due yet (Section 7.4).
+- `engine` holds what every run on this playback process shares, set when the process starts and never by a start body: the same values a run's `meta.json` records. A restore compares them with the snapshot's run before it replays the day (Section 7.4).
+
 - `start` needs `from_day`; `to_day`, `speed`, `seed` and `run_id` are optional. `duplicate_rate` (a share in [0, 1], default 0) and `shuffle` (default off, Section 7.2) are part of the start body: they are per-run facts, derived from the seed like every other random value, and recorded in the run's `meta.json` next to the seed. A rate outside [0, 1] answers `422`, and so does `shuffle` together with `--sequential`. Status events and restocks are switched on when the playback process starts, not per run.
+- `skip_first_restock` (default false) drops the restock at 00:00 of `from_day`. A snapshot restore sets it when the day it replays already had its restock (Section 7.4).
 - A `to_day` past the last day that has orders is shortened to that day. The answer's `to_day` shows the day used, and a warning names it. A `from_day` past the data, or inside the warm-up window, is refused.
 - How a status event's final answer is counted:
   - `events_acked`: the region applied it.
@@ -830,13 +842,19 @@ Browsers decide same-site by scheme + registrable domain, ignoring the port: `ht
 
 - `kind` is `scenario`, `snapshot`, `restore` or `check`; `state` is `running`, `done` or `failed`. One job runs at a time: a second `POST` answers `409` with `{"error": "busy", "job_id": "j7"}`.
 - `POST /sim/scenarios/{name}` takes an optional `{"region_id": "r1"}`, the region to break (default `r1`). Its `result` is the checker's result plus the scenario's own numbers, such as T1's failover time.
-- `GET /sim/snapshots` lists `{"name", "created_at", "sim_day", "sim_time", "regions"}`. `POST /sim/snapshots` takes `{"name": "before-t2"}` (`409` when the name is taken). Restoring an unknown name is a `404`.
-- The `result` of `POST /sim/check`:
+- `GET /sim/snapshots` answers `{"snapshots": [...]}`, one `{"name", "created_at", "sim_day", "sim_time", "regions"}` per snapshot (`{"snapshots": []}` when there are none). `POST /sim/snapshots` takes `{"name": "before-t2"}` (`409` when the name is taken, `422` for a name that is not one path component; both answered at once, before a job is queued). `POST /sim/snapshots/{name}/restore` takes an optional `{"replace_cluster_file": false, "services": "auto"}` (`services` is `auto`, `host`, `containers` or `none`; Section 7.4); restoring an unknown name is a `404` and a name that is not one path component a `422`, both answered at once. The job checks the name again when it runs (a `rosctl snapshot save` from a shell can take the name in between), so the job can still fail that way.
+- `POST /sim/check` takes `{"runs": ["<run_id>", ...], "allow_unacked": false}` (at least one run, each one path component, else `422`); a restored run brings the run it continues by itself. Its `result`:
 
 ```json
 { "passed": true, "acked": 21840, "stored": 21840, "hq": 21840,
-  "lost_at_failover": { "count": 0, "order_ids": [] }, "duplicates": [], "unaccounted": [] }
+  "lost_at_failover": { "count": 0, "order_ids": [] }, "duplicates": [], "unaccounted": [],
+  "stored_unacked": { "count": 0, "order_ids": [], "allowed": false },
+  "runs": ["2026-11-20-a"], "days": [14, 20] }
 ```
+
+  `duplicates` entries are `{"external_order_id", "where": "regions", "regions"}` or `{"external_order_id", "where": "hq", "count"}`; `unaccounted` entries are `{"external_order_id", "reason", "region_id"}` (Section 7.5 lists the reasons). `stored_unacked` fails the check unless `allow_unacked` is true.
+
+- The same code runs as `rosctl check --run <run_id> [--run ...] [--allow-unacked] [--json] [--port <control port>]` (exit 0 on pass, 1 on fail; `--port` is the playback host it asks whether a run is still live, as for `rosctl snapshot`) and `rosctl snapshot save|restore|list`. As jobs, they reach the control process's own playback on the port it listens on (`rosctl control --port`).
 
 ## 7. Simulation harness
 
@@ -887,6 +905,7 @@ Playback also sends status events for each order, triggers restocks every R simu
 - The batch waits for every earlier send to finish, because an order still in flight from before midnight must land first: the oracle applies it first.
 - That day's orders wait for the whole batch.
 - A restock that still fails after its attempts is counted and reported, and the run goes on.
+- A start can drop the restock at 00:00:00 of `from_day` (`skip_first_restock`, default off; Section 7.4): a snapshot restore replays a day whose restock already went out, and restock tops every counter up to par, so a second one would refill what was sold between midnight and the snapshot.
 
 **Duplicates and shuffle.** A configurable share of orders (`duplicate_rate`, default 0) is sent twice, and delivery can be reordered (`shuffle`, default off). Both are per-run start facts, recorded in `meta.json`, and both derive every random value from the hash of (`seed`, `order_id`, purpose) - never a shared generator.
 
@@ -923,11 +942,60 @@ A snapshot is the state of the whole system at a point in simulated time:
 
 Restore reverses it. Because primaries and standbys are captured stopped and together, replication state, epochs and outboxes come back consistent.
 
+How it is built (`rosctl snapshot save|restore|list`, `sim/snapshot.py`):
+
+**Save.**
+
+- **Where it snapshots.** The point is the **dispatch frontier**: the simulated instant of the last item the engine sent (`GET /sim/playback`, Section 6.3), never the clock. The clock runs on wall time and runs ahead of dispatch when a status event waits for its order's answer, so a clock point could name day N+1 while the run log and the databases end in day N, and the rest of day N would never be sent.
+- **When.** Save waits until the frontier is `ROS_SIM_SNAPSHOT_MIN_DAY_OFFSET_S` (00:30) into its day and no order of an earlier day is still held back unsent (with shuffle on, a held order can trail the frontier, and at night a window of orders can span 00:30). It refuses a minimum below the last status event's offset plus the jitter the playback host runs with (read from its `engine` block; 1 s with events off). It gives up when dispatch has not moved for `ROS_SIM_SNAPSHOT_DRAIN_TIMEOUT_S` of wall time while an item is due (the clock past `next_due`); waiting for an item that is not due yet never counts, so a quiet night at 1x is not a stall.
+- **What it refuses.** A run that is stopping (it is still sending, and where it ends is not a chosen point): snapshot once it has stopped. A paused run that stands before the minimum. A run whose history is incomplete (below).
+- **The pause.** Save pauses playback, waits for in-flight requests (a wall-time deadline), and checks the frozen point again; if dispatch moved past it (across midnight, say), save refuses and resumes the run. A pause request that fails in transport is resolved: the run is resumed if it did pause, and an unreadable state is reported. Any failure after the pause resumes the run.
+- **What it records.** `snapshot.json` (the point as `sim_day`/`sim_time`, the clock at the pause as `clock_sim_day`/`clock_sim_time`, the run's settings and the playback host's `engine` block), `cluster.toml`, `toxiproxy.json` (each proxy's enabled flag and toxics), `image.json` (the PostgreSQL image the databases run), and the run log of the run **and every run it continues** (a restored run's parent, and so on): each snapshot carries the run's whole history, so a later restore of an older snapshot cannot leave this one's ancestors at another point.
+- **The databases.** It stops **only the PostgreSQL services**, by name, HQ's first: the coordinator acts only with exactly one reachable writable HQ, so it decides nothing while the regions stop (stopped together, a standby would stop before its primary with HQ up, and a synchronous cluster's coordinator would downgrade that primary to async into the snapshot). A bare `docker compose stop` would stop Toxiproxy too, which reloads its config on start and drops every fault. It archives every data volume, the baseline's included, with the exact image the databases run (the `hq-primary` container's image id, `docker run --pull=never`), then starts the databases and resumes playback - only once they are back (healthy); if they do not come back, playback is left paused and the error says so.
+- **Failure and Ctrl-C.** It builds into `snapshots/.<name>.partial/` and renames at the end, so a failed snapshot leaves nothing behind. The stopped window runs in one worker thread; a cancelled save tells it to stop at its next step and waits for it, so bringing the databases back never races it.
+
+**Restore.**
+
+- **Checks first, changes nothing until they pass.** The snapshot is complete (every volume archive it will unpack, not empty; the saved runs) and its `toxiproxy.json` is well formed; its `cluster.toml` matches the current one (or `--replace-cluster-file` is passed, which writes it over the current file); its PostgreSQL image is the one the databases use now (a data directory only starts under the PostgreSQL that wrote it); and the services do not run both as host processes and as containers (they share ports).
+- **No staging.** It does not unpack into spare volumes first: Docker cannot rename a volume, so staging would copy every volume twice on every restore. After the checks only an I/O error mid-unpack can stop it half way, with the snapshot untouched, so running the restore again is the recovery.
+- **The steps.** Stop the live run and wait until it has stopped (a run still stopping keeps writing its log, which restore is about to put back; past the engine's drain time plus slack it gives up, changing nothing else). Stop the services the way they run: host processes through `rosctl down`, or, in container mode, the generated file's `services` profile containers. Stop the databases. Regenerate `infra/generated/` from the snapshot's `cluster.toml` before any container starts. Unpack every volume. Put the run logs back. Start the databases. Put Toxiproxy's proxies and toxics back (healing the control process's own faults first). Start the services again (`rosctl up`, or `compose --profile services up -d --wait` for every service entry of the snapshot's shape): they cache epochs and primaries that a restore makes stale.
+- **Which services it starts.** `--services` (the API's `services`) decides. The default, `auto`, starts them the way they ran before the restore, and starts none if none ran: restore never guesses between host processes and containers. `host` or `containers` start them that way, even when none ran; asking for one while they run the other way is refused before anything changes. `none` stops them and starts none. When no services start, the result says how to start them, the replay is not resumed (every order would fail against services that are down; the link is kept and `manual_command` resumes it once they are up), and the saved cuts are called out. A plain `rosctl up` refuses while a link it dials is cut (its precheck finds it closed): restore again with `--services host`, which tells the precheck to skip the cut ports and keeps the cuts, or use `rosctl up --no-precheck`. A gateway cannot start at all while its links to HQ are cut (it cannot load its routing): restore again with `--services host` or `containers`, which start it first and cut those links after. Healing a cut first works too, but drops that saved fault.
+- **Saved cuts.** A proxy the snapshot had cut is cut again before the services start, and stays cut (starting healed and cutting afterwards would let a relay drain the backlog the snapshot held behind the cut). A cut proxy does not listen, so restore tells `rosctl up`'s precheck to skip those ports; plain `rosctl up` checks every port as before. One kind of cut waits until the services are up: the gateway's links to HQ. The gateway loads its routing table from HQ's writable node when it starts, so with those links cut it would never become ready (in the original run it was already up when the cut came); restore cuts them right after the services start. Nothing flows through them meanwhile: playback is stopped, and the gateway's HQ link carries no backlog. Restored cuts are not faults of the control process: its links view shows them as unexplained, and heal-all clears them.
+- **Another cluster shape.** With `--replace-cluster-file`, the old shape's databases that the snapshot's shape lacks (an `r2`, say) are left stopped with their volumes, and the result names them.
+
+**Resuming playback (option C).**
+
+- **A new run, linked first.** Playback cannot start mid-day, so restore starts a **new run** (`<run_id>-r<n>`) from 00:00 of the snapshot's day, with the same seed, window and settings. Before anything starts, restore writes the new run's `resumed_from.json` (its parent, the snapshot, the point) into `runs/<run_id>-r<n>/`: the checker follows it to the days before the snapshot. The engine accepts the folder (it reserves a run id by creating `orders.jsonl`), so the link also reserves the id, and a run started by hand with exactly that `--run-id` is linked too. If an automatic start fails, the folder goes.
+- **The replay.** What the regions stored before the snapshot point is answered as a duplicate and changes nothing: an order the region stored is answered from its inbox without touching stock, and a status event has a fixed id. An order the region never stored is no duplicate: if every send of it failed or timed out before the snapshot, the replay sends it again, the region may store it now, and it takes stock (Limitation 1). The day is replayed at a catch-up speed (default 5000x) and switched back to the saved speed 10 simulated minutes before the snapshot point. A replay paused during catch-up gets the saved speed back at once, so it does not resume at catch-up speed; a stopped or replaced run is left alone.
+- **The day's restock.** It is skipped (`skip_first_restock`) when it already went out, decided from the restored run's `meta.json`, never its log: the day is one of the run's restock days, or the run is itself a replay of that day that skipped it (a resumed run saved and restored again). The snapshot point is past midnight, so the batch was sent and answered. It is skipped because restock tops up to par, and a second one would refill what was sold since midnight. Vendors whose restock that day failed in the original run stay unrestocked, as they did then; the result lists them (`restock_failed_vendors`).
+- **The playback host.** Before it starts the replay, restore compares the host's `engine` block with the engine the snapshot's run had, every fact but `inflight`: a host started with other flags (a single-region host for a gateway snapshot, say) sends with its own settings from the first order on, so on any difference restore does not start, lists the differences, and gives the manual command.
+- **No host.** Restore cannot start the replay itself: it answers `started: false` with `manual_command`, the `rosctl playback start --via-control` that resumes the run by hand on the control process (start `rosctl control` first when none runs). The day, window, seed, run id, speed and restock skip are always in it, and `--port` when restore reached the playback host on another port than `ROS_SIM_CONTROL_PORT`; every other run flag only where the saved run differs from the current settings (`ROS_SIM_*`, `.env`), with exact numbers, so the command is as short as it can be and still exact. Engine-wide settings cannot travel with a start (they hold for every run the control process hosts): where the saved run differs, the command is joined by a `restart rosctl control with ...` note instead, and a warning names the settings that have no flag (the event jitter, the edge host, the warm-up: restart `rosctl control` with `ROS_SIM_STOCK_WARM_UP_DAYS`, which rebuilds the data cache for it as it starts).
+
+**Limitations of option C.**
+
+1. A restored run is not identical to an uninterrupted one. Orders, refusals and statuses still end up consistent (the checker passes), but orders whose every send failed or timed out before the region stored them (only under faults) are sent again and may now be stored, taking stock; with `shuffle` on, the reorder batches count from the new run's start, so delivery near the snapshot point differs; and in concurrent runs, which order wins scarce stock was never repeatable anyway.
+2. Status events and resends of the previous day's late orders that fall after midnight are not sent by the new run. The engine dispatches in one time order, so once the frontier is 00:30 into the day, every status event of the previous day (at most 25 minutes plus the jitter after its order) and the midnight restock batch have been dispatched, and the in-flight wait means they were answered. Only a resend whose offset crosses midnight can still be skipped (harmless: it is a duplicate).
+3. The new run's counters include the replayed part, answered as duplicates; the checker reads both run logs (`rosctl check --run <new run>` follows `resumed_from.json`).
+4. The simulated clock, and the UI, jump back to 00:00 of the day and fast-forward to the snapshot point.
+
+**Future work (option A, not built).** A true mid-day resume: the engine restarts at the exact dispatch point where pause stopped (simulated instant, kind, stream position), rebuilds the delivery plan from the seed and skips everything before it, takes the order ids of pending status events from the restored run log, and continues the same run log. It removes limitations 1 to 4 but changes the dispatcher, the reorder buffer and the log sequence numbers.
+
 ### 7.5 Invariant checker
 
 After a run and after queues drain: orders acknowledged by the gateway = orders stored across regions = orders in HQ's analytics copy; no `external_order_id` stored twice; every refused or parked order is accounted for.
 
 After a failover the three numbers may differ by a small, explainable amount, and the checker reports it as "lost at failover" instead of failing: orders the old primary acknowledged, or its relay forwarded to HQ, before they were replicated to the standby. With asynchronous replication that is the expected cost, and it is the number the sync-versus-async comparison is about. Anything beyond it is a bug.
+
+How it is built (`rosctl check`, `sim/checker.py`):
+
+- **Drain** is a real condition, never a sleep: no outbox row with `relayed_at IS NULL` on any region's current primary and no `holding_queue` row with `delivered_at IS NULL`. After `ROS_SIM_CHECK_DRAIN_TIMEOUT_S` the check fails and says which queue is left.
+- It refuses a run (or a run it continues) that the playback host still runs, pauses or stops: a live run's log trails the databases by whatever is in flight. Check it once it has stopped.
+- It compares **sets** of `(channel, external_order_id)` within the runs' days - from the first run's `from_day` to the last day the runs actually sent (a run stopped early still names its planned `to_day`). The sets are every order stored on those days, not only the runs' own: check a cluster that holds only these runs' orders on those days (re-bootstrap between unrelated runs over the same days), or another run's orders show as `stored_not_in_run`. It reads each region's current primary from `region_state` and HQ's current primary from `pg_is_in_recovery()`. Acked means a `200`/`201` with an order id, or a `202` whose holding-queue row was delivered `accepted`; resends and replayed duplicates count once, best outcome first.
+- It refuses a run that targeted a region's edge API (`--target edge`): an edge run stays inside its region with no HQ behind it, and `rosctl oracle compare` covers it.
+- **Lost at failover** only when the order's region has a `failover` in `cluster_events` after the order's **latest** ack and replicated asynchronously at that moment (`synchronous = false`, or a `sync_downgrade` before the failover). An order acked twice (a resend, or a restored day's replay) was still in its region at the second answer, so only a failover after that one can explain it. An order that is at HQ but not in its region, with every send errored, counts only when the failover came after its first send; without a send time it is unaccounted. Otherwise a missing order is unaccounted.
+- **Known limit: lost at failover has no time bound.** Any failover after an order's last ack counts, however long after it, though asynchronous replication can only lose the last moments of commits. After a restore the parent run's acks are hours of wall time before any failover in the resumed run, so the excuse is wider still. The fix is a short window after the ack (a wall-time setting, not tied to playback speed); it is left for a follow-up because it changes what the checker accepts.
+- **Stored but never answered** (`stored_unacked`): every send of the order errored, yet it is stored. No client was promised anything, but a gateway that saves orders and never replies would look like this, so it fails the check by default; fault scenarios pass `--allow-unacked`, where a timeout that still landed is normal. To revisit after local testing; the planned upgrade is to fail only on orders sent outside a fault window.
+- **Unaccounted reasons:** `acked_not_stored`, `in_hq_not_in_region`, `stored_not_in_hq`, `refused_but_stored`, `stored_not_acked`, `stored_not_in_run`, `refused_not_in_inbox`, `parked_without_holding_row`, `parked_not_delivered`. **Duplicates** are checked across regions, inside one region (`orders` has no unique constraint on `external_order_id`), and at HQ.
 
 ## 8. Web UI
 

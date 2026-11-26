@@ -296,6 +296,84 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("infra/cluster.toml"),
         help="cluster description to copy from (default: infra/cluster.toml)",
     )
+    # --- checker and snapshots (WP6b) ----------------------------------
+    pstart.add_argument(
+        "--skip-first-restock",
+        action="store_true",
+        help="drop the restock at 00:00 of --from-day (snapshot restore sets it "
+        "when it replays a day whose restock already went out)",
+    )
+    check = sub.add_parser(
+        "check",
+        help="the invariant checker: wait for the queues to drain, then compare the "
+        "run log, the regions and HQ (exit 0 pass, 1 fail)",
+    )
+    check.add_argument(
+        "--run",
+        dest="runs",
+        action="append",
+        required=True,
+        help="a run id under runs/; repeat for several (a restored run brings "
+        "the run it continues by itself)",
+    )
+    check.add_argument(
+        "--allow-unacked",
+        action="store_true",
+        help="do not fail on orders that are stored though every send of them "
+        "errored (fault scenarios, where a timeout that still landed is normal)",
+    )
+    check.add_argument("--json", action="store_true", help="print the Section 6.3 result")
+    check.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="the playback host's control port, asked whether a run is still live "
+        "(default ROS_SIM_CONTROL_PORT)",
+    )
+    check.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="cluster description (default ROS_CLUSTER_FILE, infra/cluster.toml)",
+    )
+    snapshot = sub.add_parser(
+        "snapshot", help="save or restore the whole cluster at a point in simulated time"
+    )
+    ssub = snapshot.add_subparsers(dest="snapshot_command", required=True)
+    ssave = ssub.add_parser(
+        "save", help="pause playback, archive every database volume into snapshots/<name>/"
+    )
+    ssave.add_argument("name")
+    srestore = ssub.add_parser(
+        "restore",
+        help="put a snapshot back, restart the services, replay its day as a new run",
+    )
+    srestore.add_argument("name")
+    srestore.add_argument(
+        "--replace-cluster-file",
+        action="store_true",
+        help="write the snapshot's cluster.toml over the current one when they differ",
+    )
+    srestore.add_argument(
+        "--services",
+        # snapshot.SERVICE_MODES (not imported here: the CLI loads lazily)
+        choices=("auto", "host", "containers", "none"),
+        default="auto",
+        help="how to start the services afterwards: auto (default) starts them the way "
+        "they ran before, and none if none ran; host, containers or none choose",
+    )
+    for sparser in (ssave, srestore):
+        sparser.add_argument(
+            "--config",
+            type=Path,
+            default=None,
+            help="the cluster file bootstrap ran with (default ROS_CLUSTER_FILE)",
+        )
+        sparser.add_argument(
+            "--port", type=int, default=None, help="the playback host's control port"
+        )
+    ssub.add_parser("list", help="the saved snapshots")
+
     # --- services (up/down) ---------------------------------------------
     # The service table and the start/stop machinery live in
     # restaurantos.sim.services; this block only wires them up.
@@ -488,6 +566,14 @@ def app(argv: Sequence[str] | None = None) -> int:
             print(warning, file=sys.stderr)
         print(format_report(counts))
         return 0
+    if args.command == "check":
+        from restaurantos.sim.jobs_cli import check_command
+
+        return check_command(args)
+    if args.command == "snapshot":
+        from restaurantos.sim.jobs_cli import snapshot_command
+
+        return snapshot_command(args)
     if args.command in ("up", "down"):
         from restaurantos.common.cluster import load_cluster
         from restaurantos.common.config import get_settings

@@ -271,6 +271,9 @@ async def _run_start(
         # the banner's days come from the effective window, so a
         # shortened to_day never announces restocks outside the data
         banner_days = restock_days(meta.warm_up_days, restock_every, window.from_day, window.to_day)
+        if getattr(args, "skip_first_restock", False):
+            # the engine drops the from_day restock the same way
+            banner_days = [day for day in banner_days if day != window.from_day]
         pairs = restock_vendors(data_dir)
         vendors = [vendor for vendor, _geohash in pairs]
         # the region map shards these same rows, not a second read
@@ -412,7 +415,7 @@ async def _run_start(
     extras: _ControlExtras | None = None
     if control:
         try:
-            extras = _add_control_extras(app, args.config or common.cluster_file)
+            extras = _add_control_extras(app, args.config or common.cluster_file, port=args.port)
         except (OSError, ValueError) as error:
             print(f"rosctl control: {error}", file=sys.stderr)
             return 1
@@ -474,6 +477,7 @@ async def _run_start(
                 duplicate_rate=duplicate_rate,
                 shuffle=shuffle_on,
                 meta_extra=meta_extra,
+                skip_first_restock=getattr(args, "skip_first_restock", False),
             )
         except StateError:
             # A run was started through the control API in the window
@@ -658,12 +662,13 @@ class _ControlExtras:
         await self.toxiproxy.aclose()
 
 
-def _add_control_extras(app: Any, cluster_file: Path) -> _ControlExtras:
+def _add_control_extras(app: Any, cluster_file: Path, *, port: int | None = None) -> _ControlExtras:
     """Mount the links, faults, nodes and jobs routes beside the playback
     routes. The cluster file decides the link groups and the nodes - use
-    the file bootstrap ran with."""
+    the file bootstrap ran with. `port` is the one the control process
+    listens on: its check and snapshot jobs reach its playback there."""
     from restaurantos.common.cluster import link_groups
-    from restaurantos.sim.control_api import add_control_routes
+    from restaurantos.sim.control_api import add_control_routes, add_sim_jobs
     from restaurantos.sim.faults import FaultLayer
     from restaurantos.sim.nodes import Nodes
 
@@ -672,6 +677,7 @@ def _add_control_extras(app: Any, cluster_file: Path) -> _ControlExtras:
     toxiproxy = Toxiproxy()
     jobs = JobRunner()
     add_control_routes(app, faults=FaultLayer(toxiproxy, groups), nodes=Nodes(cluster), jobs=jobs)
+    add_sim_jobs(app, port=port)
     return _ControlExtras(toxiproxy, jobs, cluster_file, len(groups))
 
 
@@ -766,6 +772,10 @@ async def start_via_control(args: argparse.Namespace) -> int:
         value = getattr(args, key)
         if value is not None:
             body[key] = value
+    if getattr(args, "skip_first_restock", False):
+        # a snapshot restore's replay sets this; it is the run's own
+        # flag even though a plain start leaves it off
+        body["skip_first_restock"] = True
     return await control_command(args, method="POST", body=body)
 
 

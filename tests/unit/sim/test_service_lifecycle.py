@@ -1686,9 +1686,44 @@ def test_up_of_one_service_prechecks_only_its_own_dials(
         specs=[spec, fake("edge-r2", ROS_MODE="edge", ROS_REGION_ID="r2")],
     )
     _track(steps)
+    # _wait_ready waits only for started steps: a failed start would pass it
+    assert [(step.name, step.outcome) for step in steps] == [("edge-r1", "started")]
     _wait_ready(steps, ready_dir)
     assert seen == [[5510, 5511]]
-    down_services(cluster, runs_dir=tmp_path / "runs", names=["edge-r1"], specs=[spec])
+    stopped = down_services(cluster, runs_dir=tmp_path / "runs", names=["edge-r1"], specs=[spec])
+    assert [(step.name, step.outcome) for step in stopped] == [("edge-r1", "stopped")]
+
+
+@requires_proc
+def test_the_precheck_skips_the_ports_a_restore_expects_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ready_dir: Path
+) -> None:
+    # a restored snapshot cut a proxy: its listener is down on purpose,
+    # so restore names its port and the precheck dials only the rest
+    seen: list[list[int]] = []
+
+    def recording_unreachable(ports: list[int], **kwargs: object) -> list[int]:
+        seen.append(list(ports))
+        return []
+
+    monkeypatch.setattr(services, "dials", lambda spec, cluster: [21001, 21002])
+    monkeypatch.setattr(services, "unreachable_ports", recording_unreachable)
+    runs = tmp_path / "runs"
+    steps = up_services(
+        CLUSTER,
+        runs_dir=runs,
+        precheck=True,
+        expected_down=[21001],
+        grace_s=0.0,
+        specs=[fake("sleeper")],
+    )
+    _track(steps)
+    # _wait_ready waits only for started steps: a failed start would pass it
+    assert [(step.name, step.outcome) for step in steps] == [("sleeper", "started")]
+    _wait_ready(steps, ready_dir)
+    assert seen == [[21002]]
+    stopped = down_services(CLUSTER, runs_dir=runs, names=["sleeper"], specs=[fake("sleeper")])
+    assert [(step.name, step.outcome) for step in stopped] == [("sleeper", "stopped")]
 
 
 def test_a_platform_without_proc_is_refused_before_anything_runs(

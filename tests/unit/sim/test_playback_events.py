@@ -1402,7 +1402,14 @@ async def test_meta_records_the_extras(tmp_path: Path) -> None:
     await pb.stop()
     meta = json.loads((tmp_path / "meta" / "meta.json").read_text())
     assert meta["events"] == {"enabled": True, "sample_rate": 0.5, "jitter_s": 60.0}
-    assert meta["restock"] == {"days": [21], "vendors": 1, "every": 7}
+    assert meta["restock"] == {
+        "days": [21],
+        "vendors": 1,
+        "every": 7,
+        # a restored day replayed without its midnight restock
+        # (skip_first_restock, default off)
+        "skipped_first": False,
+    }
 
 
 # --- kitchen-call retries (review round 3, item 1) ------------------------
