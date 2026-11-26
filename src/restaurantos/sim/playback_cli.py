@@ -706,11 +706,9 @@ def _add_control_extras(
         from restaurantos.sim.scenarios import default_env
 
         engine = dict(scenario_engine)
-        engine_port = engine.pop("port")
+        engine.pop("port")
         env = default_env(cluster, cluster_file, faults=faults, nodes=nodes, **engine)
-        add_job_routes(
-            app, jobs=jobs, scenarios=env, cluster_file=cluster_file, control_port=engine_port
-        )
+        add_job_routes(app, jobs=jobs, scenarios=env)
     return _ControlExtras(toxiproxy, jobs, cluster_file, len(groups))
 
 
