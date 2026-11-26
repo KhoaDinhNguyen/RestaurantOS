@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -785,6 +786,22 @@ async def test_a_failed_archive_and_a_failed_start_are_both_named(world: World) 
     assert [body["action"] for body in host.commands] == ["pause"]
 
 
+async def _worker_reached(
+    step: threading.Event, task: asyncio.Task, timeout_s: float = 10.0
+) -> None:
+    """Wait (real time) until a gated worker thread has reached `step`.
+    If `task` ends first, await it so its own error is the failure;
+    fail, rather than hang, if neither happens within timeout_s."""
+    deadline = time.monotonic() + timeout_s
+    while not step.is_set():
+        if task.done():
+            await task  # raises the task's own error, if it has one
+            pytest.fail("the task finished before its worker reached the step")
+        if time.monotonic() > deadline:
+            pytest.fail(f"the worker did not reach the step within {timeout_s} s")
+        await asyncio.sleep(0.01)
+
+
 async def test_cancelling_a_save_waits_for_its_docker_worker(world: World) -> None:
     """Ctrl-C mid-archive: the worker thread cannot be stopped, so the
     databases come back and partial/ goes only once it has finished;
@@ -792,14 +809,15 @@ async def test_cancelling_a_save_waits_for_its_docker_worker(world: World) -> No
     ctx, host, docker, _, _ = world
     docker.gate = threading.Event()
     task = asyncio.create_task(save("cancelled", ctx))
-    while not docker.archiving.is_set():
-        await asyncio.sleep(0.01)
-    task.cancel()
-    await asyncio.sleep(0.1)
-    # the worker is still archiving: nothing may race it yet
-    assert ("start", DATABASES) not in docker.calls
-    assert (ctx.snapshot_dir / ".cancelled.partial").is_dir()
-    docker.gate.set()
+    try:
+        await _worker_reached(docker.archiving, task)
+        task.cancel()
+        await asyncio.sleep(0.1)
+        # the worker is still archiving: nothing may race it yet
+        assert ("start", DATABASES) not in docker.calls
+        assert (ctx.snapshot_dir / ".cancelled.partial").is_dir()
+    finally:
+        docker.gate.set()  # released whatever failed, so the worker ends
     with pytest.raises(asyncio.CancelledError):
         await task
     # it stopped at its next step, then the databases came back
@@ -1095,12 +1113,13 @@ async def test_cancelling_a_restore_waits_for_its_unpack_worker(world: World) ->
     docker.calls.clear()
     docker.unpack_gate = threading.Event()
     task = asyncio.create_task(restore("snap", ctx))
-    while not docker.unpacking.is_set():
-        await asyncio.sleep(0.01)
-    task.cancel()
-    await asyncio.sleep(0.1)
-    assert not task.done()  # the unpack thread still writes: wait for it
-    docker.unpack_gate.set()
+    try:
+        await _worker_reached(docker.unpacking, task)
+        task.cancel()
+        await asyncio.sleep(0.1)
+        assert not task.done()  # the unpack thread still writes: wait for it
+    finally:
+        docker.unpack_gate.set()  # released whatever failed, so the worker ends
     with pytest.raises(asyncio.CancelledError):
         await task
     # it stopped at its next volume; nothing ran after it
