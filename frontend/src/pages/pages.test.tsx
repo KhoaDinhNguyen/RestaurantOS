@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -68,6 +68,75 @@ describe("the four views render against the mock server", () => {
     ).toBeVisible();
     expect(screen.getByLabelText("region")).toHaveValue("r2");
   });
+
+  it("the same search again asks again", async () => {
+    const calls: string[] = [];
+    const server = createMockServer();
+    setTransport(async (method, url, body) => {
+      calls.push(url);
+      return server(method, url, body);
+    });
+    const user = userEvent.setup();
+    open("/customer");
+    const search = await screen.findByRole("button", { name: "Search w21z7" });
+    await user.click(search);
+    await screen.findByText("00a1f3c2");
+    await user.click(search);
+    await vi.waitFor(() =>
+      expect(
+        calls.filter((u) => u.startsWith("/api/v1/vendors?")),
+      ).toHaveLength(2),
+    );
+  });
+
+  it("Back on the Region view goes back to the previous restaurant", async () => {
+    const router = createMemoryRouter(routes, {
+      initialEntries: ["/region?region=r1&vendor=00a1f3c2"],
+    });
+    render(<RouterProvider router={router} />);
+    const user = userEvent.setup();
+    expect(
+      await screen.findByRole("heading", { name: "Kitchen board: 00a1f3c2" }),
+    ).toBeVisible();
+
+    const vendor = screen.getByLabelText("restaurant (vendor id)");
+    await user.clear(vendor);
+    await user.type(vendor, "3b7e91d0");
+    await user.click(screen.getByRole("button", { name: "Open" }));
+    expect(
+      await screen.findByRole("heading", { name: "Kitchen board: 3b7e91d0" }),
+    ).toBeVisible();
+
+    await act(() => router.navigate(-1));
+    expect(
+      await screen.findByRole("heading", { name: "Kitchen board: 00a1f3c2" }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("restaurant (vendor id)")).toHaveValue(
+      "00a1f3c2",
+    );
+  });
+
+  it("the kitchen board asks for nothing when no status is ticked", async () => {
+    const calls: string[] = [];
+    const server = createMockServer();
+    setTransport(async (method, url, body) => {
+      calls.push(url);
+      return server(method, url, body);
+    });
+    const user = userEvent.setup();
+    open("/region?region=r1&vendor=00a1f3c2");
+    await screen.findByRole("heading", { name: "Kitchen board: 00a1f3c2" });
+    for (const status of ["received", "accepted", "preparing", "ready"])
+      await user.click(screen.getByRole("checkbox", { name: status }));
+    expect(
+      await screen.findByText("Tick at least one status to see orders."),
+    ).toBeInTheDocument();
+    const board = (u: string) => u.includes("/vendors/00a1f3c2/orders?");
+    const before = calls.filter(board).length;
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    expect(calls.filter(board)).toHaveLength(before);
+    expect(calls.filter(board).every((u) => u.includes("status="))).toBe(true);
+  }, 10000);
 
   it("a hidden view stops polling", async () => {
     const calls: string[] = [];

@@ -250,7 +250,8 @@ export interface RegionDirectoryRow {
   region_id: string;
   epoch: number;
   primary_node: string;
-  standby_node: string;
+  /** Null while the region runs without a standby. */
+  standby_node: string | null;
   menu_version: number;
   updated_at: string;
   geohashes: string[];

@@ -151,6 +151,7 @@ export function FaultsPanel() {
       </form>
       <ApiStatus result={inject.result} />
       <ApiStatus result={remove.result} />
+      <ApiStatus result={heal.result} />
       {!!inject.result?.data?.already_disabled?.length && (
         <p className="text-sm text-amber-800">
           Already disabled before this cut, and left alone:{" "}

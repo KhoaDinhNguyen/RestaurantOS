@@ -67,24 +67,47 @@ describe("OrderForm", () => {
     expect(
       await screen.findByText(/503: region r2 cannot be reached/),
     ).toBeInTheDocument();
-    // ... but an order is still accepted for later delivery.
-    setTransport(async (method, _url, body) => {
-      if (method === "POST") orders.push(body as OrderRequest);
-      return method === "POST"
-        ? {
-            status: 202,
-            body: { queued: true, region_id: "r2", order_id: null },
-          }
-        : {
-            status: 503,
-            body: { error: "region_unreachable", region_id: "r2" },
-          };
-    });
-    await user.click(screen.getByRole("button", { name: "Place order" }));
+    // ... and with no item there is nothing to send.
+    const place = screen.getByRole("button", { name: "Place order" });
+    expect(place).toBeDisabled();
+
+    // An item typed by product id is still accepted for later delivery.
+    await user.type(screen.getByLabelText("product id"), "e5f6a7b8c9d0");
+    await user.type(screen.getByLabelText("quantity"), "1");
+    await user.click(place);
     expect(await screen.findByText(/202: region r2/)).toBeInTheDocument();
+    expect(orders[0].items).toEqual([
+      { product_id: "e5f6a7b8c9d0", quantity: 1 },
+    ]);
 
     await user.click(screen.getByRole("button", { name: /Ask again/ }));
+    await screen.findByText(/202: region r2/);
     expect(orders).toHaveLength(2);
-    expect(orders[1].external_order_id).toBe(orders[0].external_order_id);
+    expect(orders[1]).toEqual(orders[0]);
+  });
+
+  it("keeps New order disabled while the order is on its way", async () => {
+    let answer: (() => void) | undefined;
+    const server = createMockServer();
+    setTransport(async (method, url, body) => {
+      if (method === "POST")
+        await new Promise<void>((resolve) => (answer = resolve));
+      return server(method, url, body);
+    });
+    render(
+      <SimClockContext.Provider value={clock}>
+        <OrderForm vendorId="00a1f3c2" geohash="w21z7" onPlaced={vi.fn()} />
+      </SimClockContext.Provider>,
+    );
+    const user = userEvent.setup();
+    await user.type(
+      await screen.findByLabelText("quantity of Noodle soup"),
+      "1",
+    );
+    await user.click(screen.getByRole("button", { name: "Place order" }));
+    expect(screen.getByRole("button", { name: "New order" })).toBeDisabled();
+    answer?.();
+    expect(await screen.findByText(/201: stored in r1/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "New order" })).toBeEnabled();
   });
 });

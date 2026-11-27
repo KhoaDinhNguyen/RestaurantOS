@@ -1,0 +1,72 @@
+[
+  {
+    "vendor_id": "00a1f3c2",
+    "product_id": "0012ab34cd56",
+    "name": "Noodle soup",
+    "price_units": 30,
+    "menu_version": 1,
+    "dish_id": "0a1b2c3d4e5f",
+    "available": true,
+    "reason": null
+  },
+  {
+    "vendor_id": "00a1f3c2",
+    "product_id": "7a8b9c0d1e2f",
+    "name": "Noodle soup, large",
+    "price_units": 42,
+    "menu_version": 1,
+    "dish_id": "0a1b2c3d4e5f",
+    "available": false,
+    "reason": "stock"
+  },
+  {
+    "vendor_id": "3b7e91d0",
+    "product_id": "a1b2c3d4e5f6",
+    "name": "Chicken rice",
+    "price_units": 25,
+    "menu_version": 1,
+    "dish_id": "1c2d3e4f5a6b",
+    "available": true,
+    "reason": null
+  },
+  {
+    "vendor_id": "3b7e91d0",
+    "product_id": "b2c3d4e5f6a7",
+    "name": "Chicken rice set of 2",
+    "price_units": 45,
+    "menu_version": 1,
+    "dish_id": "1c2d3e4f5a6b",
+    "available": false,
+    "reason": "manual"
+  },
+  {
+    "vendor_id": "71c4d2aa",
+    "product_id": "c3d4e5f6a7b8",
+    "name": "Mango pudding",
+    "price_units": 12,
+    "menu_version": 1,
+    "dish_id": "0003e4f5a6b7",
+    "available": true,
+    "reason": null
+  },
+  {
+    "vendor_id": "71c4d2aa",
+    "product_id": "d4e5f6a7b8c9",
+    "name": "Chain chicken rice",
+    "price_units": 28,
+    "menu_version": 1,
+    "dish_id": "2d3e4f5a6b7c",
+    "available": true,
+    "reason": null
+  },
+  {
+    "vendor_id": "9e02b5f4",
+    "product_id": "e5f6a7b8c9d0",
+    "name": "Noodle soup",
+    "price_units": 31,
+    "menu_version": 1,
+    "dish_id": "0a1b2c3d4e5f",
+    "available": true,
+    "reason": null
+  }
+]

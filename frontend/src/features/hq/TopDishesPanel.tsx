@@ -31,7 +31,7 @@ export function TopDishesPanel() {
   const [auto, setAuto] = useState(false);
   const [submitted, setSubmitted] = useState<Submitted | null>(null);
 
-  const { result, loading } = usePolling(
+  const { result, loading, refresh } = usePolling(
     submitted && JSON.stringify(submitted),
     () => topDishes(submitted!.range, submitted!.rankBy, submitted!.limit),
     auto ? 2000 : 0,
@@ -44,7 +44,10 @@ export function TopDishesPanel() {
         className="mb-3 flex flex-wrap items-end gap-2"
         onSubmit={(e) => {
           e.preventDefault();
-          setSubmitted({ range: withDefaultDays(range, day), rankBy, limit });
+          const next = { range: withDefaultDays(range, day), rankBy, limit };
+          // Run with unchanged fields asks again (after a 503, or for fresh data).
+          if (JSON.stringify(next) === JSON.stringify(submitted)) refresh();
+          else setSubmitted(next);
         }}
       >
         <RangeFields value={range} onChange={setRange} simDay={day} />

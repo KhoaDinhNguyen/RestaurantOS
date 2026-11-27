@@ -21,12 +21,20 @@ export function NodesPanel() {
   const kill = useAction(killNode);
   const start = useAction(startNode);
   const [typed, setTyped] = useState("");
+  /** Which button was pressed last: its answer is the one shown. */
+  const [lastAction, setLastAction] = useState<"kill" | "start" | null>(null);
 
   const nodes = cluster.result?.data?.nodes ?? [];
-  const last = kill.result ?? start.result;
+  const last =
+    lastAction === "kill"
+      ? kill.result
+      : lastAction === "start"
+        ? start.result
+        : null;
 
   const act = async (action: "kill" | "start", nodeId: string) => {
     if (action === "kill" && !window.confirm(`Kill ${nodeId}?`)) return;
+    setLastAction(action);
     await (action === "kill" ? kill : start).run(nodeId);
     cluster.refresh();
   };

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useSearchParams } from "react-router";
 import { REGION_IDS } from "../api/endpoints";
 import { Field } from "../components/Panel";
@@ -8,6 +8,7 @@ import { MenuAvailabilityPanel } from "../features/region/MenuAvailabilityPanel"
 import { RegionSummaryPanel } from "../features/region/RegionSummaryPanel";
 import { StockPanel } from "../features/region/StockPanel";
 import { useSimClock } from "../hooks/useSimClock";
+import { useViewActive } from "../hooks/useViewActive";
 import { PageLayout } from "./layout/PageLayout";
 
 /**
@@ -18,21 +19,32 @@ import { PageLayout } from "./layout/PageLayout";
 export function RegionPage() {
   const { day } = useSimClock();
   const [params, setParams] = useSearchParams();
+  const active = useViewActive();
   // The view stays mounted while another tab is open, and the address then
-  // belongs to that tab. So the region and vendor live in state: taken from
-  // the address once (a bookmarked /region?region=r2&vendor=... works), and
-  // written back to it when you change them here.
-  const [regionId, setRegionId] = useState(
-    () => params.get("region") ?? REGION_IDS[0] ?? "r1",
-  );
-  const [vendorId, setVendorId] = useState(() => params.get("vendor"));
-  const [typedVendor, setTypedVendor] = useState(vendorId ?? "");
-
-  const show = (region: string, vendor: string | null) => {
-    setRegionId(region);
-    setVendorId(vendor);
-    setParams(vendor ? { region, vendor } : { region });
+  // belongs to that tab. So the region and vendor live in state, which
+  // follows the address while this view is on screen (a bookmarked
+  // /region?region=r2&vendor=... works, and so do Back and Forward), and
+  // keeps its values while another view is.
+  const fromUrl = {
+    regionId: params.get("region") ?? REGION_IDS[0] ?? "r1",
+    vendorId: params.get("vendor"),
   };
+  const [shown, setShown] = useState(fromUrl);
+  const [typedVendor, setTypedVendor] = useState(fromUrl.vendorId ?? "");
+  if (
+    active &&
+    (fromUrl.regionId !== shown.regionId || fromUrl.vendorId !== shown.vendorId)
+  ) {
+    if (fromUrl.vendorId !== shown.vendorId)
+      setTypedVendor(fromUrl.vendorId ?? "");
+    setShown(fromUrl);
+  }
+  const { regionId, vendorId } = shown;
+
+  // Only used while this view is on screen, so the address is enough: the
+  // state above follows it.
+  const show = (region: string, vendor: string | null) =>
+    setParams(vendor ? { region, vendor } : { region });
 
   return (
     <PageLayout
@@ -76,13 +88,15 @@ export function RegionPage() {
     >
       <RegionSummaryPanel regionId={regionId} day={day} />
       {vendorId ? (
-        <>
+        // Keyed by region and vendor: opening another restaurant starts its
+        // panels afresh, so no Retry or message of the previous one survives.
+        <Fragment key={`${regionId}|${vendorId}`}>
           <KitchenBoard regionId={regionId} vendorId={vendorId} day={day} />
           <div className="grid gap-4 lg:grid-cols-2">
             <MenuAvailabilityPanel regionId={regionId} vendorId={vendorId} />
             <StockPanel regionId={regionId} vendorId={vendorId} />
           </div>
-        </>
+        </Fragment>
       ) : (
         <p className="text-sm text-slate-500">
           Enter a vendor id to open its kitchen board, menu and stock.

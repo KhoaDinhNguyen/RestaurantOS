@@ -1,0 +1,77 @@
+{
+  "as_of": "2026-11-23T10:00:00Z",
+  "nodes": [
+    {
+      "node_id": "hq-primary",
+      "region_id": null,
+      "role": "primary",
+      "status": "up",
+      "last_heartbeat_at": "2026-11-23T10:00:00Z"
+    },
+    {
+      "node_id": "hq-standby",
+      "region_id": null,
+      "role": "standby",
+      "status": "up",
+      "last_heartbeat_at": "2026-11-23T10:00:00Z"
+    },
+    {
+      "node_id": "r1-primary",
+      "region_id": "r1",
+      "role": "primary",
+      "status": "up",
+      "last_heartbeat_at": "2026-11-23T10:00:00Z"
+    },
+    {
+      "node_id": "r1-standby",
+      "region_id": "r1",
+      "role": "standby",
+      "status": "up",
+      "last_heartbeat_at": "2026-11-23T10:00:00Z"
+    },
+    {
+      "node_id": "r2-primary",
+      "region_id": "r2",
+      "role": "primary",
+      "status": "suspect",
+      "last_heartbeat_at": "2026-11-23T09:59:52Z"
+    },
+    {
+      "node_id": "r2-standby",
+      "region_id": "r2",
+      "role": "standby",
+      "status": "up",
+      "last_heartbeat_at": "2026-11-23T10:00:00Z"
+    }
+  ],
+  "regions": [
+    {
+      "region_id": "r1",
+      "epoch": 1,
+      "menu_version": 1,
+      "primary_node": "r1-primary",
+      "standby_node": "r1-standby",
+      "replication": "async",
+      "orders_per_s": 41.5,
+      "standby_lag_s": 0.2,
+      "hq_lag_s": 1.1,
+      "outbox_backlog": 12,
+      "holding_queue": 0,
+      "figures_as_of": "2026-11-23T10:00:00Z"
+    },
+    {
+      "region_id": "r2",
+      "epoch": 1,
+      "menu_version": 1,
+      "primary_node": "r2-primary",
+      "standby_node": "r2-standby",
+      "replication": "async",
+      "orders_per_s": 0,
+      "standby_lag_s": null,
+      "hq_lag_s": 9.4,
+      "outbox_backlog": 140,
+      "holding_queue": 3,
+      "figures_as_of": "2026-11-23T09:59:50Z"
+    }
+  ]
+}

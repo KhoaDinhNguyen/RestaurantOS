@@ -1,0 +1,29 @@
+[
+  {
+    "item_kind": "ingredient",
+    "item_id": "mock-broth",
+    "name": "mock-broth",
+    "unit": "ladle",
+    "on_hand": 12,
+    "par_level": 35,
+    "updated_at": "2026-11-23T10:00:00Z"
+  },
+  {
+    "item_kind": "ingredient",
+    "item_id": "mock-noodles",
+    "name": "mock-noodles",
+    "unit": "g",
+    "on_hand": 2,
+    "par_level": 40,
+    "updated_at": "2026-11-23T10:00:00Z"
+  },
+  {
+    "item_kind": "dish",
+    "item_id": "0003e4f5a6b7",
+    "name": "Mock Mango Pudding",
+    "unit": null,
+    "on_hand": 6,
+    "par_level": 10,
+    "updated_at": "2026-11-23T10:00:00Z"
+  }
+]

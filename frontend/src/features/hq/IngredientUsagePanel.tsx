@@ -26,7 +26,7 @@ export function IngredientUsagePanel() {
     strategy: Strategy;
   } | null>(null);
 
-  const { result, loading } = usePolling(
+  const { result, loading, refresh } = usePolling(
     submitted && JSON.stringify(submitted),
     () => ingredientUsage(submitted!.range, submitted!.strategy),
     0,
@@ -39,7 +39,10 @@ export function IngredientUsagePanel() {
         className="mb-3 flex flex-wrap items-end gap-2"
         onSubmit={(e) => {
           e.preventDefault();
-          setSubmitted({ range: withDefaultDays(range, day), strategy });
+          const next = { range: withDefaultDays(range, day), strategy };
+          // Run with unchanged fields asks again (after a 503, or for fresh data).
+          if (JSON.stringify(next) === JSON.stringify(submitted)) refresh();
+          else setSubmitted(next);
         }}
       >
         <RangeFields value={range} onChange={setRange} simDay={day} />

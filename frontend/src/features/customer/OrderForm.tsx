@@ -3,7 +3,7 @@ import { gatewayApi, getMenu, placeOrder } from "../../api/endpoints";
 import type { ApiResult } from "../../api/client";
 import type { OrderRequest, OrderResponse } from "../../api/types";
 import { ApiStatus } from "../../components/ApiStatus";
-import { Panel } from "../../components/Panel";
+import { Field, Panel } from "../../components/Panel";
 import {
   buttonClass,
   inputClass,
@@ -14,7 +14,7 @@ import {
 } from "../../components/styles";
 import { usePolling } from "../../hooks/usePolling";
 import { useSimClock } from "../../hooks/useSimClock";
-import { newId } from "../../lib/ids";
+import { newId } from "../../api/ids";
 
 /** The fixed `channel` for orders placed from this UI (playback uses `dhrd`). */
 const CHANNEL = "web";
@@ -46,6 +46,9 @@ export function OrderForm({
     5000,
   );
   const [quantities, setQuantities] = useState<Record<string, string>>({});
+  // An item typed by product id, for when the menu cannot be loaded (the
+  // gateway cannot reach the region): the order is then parked, not lost.
+  const [typed, setTyped] = useState({ productId: "", quantity: "" });
   const [sent, setSent] = useState<OrderRequest | null>(null);
   const [answer, setAnswer] = useState<ApiResult<OrderResponse> | null>(null);
   const [pending, setPending] = useState(false);
@@ -61,11 +64,23 @@ export function OrderForm({
       onPlaced({ vendorId, orderId: body.order_id, day: body.order_day });
   };
 
+  // The lines of the order: every filled-in quantity, plus the typed item.
+  // An order needs at least one (POST /orders refuses an empty one).
+  const wanted = (q: string) => /^\d+$/.test(q) && Number(q) > 0;
+  /** The typed item's row is shown, and counts, only while there is no menu. */
+  const menuMissing = menu.result !== null && menu.result.data === null;
+  const typedId = menuMissing ? typed.productId.trim() : "";
+  const items = [
+    ...Object.entries(quantities)
+      .filter(([, q]) => wanted(q))
+      .map(([product_id, q]) => ({ product_id, quantity: Number(q) })),
+    ...(typedId && wanted(typed.quantity)
+      ? [{ product_id: typedId, quantity: Number(typed.quantity) }]
+      : []),
+  ];
+
   const place = () => {
-    if (day === null) return;
-    const items = Object.entries(quantities)
-      .filter(([, q]) => /^\d+$/.test(q) && q !== "0")
-      .map(([product_id, q]) => ({ product_id, quantity: Number(q) }));
+    if (day === null || items.length === 0) return;
     void send({
       channel: CHANNEL,
       external_order_id: newId(),
@@ -82,6 +97,7 @@ export function OrderForm({
     setSent(null);
     setAnswer(null);
     setQuantities({});
+    setTyped({ productId: "", quantity: "" });
   };
 
   // A draft is open until it gets a final answer; a 202, a 5xx or no answer
@@ -134,12 +150,39 @@ export function OrderForm({
           </tbody>
         </table>
       )}
+      {menuMissing && (
+        <div className="mt-2 flex flex-wrap items-end gap-2">
+          <p className="w-full text-xs text-slate-600">
+            The menu cannot be loaded. You can still order by product id: if the
+            region cannot be reached, the order is parked and delivered later.
+          </p>
+          <Field label="product id">
+            <input
+              className={`${inputClass} w-36 font-mono`}
+              disabled={sent !== null}
+              value={typed.productId}
+              onChange={(e) =>
+                setTyped({ ...typed, productId: e.target.value })
+              }
+            />
+          </Field>
+          <Field label="quantity">
+            <input
+              className={`${inputClass} w-16`}
+              inputMode="numeric"
+              disabled={sent !== null}
+              value={typed.quantity}
+              onChange={(e) => setTyped({ ...typed, quantity: e.target.value })}
+            />
+          </Field>
+        </div>
+      )}
 
       <div className="mt-3 flex flex-wrap items-center gap-2">
         {sent === null ? (
           <button
             className={buttonClass}
-            disabled={pending || day === null}
+            disabled={pending || day === null || items.length === 0}
             onClick={place}
           >
             Place order
@@ -155,7 +198,12 @@ export function OrderForm({
                 {answer?.status === 202 ? "Ask again" : "Retry"} (same order id)
               </button>
             )}
-            <button className={subtleButtonClass} onClick={newOrder}>
+            {/* Not while a request is out: its answer belongs to this draft. */}
+            <button
+              className={subtleButtonClass}
+              disabled={pending}
+              onClick={newOrder}
+            >
               New order
             </button>
           </>

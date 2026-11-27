@@ -1,0 +1,30 @@
+[
+  {
+    "vendor_id": "00a1f3c2",
+    "region_id": "r1",
+    "chain_id": null,
+    "geohash": "w21z7",
+    "primary_cuisine": "noodles"
+  },
+  {
+    "vendor_id": "3b7e91d0",
+    "region_id": "r1",
+    "chain_id": null,
+    "geohash": "w21z7",
+    "primary_cuisine": "rice"
+  },
+  {
+    "vendor_id": "71c4d2aa",
+    "region_id": "r1",
+    "chain_id": "c0042",
+    "geohash": "w21z6",
+    "primary_cuisine": "dessert"
+  },
+  {
+    "vendor_id": "9e02b5f4",
+    "region_id": "r2",
+    "chain_id": null,
+    "geohash": "w21zk",
+    "primary_cuisine": "noodles"
+  }
+]

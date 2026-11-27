@@ -42,7 +42,9 @@ export function DishNearbySearch({ geohash }: { geohash: string }) {
         onSubmit={(e) => {
           e.preventDefault();
           setPicked([]);
-          setSubmitted(q);
+          // The same search again asks again (after an error, or for fresh data).
+          if (submitted === q) dishes.refresh();
+          else setSubmitted(q);
         }}
       >
         <Field label="dish name">

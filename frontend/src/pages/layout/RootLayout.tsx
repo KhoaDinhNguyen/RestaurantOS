@@ -25,7 +25,9 @@ const VIEWS = [
  */
 export function RootLayout() {
   const location = useLocation();
-  const path = location.pathname.replace(/\/+$/, "") || "/";
+  // The router matches paths case-insensitively (/HQ opens hq), so match the
+  // same way here.
+  const path = location.pathname.replace(/\/+$/, "").toLowerCase() || "/";
   const current = VIEWS.find((v) => v.to === path);
   // The address each view was last left at (e.g. /region?region=r2), so its
   // tab brings it back.

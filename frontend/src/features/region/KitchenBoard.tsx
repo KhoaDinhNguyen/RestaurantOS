@@ -16,7 +16,7 @@ import {
   thClass,
 } from "../../components/styles";
 import { usePolling } from "../../hooks/usePolling";
-import { newId } from "../../lib/ids";
+import { newId } from "../../api/ids";
 
 const OPEN: OrderStatus[] = ["received", "accepted", "preparing", "ready"];
 
@@ -45,9 +45,14 @@ export function KitchenBoard({
   const api = edgeApi(regionId);
   const [statuses, setStatuses] = useState<OrderStatus[]>(OPEN);
   const [attempt, setAttempt] = useState<Attempt | null>(null);
+  // One status change at a time: the buttons wait for the answer, so an
+  // older answer can never replace a newer one (or hide its Retry).
+  const [sending, setSending] = useState(false);
 
+  // No status ticked means nothing to show. The request is not sent: without
+  // a status filter the server would answer every order of the day.
   const { result, loading, refresh } = usePolling(
-    day === null
+    day === null || statuses.length === 0
       ? null
       : `board|${regionId}|${vendorId}|${day}|${statuses.join(",")}`,
     () => listOrders(api, vendorId, day, statuses),
@@ -55,15 +60,20 @@ export function KitchenBoard({
   );
 
   const send = async (next: Omit<Attempt, "result">) => {
+    setSending(true);
     setAttempt({ ...next, result: null });
-    const answer = await changeStatus(
-      api,
-      vendorId,
-      next.orderId,
-      next.eventId,
-      next.toStatus,
-    );
-    setAttempt({ ...next, result: answer });
+    try {
+      const answer = await changeStatus(
+        api,
+        vendorId,
+        next.orderId,
+        next.eventId,
+        next.toStatus,
+      );
+      setAttempt({ ...next, result: answer });
+    } finally {
+      setSending(false);
+    }
     refresh();
   };
 
@@ -103,6 +113,7 @@ export function KitchenBoard({
           {failed && (
             <button
               className={`${subtleButtonClass} mt-1`}
+              disabled={sending}
               onClick={() => void send(attempt)}
             >
               Retry {attempt.toStatus} (same event id)
@@ -111,6 +122,11 @@ export function KitchenBoard({
         </div>
       )}
 
+      {statuses.length === 0 && (
+        <p className="text-sm text-slate-400">
+          Tick at least one status to see orders.
+        </p>
+      )}
       <ApiStatus result={result} loading={loading} />
       {result?.data && (
         <table className={tableClass}>
@@ -147,6 +163,7 @@ export function KitchenBoard({
                       <button
                         key={s}
                         className={subtleButtonClass}
+                        disabled={sending}
                         onClick={() =>
                           void send({
                             orderId: o.order_id,

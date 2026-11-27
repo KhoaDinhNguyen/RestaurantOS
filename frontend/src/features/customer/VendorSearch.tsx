@@ -24,7 +24,7 @@ export function VendorSearch({
     geohash: string;
     q: string;
   } | null>(null);
-  const { result, loading } = usePolling(
+  const { result, loading, refresh } = usePolling(
     submitted && `vendors|${submitted.geohash}|${submitted.q}`,
     () => searchVendors(submitted!.geohash, submitted!.q),
     0,
@@ -36,7 +36,9 @@ export function VendorSearch({
         className="mb-3 flex flex-wrap items-end gap-2"
         onSubmit={(e) => {
           e.preventDefault();
-          setSubmitted({ geohash, q });
+          // The same search again asks again (after an error, or for fresh data).
+          if (submitted?.geohash === geohash && submitted.q === q) refresh();
+          else setSubmitted({ geohash, q });
         }}
       >
         <Field label="cuisine or product (optional)">

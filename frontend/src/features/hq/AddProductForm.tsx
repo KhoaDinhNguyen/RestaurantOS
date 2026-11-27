@@ -12,7 +12,9 @@ const empty = {
   name: "",
   price_units: "",
   dish_id: "",
-  multiplier: "1",
+  // No default: a product's dish link is fixed at creation, so an edit must
+  // not send a multiplier nobody typed (it would answer 409 dish_link_fixed).
+  multiplier: "",
   note: "",
 };
 
@@ -40,6 +42,8 @@ export function AddProductForm() {
   };
 
   const answer = publish.result;
+  /** No product id: a new product, which needs its dish link. */
+  const isNew = form.product_id.trim() === "";
   return (
     <Panel title="Add or change a product">
       <form
@@ -86,6 +90,7 @@ export function AddProductForm() {
             className={inputClass}
             value={form.dish_id}
             onChange={set("dish_id")}
+            required={isNew}
           />
         </Field>
         <Field label="multiplier">
@@ -94,6 +99,7 @@ export function AddProductForm() {
             inputMode="numeric"
             value={form.multiplier}
             onChange={set("multiplier")}
+            required={isNew}
           />
         </Field>
         <Field label="note">
@@ -112,7 +118,9 @@ export function AddProductForm() {
         </button>
       </form>
       <p className="mt-2 text-xs text-slate-500">
-        Find a dish id with the dish search on the Customer view.
+        A new product needs a dish id and a multiplier; find a dish id with the
+        dish search on the Customer view. On a change, leave both empty: a
+        product&apos;s dish link cannot change.
       </p>
       {answer?.data && (
         <div className="mt-3 text-sm text-emerald-700">

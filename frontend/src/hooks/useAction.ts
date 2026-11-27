@@ -1,10 +1,11 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import type { ApiResult } from "../api/client";
 
 export interface Action<A extends unknown[], T> {
   run: (...args: A) => Promise<ApiResult<T>>;
+  /** True while any call is still waiting for its answer. */
   pending: boolean;
-  /** The answer to the last call. */
+  /** The answer to the most recent call (an older call finishing later never replaces it). */
   result: ApiResult<T> | null;
   reset: () => void;
 }
@@ -13,19 +14,28 @@ export interface Action<A extends unknown[], T> {
 export function useAction<A extends unknown[], T>(
   call: (...args: A) => Promise<ApiResult<T>>,
 ): Action<A, T> {
-  const [pending, setPending] = useState(false);
+  const [inFlight, setInFlight] = useState(0);
   const [result, setResult] = useState<ApiResult<T> | null>(null);
+  /** Numbers each call, so only the latest one may set `result`. */
+  const latest = useRef(0);
 
   const run = useCallback(
     async (...args: A) => {
-      setPending(true);
-      const answer = await call(...args);
-      setResult(answer);
-      setPending(false);
-      return answer;
+      const id = ++latest.current;
+      setInFlight((n) => n + 1);
+      try {
+        const answer = await call(...args);
+        if (id === latest.current) setResult(answer);
+        return answer;
+      } finally {
+        setInFlight((n) => n - 1);
+      }
     },
     [call],
   );
-  const reset = useCallback(() => setResult(null), []);
-  return { run, pending, result, reset };
+  const reset = useCallback(() => {
+    latest.current += 1;
+    setResult(null);
+  }, []);
+  return { run, pending: inFlight > 0, result, reset };
 }

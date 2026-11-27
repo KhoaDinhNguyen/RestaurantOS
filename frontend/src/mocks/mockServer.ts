@@ -31,12 +31,12 @@ import type {
   SnapshotInfo,
   StockRow,
 } from "../api/types";
-import clusterJson from "./data/cluster.json";
-import dishesJson from "./data/dishes.json";
-import linksJson from "./data/links.json";
-import menusJson from "./data/menus.json";
-import stockJson from "./data/stock.json";
-import vendorsJson from "./data/vendors.json";
+import clusterJson from "./fixtures/cluster.json";
+import dishesJson from "./fixtures/dishes.json";
+import linksJson from "./fixtures/links.json";
+import menusJson from "./fixtures/menus.json";
+import stockJson from "./fixtures/stock.json";
+import vendorsJson from "./fixtures/vendors.json";
 
 const CUT_OFF_REGION = "r2";
 const STAMP = "2026-11-23T10:00:00Z";
@@ -124,11 +124,20 @@ const notFound = () => reply(404, { error: "not_found" });
 const unreachable = (regionId: string) =>
   reply(503, { error: "region_unreachable", region_id: regionId });
 
-function addSeconds(time: string, seconds: number): string {
+/** Moves a simulated instant on by `seconds`, carrying into the next day. */
+function addSeconds(
+  day: number,
+  time: string,
+  seconds: number,
+): { day: number; time: string } {
   const [h, m, s] = time.split(":").map(Number);
-  const total = (h * 3600 + m * 60 + s + seconds) % 86400;
+  const elapsed = h * 3600 + m * 60 + s + seconds;
+  const total = elapsed % 86400;
   const pad = (n: number) => String(Math.floor(n)).padStart(2, "0");
-  return `${pad(total / 3600)}:${pad((total % 3600) / 60)}:${pad(total % 60)}`;
+  return {
+    day: day + Math.floor(elapsed / 86400),
+    time: `${pad(total / 3600)}:${pad((total % 3600) / 60)}:${pad(total % 60)}`,
+  };
 }
 
 function meta(mode: string, rows: number): QueryMeta {
@@ -264,6 +273,14 @@ export function createMockServer(): Transport {
   }
 
   function placeOrder(body: OrderRequest): RawResponse {
+    // The gateway's request check (OrderRequest.items has min_length=1)
+    // runs before anything else, so an empty order is never parked.
+    if (!Array.isArray(body.items) || body.items.length === 0)
+      return reply(422, {
+        detail: [
+          { loc: ["body", "items"], msg: "List should have at least 1 item" },
+        ],
+      });
     const first = answers.get(body.external_order_id);
     if (first) return reply(200, { ...first, duplicate: true });
     const region = vendorRegion(body.vendor_id);
@@ -673,12 +690,19 @@ export function createMockServer(): Transport {
 
   function simRoute(method: string, path: string, body: unknown): RawResponse {
     if (method === "GET" && path === "/sim/clock") {
-      if (clock.state === "running" && clock.sim_time) {
+      if (
+        clock.state === "running" &&
+        clock.sim_day !== null &&
+        clock.sim_time
+      ) {
         // Each read moves the mock clock on by one simulated minute per 1,000x.
-        clock.sim_time = addSeconds(
+        const next = addSeconds(
+          clock.sim_day,
           clock.sim_time,
           60 * ((clock.speed ?? 1000) / 1000),
         );
+        clock.sim_day = next.day;
+        clock.sim_time = next.time;
       }
       return reply(200, clock);
     }
