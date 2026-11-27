@@ -12,8 +12,11 @@ import type {
   ClusterEvent,
   ClusterStatus,
   Dish,
+  CheckResult,
   ExceptionEntry,
   Fault,
+  Job,
+  JobKind,
   LinkGroup,
   MenuRow,
   Order,
@@ -22,7 +25,10 @@ import type {
   OrderStatus,
   PlaybackState,
   QueryMeta,
+  ScenarioInfo,
+  ScenarioResult,
   SimClock,
+  SnapshotInfo,
   StockRow,
 } from "../api/types";
 import clusterJson from "./data/cluster.json";
@@ -34,6 +40,71 @@ import vendorsJson from "./data/vendors.json";
 
 const CUT_OFF_REGION = "r2";
 const STAMP = "2026-11-23T10:00:00Z";
+
+/** The scripted scenarios, as `GET /sim/scenarios` lists them. */
+const COMMON_PARAMS = {
+  region_id: "r1",
+  from_day: null,
+  speed: null,
+  seed: 0,
+  inject_at: "11:00:00",
+  settle_s: 30,
+};
+const SCENARIOS: ScenarioInfo[] = [
+  ["T1", "isolate the region's primary; the standby takes over", 30, {}],
+  [
+    "T1b",
+    "kill the region's primary container; the standby takes over",
+    30,
+    {},
+  ],
+  ["T2", "cut the region off from HQ; HQ parks its orders", 60, {}],
+  [
+    "T3",
+    "T2, then kill the region's relay and the HQ worker during the drain",
+    60,
+    { kill_after_s: 1, down_s: 5 },
+  ],
+  [
+    "T4",
+    "no fault: resend a share of the orders and shuffle delivery",
+    60,
+    { duplicate_rate: 0.08, shuffle: true },
+  ],
+  [
+    "T5",
+    "slow the link to the region's primary",
+    30,
+    { latency_ms: 100, jitter_ms: 0 },
+  ],
+  [
+    "T6",
+    "reset the region's links to HQ while a menu version is published",
+    20,
+    { reset_timeout_ms: 200 },
+  ],
+].map(([name, summary, faultS, extras]) => ({
+  name: name as string,
+  summary: summary as string,
+  params: {
+    ...COMMON_PARAMS,
+    fault_s: faultS as number,
+    ...(extras as object),
+  },
+}));
+
+const MOCK_CHECK: CheckResult = {
+  passed: true,
+  acked: 1840,
+  stored: 1840,
+  hq: 1840,
+  lost_at_failover: { count: 0, order_ids: [] },
+  duplicates: [],
+  unaccounted: [],
+  stored_unacked: { count: 2, order_ids: [], allowed: true },
+  runs: ["mock-run"],
+  days: [20, 20],
+};
 
 const NEXT: Record<OrderStatus, OrderStatus[]> = {
   received: ["accepted", "canceled"],
@@ -134,9 +205,41 @@ export function createMockServer(): Transport {
     orders_acked: 0,
     orders_parked: 0,
     orders_refused: 0,
+    orders_failed: 0,
+    orders_resent: 0,
+    inflight: 0,
+    dispatched_sim_day: null,
+    dispatched_sim_time: null,
+    held_sim_day: null,
+    held_sim_time: null,
+    next_due_sim_day: null,
+    next_due_sim_time: null,
+    engine: {
+      sequential: false,
+      region: null,
+      inflight: 128,
+      events: { enabled: true, sample_rate: 1.0, jitter_s: 60.0 },
+      warm_up_days: 14,
+      restock_every: 7,
+    },
   };
+  const snapshots: SnapshotInfo[] = [
+    {
+      name: "before-t2",
+      created_at: STAMP,
+      sim_day: 20,
+      sim_time: "00:30:00",
+      regions: ["r1", "r2"],
+    },
+  ];
+  /** Control-plane jobs: each poll moves a running job one step on. */
+  const jobs = new Map<
+    string,
+    { job: Job; steps: string[]; polls: number; finish: () => unknown }
+  >();
   let nextFault = 2;
   let nextOrder = 1;
+  let nextJob = 1;
 
   const vendorRegion = (id: string) =>
     vendors.find((v) => v.vendor_id === id)?.region_id;
@@ -535,8 +638,10 @@ export function createMockServer(): Transport {
     if (method === "POST" && m) {
       const region = cluster.regions.find((r) => r.region_id === m[1]);
       if (!region) return notFound();
+      const standby = region.standby_node;
+      if (standby === null) return reply(409, { error: "standby_unavailable" });
       [region.primary_node, region.standby_node] = [
-        region.standby_node,
+        standby,
         region.primary_node,
       ];
       region.epoch += 1;
@@ -610,6 +715,8 @@ export function createMockServer(): Transport {
           from_day: cmd.from_day,
           to_day: cmd.to_day ?? 90,
           speed: cmd.speed ?? 1000,
+          dispatched_sim_day: cmd.from_day,
+          dispatched_sim_time: "00:00:00",
         });
         Object.assign(clock, {
           sim_day: cmd.from_day,
@@ -656,9 +763,11 @@ export function createMockServer(): Transport {
     }
     if (method === "POST" && path === "/sim/faults/heal-all") {
       let healed = 0;
+      // Toxiproxy's own reset: it also clears what no known fault explains.
       links.forEach((l) => {
         healed += l.faults.length;
         l.faults = [];
+        l.unexplained = { disabled: [], toxics: [], missing: [] };
       });
       return reply(200, { healed });
     }
@@ -668,8 +777,12 @@ export function createMockServer(): Transport {
         l.faults.some((f) => f.fault_id === del[1]),
       );
       if (!group) return notFound();
+      const healed = group.faults.find((f) => f.fault_id === del[1])!;
       group.faults = group.faults.filter((f) => f.fault_id !== del[1]);
-      return reply(200, {});
+      return reply(
+        200,
+        healed.fault === "cut" ? { ...healed, left_disabled: [] } : healed,
+      );
     }
     const node = path.match(/^\/sim\/nodes\/([^/]+)\/(kill|start)$/);
     if (method === "POST" && node) {
@@ -677,6 +790,166 @@ export function createMockServer(): Transport {
       const target = cluster.nodes.find((n) => n.node_id === node[1])!;
       target.status = node[2] === "start" ? "up" : "down";
       return reply(200, { node_id: node[1], running: node[2] === "start" });
+    }
+    return jobRoute(method, path, body);
+  }
+
+  function submitJob(
+    kind: JobKind,
+    name: string | null,
+    steps: string[],
+    finish: () => unknown,
+  ): RawResponse {
+    const running = [...jobs.values()].find((j) => j.job.state === "running");
+    if (running)
+      return reply(409, {
+        error: "busy",
+        message: `job ${running.job.job_id} is still running; one job at a time`,
+        job_id: running.job.job_id,
+      });
+    const job: Job = {
+      job_id: `j${nextJob++}`,
+      kind,
+      name,
+      state: "running",
+      started_at: STAMP,
+      finished_at: null,
+      result: null,
+      error: null,
+      progress: steps[0] ?? null,
+    };
+    jobs.set(job.job_id, { job, steps, polls: 0, finish });
+    return reply(202, job);
+  }
+
+  function jobRoute(method: string, path: string, body: unknown): RawResponse {
+    const jobPath = path.match(/^\/sim\/jobs\/([^/]+)$/);
+    if (method === "GET" && jobPath) {
+      const entry = jobs.get(decodeURIComponent(jobPath[1]));
+      if (!entry)
+        return reply(404, {
+          error: "unknown_job",
+          message: `no job '${jobPath[1]}'`,
+        });
+      if (entry.job.state === "running") {
+        entry.polls += 1;
+        if (entry.polls < entry.steps.length) {
+          entry.job.progress = entry.steps[entry.polls];
+        } else {
+          entry.job.state = "done";
+          entry.job.finished_at = STAMP;
+          entry.job.result = entry.finish();
+        }
+      }
+      return reply(200, entry.job);
+    }
+
+    if (method === "GET" && path === "/sim/scenarios")
+      return reply(200, SCENARIOS);
+    const scenario = path.match(/^\/sim\/scenarios\/([^/]+)$/);
+    if (method === "POST" && scenario) {
+      const spec = SCENARIOS.find((s) => s.name === scenario[1]);
+      if (!spec)
+        return reply(404, {
+          error: "unknown_scenario",
+          message: `no scenario '${scenario[1]}'`,
+        });
+      const params = (body ?? {}) as Record<string, unknown>;
+      const unknown = Object.keys(params).filter((k) => !(k in spec.params));
+      if (unknown.length)
+        return reply(422, {
+          error: "invalid_params",
+          message: `${spec.name} does not take ${unknown.join(", ")}`,
+        });
+      const region = String(params.region_id ?? spec.params.region_id);
+      return submitJob(
+        "scenario",
+        spec.name,
+        [
+          "starting the playback run",
+          `${region} broken: 25 s left`,
+          "running the checker",
+        ],
+        (): ScenarioResult => ({
+          scenario: spec.name,
+          summary: spec.summary,
+          passed: true,
+          error: null,
+          region_id: region,
+          params: { ...spec.params, ...(params as ScenarioInfo["params"]) },
+          run_id: `mock-${spec.name.toLowerCase()}`,
+          measurements: { failover_s: 4.2, writes_resumed_s: 5.1 },
+          conditions: [
+            { name: "the standby was promoted", passed: true, detail: null },
+            { name: "checker passed", passed: true, detail: null },
+          ],
+          check: { ...MOCK_CHECK, runs: [`mock-${spec.name.toLowerCase()}`] },
+          warnings: [],
+          next_steps: [],
+        }),
+      );
+    }
+
+    if (method === "GET" && path === "/sim/snapshots")
+      return reply(200, { snapshots });
+    if (method === "POST" && path === "/sim/snapshots") {
+      const name = String((body as { name?: unknown } | null)?.name ?? "");
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(name))
+        return reply(422, {
+          error: "invalid_name",
+          message: "a snapshot name is one path component",
+        });
+      if (snapshots.some((s) => s.name === name))
+        return reply(409, {
+          error: "snapshot_exists",
+          message: `snapshot '${name}' already exists`,
+        });
+      return submitJob(
+        "snapshot",
+        name,
+        ["pausing playback", "stopping the databases", "archiving volumes"],
+        () => {
+          snapshots.push({
+            name,
+            created_at: STAMP,
+            sim_day: clock.sim_day,
+            sim_time: clock.sim_time,
+            regions: ["r1", "r2"],
+          });
+          return { name, sim_day: clock.sim_day, sim_time: clock.sim_time };
+        },
+      );
+    }
+    const restore = path.match(/^\/sim\/snapshots\/([^/]+)\/restore$/);
+    if (method === "POST" && restore) {
+      const name = decodeURIComponent(restore[1]);
+      if (!snapshots.some((s) => s.name === name))
+        return reply(404, {
+          error: "unknown_snapshot",
+          message: `no snapshot '${name}'`,
+        });
+      return submitJob(
+        "restore",
+        name,
+        ["stopping the services", "unpacking volumes", "starting the services"],
+        () => ({
+          services: "host",
+          warnings: [],
+          resume: { started: true, run_id: "mock-run-r1", warnings: [] },
+        }),
+      );
+    }
+
+    if (method === "POST" && path === "/sim/check") {
+      const runs = (body as { runs?: unknown } | null)?.runs;
+      if (!Array.isArray(runs) || runs.length === 0)
+        return reply(422, { detail: "runs needs at least one run id" });
+      return submitJob(
+        "check",
+        null,
+        ["waiting for the outbox and the holding queue to drain"],
+        () => ({ ...MOCK_CHECK, runs }),
+      );
     }
     return notFound();
   }

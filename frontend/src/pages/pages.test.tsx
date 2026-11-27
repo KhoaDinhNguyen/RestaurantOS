@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createMemoryRouter, RouterProvider } from "react-router";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fetchTransport, setTransport } from "../api/client";
 import { createMockServer } from "../mocks/mockServer";
 import { routes } from "../routes";
@@ -81,6 +81,28 @@ describe("the four views render against the mock server", () => {
     // HQ is hidden: its events and exceptions are never asked for.
     expect(calls.some((u) => u.startsWith("/admin/events"))).toBe(false);
     expect(calls.some((u) => u.startsWith("/sim/links"))).toBe(true);
+  });
+
+  it("Ops runs a scenario as a job and shows its verdict", async () => {
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    open("/ops");
+    await user.selectOptions(await screen.findByLabelText("scenario"), "T2");
+    await user.click(screen.getByRole("button", { name: "Run T2" }));
+    expect(confirm).toHaveBeenCalled();
+    // the progress line while it runs, then the verdict
+    expect(await screen.findByText("r1 broken: 25 s left")).toBeInTheDocument();
+    expect(
+      await screen.findAllByText("PASSED", {}, { timeout: 5000 }),
+    ).not.toHaveLength(0);
+    expect(screen.getByText("failover_s")).toBeInTheDocument();
+    confirm.mockRestore();
+  }, 10000);
+
+  it("Ops lists the snapshots", async () => {
+    open("/ops");
+    expect(await screen.findByText("before-t2")).toBeInTheDocument();
+    expect(screen.getByText("day 20 · 00:30:00")).toBeInTheDocument();
   });
 
   it("Ops shows the link groups and their faults", async () => {

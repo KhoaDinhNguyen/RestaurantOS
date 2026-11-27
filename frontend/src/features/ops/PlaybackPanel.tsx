@@ -12,7 +12,27 @@ import { useAction } from "../../hooks/useAction";
 import { usePolling } from "../../hooks/usePolling";
 import { useSimClock } from "../../hooks/useSimClock";
 
-const IDENTITY = ["state", "run_id", "seed", "from_day", "to_day", "speed"];
+/** Fields shown in their own places, not in the counter grid. */
+const NOT_COUNTERS = new Set([
+  "state",
+  "run_id",
+  "seed",
+  "from_day",
+  "to_day",
+  "speed",
+  "engine",
+  "dispatched_sim_day",
+  "dispatched_sim_time",
+  "held_sim_day",
+  "held_sim_time",
+  "next_due_sim_day",
+  "next_due_sim_time",
+]);
+
+const instant = (day: unknown, time: unknown) =>
+  day === null || day === undefined
+    ? "—"
+    : `day ${String(day)} · ${String(time)}`;
 
 /** `/sim/clock` and `/sim/playback`: start, pause, resume, stop, speed. */
 export function PlaybackPanel() {
@@ -26,6 +46,8 @@ export function PlaybackPanel() {
     speed: "1000",
     seed: "",
     run_id: "",
+    duplicate_rate: "",
+    shuffle: false,
   });
   const [speed, setSpeedText] = useState("1000");
 
@@ -43,13 +65,17 @@ export function PlaybackPanel() {
     if (start.speed) cmd.speed = Number(start.speed);
     if (start.seed) cmd.seed = Number(start.seed);
     if (start.run_id) cmd.run_id = start.run_id;
+    if (start.duplicate_rate) cmd.duplicate_rate = Number(start.duplicate_rate);
+    if (start.shuffle) cmd.shuffle = true;
     void send(cmd);
   };
 
   const state = playback.result?.data;
   const c = clock?.data;
-  const set = (key: keyof typeof start) => (e: { target: { value: string } }) =>
-    setStart({ ...start, [key]: e.target.value });
+  const set =
+    (key: Exclude<keyof typeof start, "shuffle">) =>
+    (e: { target: { value: string } }) =>
+      setStart({ ...start, [key]: e.target.value });
 
   return (
     <Panel title="Clock and playback">
@@ -118,6 +144,23 @@ export function PlaybackPanel() {
             onChange={set("run_id")}
           />
         </Field>
+        <Field label="duplicate rate">
+          <input
+            className={`${inputClass} w-16`}
+            placeholder="0"
+            inputMode="decimal"
+            value={start.duplicate_rate}
+            onChange={set("duplicate_rate")}
+          />
+        </Field>
+        <label className="flex items-center gap-1 pb-1 text-xs text-slate-600">
+          <input
+            type="checkbox"
+            checked={start.shuffle}
+            onChange={(e) => setStart({ ...start, shuffle: e.target.checked })}
+          />
+          shuffle
+        </label>
         <button
           className={buttonClass}
           type="submit"
@@ -176,16 +219,50 @@ export function PlaybackPanel() {
             run {state.run_id ?? "—"} · seed {state.seed ?? "—"} · days{" "}
             {state.from_day ?? "—"}–{state.to_day ?? "—"}
           </p>
+          <dl className="grid gap-2 text-xs sm:grid-cols-3">
+            <div>
+              <dt className="text-slate-500">dispatched up to</dt>
+              <dd className="font-mono">
+                {instant(state.dispatched_sim_day, state.dispatched_sim_time)}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-slate-500">earliest held order</dt>
+              <dd className="font-mono">
+                {instant(state.held_sim_day, state.held_sim_time)}
+              </dd>
+            </div>
+            <div>
+              <dt className="text-slate-500">next due</dt>
+              <dd className="font-mono">
+                {instant(state.next_due_sim_day, state.next_due_sim_time)}
+              </dd>
+            </div>
+          </dl>
           <dl className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
             {Object.entries(state)
-              .filter(([key]) => !IDENTITY.includes(key))
+              .filter(([key]) => !NOT_COUNTERS.has(key))
               .map(([key, value]) => (
                 <div key={key} className="rounded bg-slate-50 px-2 py-1">
                   <dt className="text-xs text-slate-500">{key}</dt>
-                  <dd className="font-mono">{String(value)}</dd>
+                  <dd className="font-mono">
+                    {value !== null && typeof value === "object"
+                      ? JSON.stringify(value)
+                      : String(value)}
+                  </dd>
                 </div>
               ))}
           </dl>
+          {state.engine && (
+            <details className="text-xs">
+              <summary className="cursor-pointer text-slate-500">
+                engine (fixed when the playback process started)
+              </summary>
+              <pre className="mt-1 overflow-x-auto rounded bg-slate-50 p-2">
+                {JSON.stringify(state.engine, null, 2)}
+              </pre>
+            </details>
+          )}
         </div>
       )}
     </Panel>

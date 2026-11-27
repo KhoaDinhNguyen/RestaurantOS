@@ -287,8 +287,9 @@ export interface RegionStatus {
   epoch: number;
   menu_version: number;
   primary_node: string;
-  standby_node: string;
-  replication: "sync" | "async";
+  /** Null while the region runs without a standby (after T1, until rejoin). */
+  standby_node: string | null;
+  replication: "sync" | "async" | null;
   orders_per_s: number | null;
   standby_lag_s: number | null;
   hq_lag_s: number | null;
@@ -352,7 +353,19 @@ export interface PlaybackState {
   from_day: number | null;
   to_day: number | null;
   speed: number | null;
-  [counter: string]: string | number | null;
+  /** The dispatch frontier: the simulated instant of the last item sent. */
+  dispatched_sim_day?: number | null;
+  dispatched_sim_time?: string | null;
+  /** The earliest order pulled from the stream but not sent yet. */
+  held_sim_day?: number | null;
+  held_sim_time?: string | null;
+  /** The earliest item of any kind still waiting to go out. */
+  next_due_sim_day?: number | null;
+  next_due_sim_time?: string | null;
+  /** What every run on this playback process shares (Section 6.3). */
+  engine?: Record<string, unknown>;
+  /** The counters: orders_sent, events_acked, restocks_failed, inflight, ... */
+  [field: string]: unknown;
 }
 
 export interface PlaybackCommand {
@@ -362,6 +375,9 @@ export interface PlaybackCommand {
   speed?: number;
   seed?: number;
   run_id?: string;
+  /** Share of orders sent twice, in [0, 1]. */
+  duplicate_rate?: number;
+  shuffle?: boolean;
 }
 
 export type FaultKind = "cut" | "silence" | "latency" | "reset";
@@ -373,15 +389,120 @@ export interface Fault {
   params: Record<string, number>;
   proxies: string[];
   created_at: string;
+  /** On a cut's create answer: proxies that were disabled before it came. */
+  already_disabled?: string[];
+  /** On a cut's heal answer: proxies it left disabled (not its to enable). */
+  left_disabled?: string[];
+}
+
+export interface StrayToxic {
+  proxy: string;
+  name: string | null;
+  type: string | null;
+  stream: string | null;
 }
 
 export interface LinkGroup {
   group: string;
   proxies: string[];
   faults: Fault[];
+  /** Proxies a live cut holds that were already disabled when it came. */
+  preexisting_disabled?: string[];
+  /** What Toxiproxy holds that no known fault explains. */
+  unexplained?: {
+    disabled: string[];
+    toxics: StrayToxic[];
+    missing: string[];
+  };
 }
 
 export interface NodeRunState {
   node_id: string;
   running: boolean;
+}
+
+// --- jobs: scenarios, snapshots, restore, checker (Section 6.3) ------------
+
+export type JobKind = "scenario" | "snapshot" | "restore" | "check";
+
+export interface Job {
+  job_id: string;
+  kind: JobKind;
+  name: string | null;
+  state: "running" | "done" | "failed";
+  started_at: string;
+  finished_at: string | null;
+  /** The job's answer once done: a ScenarioResult, a CheckResult, ... */
+  result: unknown;
+  error: string | null;
+  /** A short line on where a running job is, e.g. a scenario's phase. */
+  progress: string | null;
+}
+
+export type ScenarioParam = string | number | boolean | null;
+
+export interface ScenarioInfo {
+  name: string;
+  summary: string;
+  /** Every parameter the scenario takes, with its default. */
+  params: Record<string, ScenarioParam>;
+}
+
+export interface ScenarioCondition {
+  name: string;
+  passed: boolean;
+  detail: string | null;
+}
+
+export interface ScenarioResult {
+  scenario: string;
+  summary: string;
+  passed: boolean;
+  error: string | null;
+  region_id: string;
+  params: Record<string, ScenarioParam>;
+  run_id: string | null;
+  measurements: Record<string, unknown>;
+  conditions: ScenarioCondition[];
+  check: CheckResult | { passed: false; error: string } | null;
+  warnings: string[];
+  next_steps: string[];
+  [field: string]: unknown;
+}
+
+export interface CheckResult {
+  passed: boolean;
+  acked: number;
+  stored: number;
+  hq: number;
+  lost_at_failover: { count: number; order_ids: string[] };
+  duplicates: Record<string, unknown>[];
+  unaccounted: {
+    external_order_id: string;
+    reason: string;
+    region_id: string | null;
+  }[];
+  stored_unacked?: { count: number; order_ids: string[]; allowed: boolean };
+  runs?: string[];
+  days?: number[];
+}
+
+export interface CheckRequest {
+  runs: string[];
+  allow_unacked: boolean;
+}
+
+export interface SnapshotInfo {
+  name: string;
+  created_at: string | null;
+  sim_day: number | null;
+  sim_time: string | null;
+  regions: string[] | null;
+}
+
+export type RestoreServices = "auto" | "host" | "containers" | "none";
+
+export interface RestoreRequest {
+  replace_cluster_file: boolean;
+  services: RestoreServices;
 }

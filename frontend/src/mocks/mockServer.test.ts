@@ -56,4 +56,33 @@ describe("mock server", () => {
     const edge = await server("GET", "/edge/r2/api/v1/vendors/9e02b5f4/menu");
     expect(edge.status).toBe(200);
   });
+
+  it("runs one control-plane job at a time and reports on it", async () => {
+    const server = createMockServer();
+    const first = await server("POST", "/sim/scenarios/T2", {
+      region_id: "r1",
+    });
+    expect(first.status).toBe(202);
+    expect(first.body).toMatchObject({ job_id: "j1", state: "running" });
+
+    const second = await server("POST", "/sim/check", { runs: ["a"] });
+    expect(second).toMatchObject({
+      status: 409,
+      body: { error: "busy", job_id: "j1" },
+    });
+
+    let job = (await server("GET", "/sim/jobs/j1")).body as { state: string };
+    while (job.state === "running")
+      job = (await server("GET", "/sim/jobs/j1")).body as { state: string };
+    expect(job).toMatchObject({
+      state: "done",
+      result: { scenario: "T2", passed: true },
+    });
+
+    const typo = await server("POST", "/sim/scenarios/T2", { kill_after: 1 });
+    expect(typo).toMatchObject({
+      status: 422,
+      body: { error: "invalid_params" },
+    });
+  });
 });

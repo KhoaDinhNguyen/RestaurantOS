@@ -5,7 +5,7 @@ import {
   injectFault,
   removeFault,
 } from "../../api/endpoints";
-import type { FaultKind } from "../../api/types";
+import type { FaultKind, LinkGroup } from "../../api/types";
 import { ApiStatus } from "../../components/ApiStatus";
 import { Field, Panel } from "../../components/Panel";
 import {
@@ -24,6 +24,45 @@ const PARAMS: Record<FaultKind, string[]> = {
   latency: ["latency_ms", "jitter_ms"],
   reset: ["timeout_ms"],
 };
+
+/**
+ * What Toxiproxy holds on a group that no known fault explains (a leftover
+ * from an earlier control process, or a manual change), and the proxies a
+ * live cut found already disabled. `Heal all` clears the unexplained part.
+ */
+function Unexplained({ group }: { group: LinkGroup }) {
+  const u = group.unexplained;
+  const pre = group.preexisting_disabled ?? [];
+  const lines: string[] = [];
+  if (u?.disabled.length) lines.push(`disabled: ${u.disabled.join(", ")}`);
+  if (u?.toxics.length)
+    lines.push(
+      `toxics: ${u.toxics.map((t) => `${t.proxy}/${t.name ?? "?"} (${t.type ?? "?"})`).join(", ")}`,
+    );
+  if (u?.missing.length)
+    lines.push(`missing in Toxiproxy: ${u.missing.join(", ")}`);
+  if (lines.length === 0 && pre.length === 0) return null;
+  return (
+    <div className="mt-1 rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-900">
+      {lines.length > 0 && (
+        <>
+          <p>Not explained by any known fault (Heal all clears it):</p>
+          <ul className="font-mono">
+            {lines.map((line) => (
+              <li key={line}>{line}</li>
+            ))}
+          </ul>
+        </>
+      )}
+      {pre.length > 0 && (
+        <p>
+          Already disabled before the live cut, stays disabled on heal:{" "}
+          <span className="font-mono">{pre.join(", ")}</span>
+        </p>
+      )}
+    </div>
+  );
+}
 
 /** `/sim/links` and `/sim/faults`: break and heal link groups. */
 export function FaultsPanel() {
@@ -112,6 +151,22 @@ export function FaultsPanel() {
       </form>
       <ApiStatus result={inject.result} />
       <ApiStatus result={remove.result} />
+      {!!inject.result?.data?.already_disabled?.length && (
+        <p className="text-sm text-amber-800">
+          Already disabled before this cut, and left alone:{" "}
+          <span className="font-mono">
+            {inject.result.data.already_disabled.join(", ")}
+          </span>
+        </p>
+      )}
+      {!!remove.result?.data?.left_disabled?.length && (
+        <p className="text-sm text-amber-800">
+          Left disabled (they were disabled before the cut):{" "}
+          <span className="font-mono">
+            {remove.result.data.left_disabled.join(", ")}
+          </span>
+        </p>
+      )}
       {heal.result?.data && (
         <p className="text-sm text-emerald-700">
           Healed {heal.result.data.healed} faults.
@@ -156,6 +211,7 @@ export function FaultsPanel() {
                 ))}
               </ul>
             )}
+            <Unexplained group={g} />
           </li>
         ))}
       </ul>

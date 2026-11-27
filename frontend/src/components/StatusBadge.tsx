@@ -10,9 +10,17 @@ const TONES: Record<string, string> = {
   down: "bg-rose-600 text-white",
   primary: "bg-slate-800 text-white",
   standby: "bg-slate-200 text-slate-700",
+  running: "bg-sky-100 text-sky-800",
+  done: "bg-emerald-100 text-emerald-800",
+  failed: "bg-rose-600 text-white",
+  PASSED: "bg-emerald-600 text-white",
+  FAILED: "bg-rose-600 text-white",
 };
 
-/** A coloured label for an order status, a node health or a node role. */
+/**
+ * A coloured label for an order status, a node health or role, a job state
+ * or a verdict.
+ */
 export function StatusBadge({ value }: { value: string }) {
   return (
     <span

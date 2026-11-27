@@ -3,6 +3,7 @@
 import { qs, request } from "./client";
 import type {
   AvailabilityResult,
+  CheckRequest,
   ClusterEvent,
   ClusterStatus,
   Dish,
@@ -11,6 +12,7 @@ import type {
   Fault,
   FaultKind,
   IngredientUsageAnswer,
+  Job,
   LinkGroup,
   MenuPublishRequest,
   MenuPublishResponse,
@@ -28,7 +30,11 @@ import type {
   RegionDirectoryRow,
   RegionSummary,
   RestockResult,
+  RestoreRequest,
+  ScenarioInfo,
+  ScenarioParam,
   SimClock,
+  SnapshotInfo,
   StatusResult,
   StockRow,
   Strategy,
@@ -218,7 +224,7 @@ export const injectFault = (
 ) => request<Fault>("POST", "/sim/faults", { body: { target, fault, params } });
 
 export const removeFault = (faultId: string) =>
-  request<unknown>("DELETE", `/sim/faults/${seg(faultId)}`);
+  request<Fault>("DELETE", `/sim/faults/${seg(faultId)}`);
 
 export const healAll = () =>
   request<{ healed: number }>("POST", "/sim/faults/heal-all");
@@ -228,3 +234,32 @@ export const killNode = (nodeId: string) =>
 
 export const startNode = (nodeId: string) =>
   request<NodeRunState>("POST", `/sim/nodes/${seg(nodeId)}/start`);
+
+// --- control plane jobs: scenarios, snapshots, checker ----------------------
+// Each POST answers 202 with a Job (or 409 `busy` naming the running one);
+// GET /sim/jobs/{id} reports on it.
+
+export const getJob = (jobId: string) =>
+  request<Job>("GET", `/sim/jobs/${seg(jobId)}`);
+
+export const listScenarios = () =>
+  request<ScenarioInfo[]>("GET", "/sim/scenarios");
+
+export const runScenario = (
+  name: string,
+  params: Record<string, ScenarioParam>,
+) => request<Job>("POST", `/sim/scenarios/${seg(name)}`, { body: params });
+
+export const listSnapshots = () =>
+  request<{ snapshots: SnapshotInfo[] }>("GET", "/sim/snapshots");
+
+export const saveSnapshot = (name: string) =>
+  request<Job>("POST", "/sim/snapshots", { body: { name } });
+
+export const restoreSnapshot = (name: string, options: RestoreRequest) =>
+  request<Job>("POST", `/sim/snapshots/${seg(name)}/restore`, {
+    body: options,
+  });
+
+export const runCheck = (body: CheckRequest) =>
+  request<Job>("POST", "/sim/check", { body });

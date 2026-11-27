@@ -99,9 +99,9 @@ export function ClusterPanel({
                     <td className={`${tdClass} font-mono`}>{r.region_id}</td>
                     <td className={`${tdClass} font-semibold`}>{r.epoch}</td>
                     <td className={`${tdClass} font-mono text-xs`}>
-                      {r.primary_node} / {r.standby_node}
+                      {r.primary_node} / {r.standby_node ?? "no standby"}
                     </td>
-                    <td className={tdClass}>{r.replication}</td>
+                    <td className={tdClass}>{show(r.replication)}</td>
                     <td className={tdClass}>{show(r.orders_per_s)}</td>
                     <td className={tdClass}>
                       {r.standby_lag_s === null

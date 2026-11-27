@@ -4,8 +4,11 @@ import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig, loadEnv, type ProxyOptions } from "vite";
 
-// The services send no CORS headers, so the dev server forwards every call
-// (docs/work-packages/wp7-web-ui.md, "Reaching them from the browser").
+// The gateway, edge and coordinator send no CORS headers, so the dev server
+// forwards every call (docs/work-packages/wp7-web-ui.md, "Reaching them from
+// the browser"). The browser's Origin is passed on unchanged: the control
+// plane checks it on every POST, PATCH and DELETE, so the page's origin must
+// be in ROS_SIM_CONTROL_ALLOWED_ORIGINS (see README.md).
 // The browser only ever uses relative paths:
 //   /api/...          -> gateway       (8000)
 //   /admin/...        -> coordinator   (8001)

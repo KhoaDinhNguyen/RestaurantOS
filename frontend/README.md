@@ -11,7 +11,7 @@ npm run dev:mock       # made-up data, no backend needed
 npm run dev            # against the real services (see below)
 ```
 
-`npm run dev` forwards every call through the Vite dev server, because the services send no CORS headers:
+`npm run dev` forwards every call through the Vite dev server, because the gateway, the edge APIs and the coordinator send no CORS headers:
 
 | Path in the browser | Goes to                                              |
 | ------------------- | ---------------------------------------------------- |
@@ -21,6 +21,16 @@ npm run dev            # against the real services (see below)
 | `/edge/r{n}/...`    | edge API of region n, port 8010 + n (prefix removed) |
 
 Two settings, read from the repository's `.env`: `ROS_UI_PROXY_HOST` (default `127.0.0.1`) and `ROS_UI_REGIONS` (default 3).
+
+**The Ops view's buttons need one more setting.** The control plane refuses every state-changing request (start playback, inject a fault, run a scenario, ...) whose browser `Origin` is not on its allowlist, even through the dev server's forward (architecture Section 6.3). Put the address you open the UI at in the repository's `.env`, then restart `rosctl control`:
+
+```bash
+ROS_SIM_CONTROL_ALLOWED_ORIGINS=http://localhost:5173
+```
+
+The origin must match exactly: `http://127.0.0.1:5173` is a different one, and so is `npm run preview`'s port 4173 (list several, comma-separated). Without it those buttons answer a red `403` that names this setting. Reading (the clock, the links, the job list) works either way.
+
+Which backend command serves what: `uv run rosctl up` starts the gateway, the coordinator, the HQ worker and every relay and edge API; `uv run rosctl control` serves every `/sim` route on 8002 (playback, faults, nodes, scenarios, snapshots, the checker).
 
 In mock mode region `r2` is cut off from HQ. Through the gateway its routes answer `503` and its orders are parked (`202`), while its edge API keeps working, as in test T2.
 
