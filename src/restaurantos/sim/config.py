@@ -39,7 +39,7 @@ class SimSettings(BaseSettings):
     # run keeps open at once; drain bounds how long `stop` waits for
     # them before abandoning (the log marks abandoned lines).
     playback_speed: float = Field(default=1000.0, gt=0)
-    playback_inflight: int = Field(default=64, ge=1)
+    playback_inflight: int = Field(default=128, ge=1)
     playback_drain_timeout_s: float = Field(default=30.0, gt=0)
     # Status events (architecture 6.1's POST /vendors/{vendor_id}/orders/
     # {order_id}/status): accepted, preparing, ready, picked_up at

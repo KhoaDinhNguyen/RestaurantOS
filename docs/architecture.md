@@ -770,7 +770,7 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
   "dispatched_sim_day": 14, "dispatched_sim_time": "09:41:07",
   "held_sim_day": 14, "held_sim_time": "09:40:55", "next_due_sim_day": 14, "next_due_sim_time": "09:40:55",
   "engine": {
-    "sequential": false, "region": null, "target_url": "http://127.0.0.1:8000/api/v1/orders", "inflight": 64,
+    "sequential": false, "region": null, "target_url": "http://127.0.0.1:8000/api/v1/orders", "inflight": 128,
     "events": {"enabled": true, "sample_rate": 1.0, "jitter_s": 60.0}, "warm_up_days": 14, "restock_every": 7,
     "duplicate_offset_s": 1.0, "shuffle_window": 8, "kitchen": {"mode": "edge", "urls": {"r1": "http://127.0.0.1:8011/api/v1"}}
   }

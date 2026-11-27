@@ -1490,7 +1490,7 @@ ENGINE = {
     "sequential": False,
     "region": None,
     "target_url": "http://127.0.0.1:8000/api/v1/orders",
-    "inflight": 64,
+    "inflight": 128,
     "events": {"enabled": True, "sample_rate": 1.0, "jitter_s": 60.0},
     "restock_every": 7,
     "duplicate_offset_s": 1.0,
