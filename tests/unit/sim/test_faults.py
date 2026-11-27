@@ -184,6 +184,21 @@ async def test_heal_all_resets_toxiproxy_and_forgets_every_fault(layer, server) 
     assert all(proxy["enabled"] and proxy["toxics"] == [] for proxy in server.proxies.values())
 
 
+async def test_heal_all_if_alone_resets_only_with_no_live_fault(layer, server) -> None:
+    # alone: the reset runs and answers 0 (no known faults)
+    assert await layer.heal_all_if_alone() == 0
+    fault = await layer.create("node:r1-primary", "cut")
+    assert server.proxies[SHARED_REPL]["enabled"] is False
+    # with a live fault: nothing changes, and the fault stays
+    assert await layer.heal_all_if_alone() is None
+    assert server.proxies[SHARED_REPL]["enabled"] is False
+    assert layer.faults() == [fault]
+    # healed by hand, the next reset runs again
+    await layer.heal(fault.fault_id)
+    assert await layer.heal_all_if_alone() == 0
+    assert server.proxies[SHARED_REPL]["enabled"] is True
+
+
 async def test_links_list_known_faults_and_what_no_fault_explains(layer, server) -> None:
     known = await layer.create("repl:r1", "latency", {"latency_ms": 50})
     # what a previous control process left behind: a disabled proxy and a toxic

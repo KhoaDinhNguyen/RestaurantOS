@@ -750,12 +750,12 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
 | `POST /sim/faults` | break a link group | required |
 | `DELETE /sim/faults/{fault_id}`, `POST /sim/faults/heal-all` | remove faults | required |
 | `POST /sim/nodes/{node_id}/kill`, `POST /sim/nodes/{node_id}/start` | real crash (T1b) and restart | required |
-| `POST /sim/scenarios/{name}` | run a scripted scenario (`T1`, `T1b`, `T2` to `T6`) | optional |
-| `GET /sim/snapshots`, `POST /sim/snapshots`, `POST /sim/snapshots/{name}/restore` | Section 7.4 | optional |
-| `POST /sim/check` | run the invariant checker | optional |
-| `GET /sim/jobs/{job_id}` | progress of a scenario, snapshot, restore or check | with the optional routes |
+| `GET /sim/scenarios`, `POST /sim/scenarios/{name}` | list the scripted scenarios; run one (`T1`, `T1b`, `T2` to `T6`, Section 7.3) | built (WP6b) |
+| `GET /sim/snapshots`, `POST /sim/snapshots`, `POST /sim/snapshots/{name}/restore` | Section 7.4 | built (WP6b) |
+| `POST /sim/check` | run the invariant checker | built (WP6b) |
+| `GET /sim/jobs/{job_id}` | progress of a scenario, snapshot, restore or check | built (WP6b) |
 
-"Optional" routes must work as `rosctl` commands; putting them on the Ops view is extra. Their shapes are fixed here either way.
+"Optional" routes must work as `rosctl` commands; putting them on the Ops view is extra. Their shapes are fixed here either way. All of them are built now. `POST /sim/scenarios/{name}`, `POST /sim/snapshots`, `POST /sim/snapshots/{name}/restore` and `POST /sim/check` start jobs; `GET /sim/scenarios` and `GET /sim/snapshots` list, and `GET /sim/jobs/{job_id}` polls a job.
 
 **Playback.** `GET /sim/clock` answers `{"state", "sim_day", "sim_time", "speed"}`. Before the first run the last three are `null`: there is no "today" yet, and a screen should ask for a day. The clock shows how far the replay got, never how long cleanup took. While a run is paused it stands where the pause caught it. After a normal end it stands at the last item's own instant, the same on every run. After a stop it stands at the moment the stop was accepted, and after a failure at the moment the run failed. From then on it does not move, including while the state is still `stopping`. `state` is `idle`, `running`, `paused`, `stopping`, `done`, `stopped` or `failed`.
 
@@ -770,7 +770,7 @@ The Ops view is the only HTTP caller. Everything here is also a `rosctl` command
   "dispatched_sim_day": 14, "dispatched_sim_time": "09:41:07",
   "held_sim_day": 14, "held_sim_time": "09:40:55", "next_due_sim_day": 14, "next_due_sim_time": "09:40:55",
   "engine": {
-    "sequential": false, "region": null, "target_url": "http://127.0.0.1:8000/api/v1/orders", "inflight": 64,
+    "sequential": false, "region": null, "target_url": "http://127.0.0.1:8000/api/v1/orders", "inflight": 128,
     "events": {"enabled": true, "sample_rate": 1.0, "jitter_s": 60.0}, "warm_up_days": 14, "restock_every": 7,
     "duplicate_offset_s": 1.0, "shuffle_window": 8, "kitchen": {"mode": "edge", "urls": {"r1": "http://127.0.0.1:8011/api/v1"}}
   }
@@ -824,7 +824,7 @@ It answers `201` with the fault; `404` for an unknown link group; `409` with `{"
 - The link groups overlap (`node:r1-primary` and `repl:r1` share `r1-standby__r1-primary`). A proxy stays disabled until the last `cut` holding it is healed, and every toxic is named after its fault (`f3-latency-up`), so a heal never undoes another fault.
 - Errors answer `{"error", "message"}`: `unknown_group`, `unknown_fault`, `unknown_node`, `unknown_job` (`404`), `fault_exists` (`409`, with the existing `fault_id`), `invalid_params` (`422`), and `toxiproxy_error` / `docker_error` (`502`) when Toxiproxy or Docker fails.
 
-**The control process.** `rosctl control` serves all of this on port 8002 and hosts playback in the same process (the same engine flags as `rosctl playback start`, fixed for every run it hosts); runs are started through `POST /sim/playback`, or `rosctl playback start --via-control --from-day N`. A standalone `rosctl playback start` still works when no control process runs; only one of the two can own the port. The `rosctl` clients are `rosctl links`, `rosctl fault add|heal|heal-all|list`, `rosctl node kill|start` and `rosctl job <job_id>`.
+**The control process.** `rosctl control` serves all of this on port 8002 and hosts playback in the same process (the same engine flags as `rosctl playback start`, fixed for every run it hosts); runs are started through `POST /sim/playback`, or `rosctl playback start --via-control --from-day N`. A standalone `rosctl playback start` still works when no control process runs; only one of the two can own the port. The `rosctl` clients are `rosctl links`, `rosctl fault add|heal|heal-all|list`, `rosctl node kill|start`, `rosctl job <job_id>` and `rosctl scenario <name>|list`.
 
 **Cross-origin requests.** A browser client (WP7) served from an origin listed in `ROS_SIM_CONTROL_ALLOWED_ORIGINS` can call the control API directly: the API answers CORS preflights and sends CORS headers for listed origins only - exact match, no wildcard, no credentials. Listing an origin does two things: it lets the browser read responses (CORS), and it lets state-changing requests past the origin guard.
 
@@ -837,7 +837,7 @@ Browsers decide same-site by scheme + registrable domain, ignoring the port: `ht
 **Jobs.** A scenario, a snapshot, a restore and a check take from seconds to minutes. Their `POST` answers `202` with a job, and `GET /sim/jobs/{job_id}` reports on it:
 
 ```json
-{ "job_id": "j7", "kind": "scenario", "name": "T2", "state": "running", "started_at": "...", "finished_at": null, "result": null, "error": null }
+{ "job_id": "j7", "kind": "scenario", "name": "T2", "state": "running", "started_at": "...", "finished_at": null, "result": null, "error": null, "progress": "r1 cut off from HQ: 41 s left" }
 ```
 
 - `kind` is `scenario`, `snapshot`, `restore` or `check`; `state` is `running`, `done` or `failed`. One job runs at a time: a second `POST` answers `409` with `{"error": "busy", "job_id": "j7"}`.
@@ -931,6 +931,45 @@ We talk to Toxiproxy through **our own small client** over its HTTP API (port 84
 
 Real crashes use `docker kill`. Scenarios T1 to T6 are scripts built from these.
 
+**Scenarios** (`sim/scenarios.py`, Phase 2 Table 9). Each runs as a job in the control process, which holds the playback engine, the fault layer and the nodes: `POST /sim/scenarios/{name}`, or `rosctl scenario <name>`, which posts it and follows the job until the verdict (exit 0 pass, 1 fail; Ctrl-C stops following, not the scenario). The script is the same for all of them:
+
+1. start a playback run over one or more whole days;
+2. wait until the simulated clock reaches `inject_at` (default `11:00:00`, the lunch peak) on the first day, so the fault lands under load;
+3. break something, hold it for `fault_s` wall seconds, repair it, then `settle_s` more seconds of load;
+4. let the run finish its window, wait for the scenario's own measurements (drain, menu arrival), run the checker (Section 7.5) on the run;
+5. write `runs/<run_id>/scenario.json`, which is also the job's `result`.
+
+| Scenario | Breaks | Passes when | Default `fault_s` |
+| --- | --- | --- | --- |
+| `T1` | `cut` on `node:<the region's current primary>` | the standby is promoted, orders commit on it again, the checker passes | 30 |
+| `T1b` | `docker kill` of the current primary, started again at the heal | as T1 | 30 |
+| `T2` | `cut` on `link:<region><->hq` | no failover, the holding queue drains after the heal, the checker passes | 60 |
+| `T3` | T2, then kill -9 of `relay-<region>` and `hq-worker` `kill_after_s` (1) after the heal, both started again after `down_s` (5) | as T2; both kills succeed, and right after them the relay's outbox and the HQ worker's holding queue together still hold work (either one may be empty, not both: an idle-worker trial fails); both come back | 60 |
+| `T4` | no fault; the run resends `duplicate_rate` (0.08) of its orders and shuffles delivery (`shuffle`, on) | the checker passes **strictly** (stored-but-unanswered orders fail it): one order per external id | 60 (load) |
+| `T5` | `latency` on `node:<the region's current primary>`, `latency_ms` (100) each way plus `jitter_ms` (0) | no failover, the primary is unchanged, the checker passes | 30 |
+| `T6` | `reset` on `link:<region><->hq` (`reset_timeout_ms`, 200: a connection lives that long), then a menu version is published through `POST /menu/products` | every sample of the region shows the old version or the whole new one, the region reaches the new one after the heal, the checker passes | 20 |
+
+Measured on a 1-region dev cluster: 1000 ms each way promotes the standby (the coordinator's 1 s connection budget and 3 s region probe cannot fit a 2 s round trip), and so does 250 ms; 100 ms does not.
+
+- **The body** is optional: `{"region_id": "r1", "from_day", "speed", "seed", "inject_at", "fault_s", "settle_s"}` for every scenario, plus the scenario's own keys from the table. An unknown key, or one of another scenario, is a `422` (`invalid_params`), so a typo never runs with a default; an unknown scenario is a `404`. A scenario is refused with `409` (`scenario_refused`) while a run is live or a fault is on, and T1/T1b also when the region's primary has no streaming standby; T6 when the region has no product to copy; any scenario whose region HQ does not know; and any scenario while the cluster file has changed shape since the control process started (a restore with `--replace-cluster-file` - restart `rosctl control`). The pre-start checks run at the POST, so these refusals cost nothing. `GET /sim/scenarios` lists every scenario with its parameters and defaults.
+- **Whole days.** The checker compares every order stored in a run's days with that run's log, so a scenario's run must send every order of its window and is never stopped early. The window is sized to outlast the script (the injection moment, plus every hold at the run's speed, plus three simulated hours because a run ends at its last order, not at midnight). By default it starts on the first day after every earlier run's `to_day` (read from `meta.json`), so each scenario writes new orders; once the data has no such days left it starts again after the warm-up, and orders already stored are answered as duplicates. A long fault at full speed spans many days: T2 with `fault_s` 900 at 1000x needs 12.
+- **The checker** allows stored-but-unanswered orders in every scenario but T4: under a fault a timeout that still landed is normal.
+- **Measurements** (`measurements` in the result): T1/T1b `failover_s` (the fault to the coordinator's `failover` event), `writes_resumed_s` (the fault to the first order committed on the new primary, read from `orders.committed_at`), `promotion_seen_s`, old and new primary and epoch; T2/T3 `held_peak` (the most orders parked at HQ during the cut) and `drain_s` (the heal to an empty holding queue for the region); T3 `pending_before_kill` and `pending_at_kill` (the holding queue and the relay's outbox, read before and right after both workers are killed: with both dead nothing drains, so a non-empty second reading is real interrupted work); T4 `orders_resent`; T6 `menu_version`, `samples`, `mixed` (the first bad samples, if any) and `arrived_s`. The result also carries `conditions` (each pass condition with its detail), the checker's result, the run's final counters, the faults it created, a timeline of wall times, `warnings` and `next_steps`.
+- **T1 and T1b leave the old primary fenced**, not a standby: the region runs without one until it is rejoined (`uv run python -m restaurantos.coordinator.rejoin <region> --compose-file infra/generated/compose.yaml`, in `next_steps`), and a second T1 or T1b on it is refused until then. The scenarios always break the region's *current* primary (from HQ's `region_state`), so they keep working after a failover.
+- **T3 kills** a host-mode service (a `rosctl up` pid file) with SIGKILL straight after SIGINT, and restarts it with `rosctl up <name>`; a container-mode service with `docker compose kill` and `start` (the `services` profile).
+- **T6 adds a product** to the menu for good: `<run_id> probe`, copied from one of the region's products (same dish link and price), so the region has one product it cannot have without the new version. The samples read the region's primary directly every quarter second: its `node_state.menu_version`, how many products claim a newer version than that, and whether the probe product is there. A sample is mixed when a product is newer than the region's version, or the probe product's presence disagrees with the version.
+- **On an error** the scenario heals the faults it created, starts what it killed, stops its run, writes the partial result (with `error`) and fails the job. It resets Toxiproxy only when no other fault is live: an operator's fault is not ours to wipe.
+- The database reads go straight to the nodes from the host (`host_conninfo`, never through Toxiproxy): a scenario has to read a region it has just cut off.
+
+**Quick runs.** A full scenario at the defaults takes about an hour on the dev cluster, because each order also sends four status events and all of them share the playback's in-flight slots. For iteration:
+
+- start the control process with `--event-sample-rate 0.2` (a fifth of the orders get their events);
+- run scenarios with `--speed 300`, so every scenario fits in one simulated day. The engine cannot keep 1000x anyway, so the lower speed costs no load.
+
+Use full events (`--event-sample-rate 1`, the default) for runs that go into the report: the kitchen working through a cut is part of what T2 and T3 show.
+
+Measured on the dev cluster, wall time per scenario at the quick settings versus the defaults: T2 with `--fault-s 60` 5 min versus 14, T3 5 versus 15, T5 5 versus 70. The pool and in-flight defaults (20 connections per node, 128 requests in flight) come from a three-configuration T4 benchmark: the winning run passed the strict checker with nothing failed or parked, and its connection peaks were 38 on the region's primary and 9 on HQ's against PostgreSQL's 100.
+
 ### 7.4 Snapshot and restore
 
 A snapshot is the state of the whole system at a point in simulated time:
@@ -961,7 +1000,7 @@ How it is built (`rosctl snapshot save|restore|list`, `sim/snapshot.py`):
 - **The steps.** Stop the live run and wait until it has stopped (a run still stopping keeps writing its log, which restore is about to put back; past the engine's drain time plus slack it gives up, changing nothing else). Stop the services the way they run: host processes through `rosctl down`, or, in container mode, the generated file's `services` profile containers. Stop the databases. Regenerate `infra/generated/` from the snapshot's `cluster.toml` before any container starts. Unpack every volume. Put the run logs back. Start the databases. Put Toxiproxy's proxies and toxics back (healing the control process's own faults first). Start the services again (`rosctl up`, or `compose --profile services up -d --wait` for every service entry of the snapshot's shape): they cache epochs and primaries that a restore makes stale.
 - **Which services it starts.** `--services` (the API's `services`) decides. The default, `auto`, starts them the way they ran before the restore, and starts none if none ran: restore never guesses between host processes and containers. `host` or `containers` start them that way, even when none ran; asking for one while they run the other way is refused before anything changes. `none` stops them and starts none. When no services start, the result says how to start them, the replay is not resumed (every order would fail against services that are down; the link is kept and `manual_command` resumes it once they are up), and the saved cuts are called out. A plain `rosctl up` refuses while a link it dials is cut (its precheck finds it closed): restore again with `--services host`, which tells the precheck to skip the cut ports and keeps the cuts, or use `rosctl up --no-precheck`. A gateway cannot start at all while its links to HQ are cut (it cannot load its routing): restore again with `--services host` or `containers`, which start it first and cut those links after. Healing a cut first works too, but drops that saved fault.
 - **Saved cuts.** A proxy the snapshot had cut is cut again before the services start, and stays cut (starting healed and cutting afterwards would let a relay drain the backlog the snapshot held behind the cut). A cut proxy does not listen, so restore tells `rosctl up`'s precheck to skip those ports; plain `rosctl up` checks every port as before. One kind of cut waits until the services are up: the gateway's links to HQ. The gateway loads its routing table from HQ's writable node when it starts, so with those links cut it would never become ready (in the original run it was already up when the cut came); restore cuts them right after the services start. Nothing flows through them meanwhile: playback is stopped, and the gateway's HQ link carries no backlog. Restored cuts are not faults of the control process: its links view shows them as unexplained, and heal-all clears them.
-- **Another cluster shape.** With `--replace-cluster-file`, the old shape's databases that the snapshot's shape lacks (an `r2`, say) are left stopped with their volumes, and the result names them.
+- **Another cluster shape.** With `--replace-cluster-file`, the old shape's databases that the snapshot's shape lacks (an `r2`, say) are left stopped with their volumes, and the result names them. The control process keeps the shape it started with, so restart it after such a restore; scenarios refuse until you do.
 
 **Resuming playback (option C).**
 

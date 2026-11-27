@@ -263,6 +263,23 @@ class FaultLayer:
             self._pre_disabled.clear()
             return healed
 
+    async def heal_all_if_alone(self) -> int | None:
+        """`heal_all`, but only when no fault is tracked: a scenario's
+        error cleanup must not wipe an operator's fault. Returns how many
+        known faults it cleared (0 when there were none), or None when
+        other faults are live and nothing was changed. The check and the
+        reset share the layer's lock, so they cannot be split by another
+        request."""
+        async with self._lock:
+            if self._faults:
+                return None
+            await self._toxiproxy.reset()
+            healed = len(self._faults)
+            self._faults.clear()
+            self._cut_counts.clear()
+            self._pre_disabled.clear()
+            return healed
+
     async def links(self) -> list[dict[str, Any]]:
         """Every link group with its faults, plus what Toxiproxy holds on
         its proxies that no known fault explains (a restart forgets the

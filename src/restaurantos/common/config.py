@@ -56,7 +56,7 @@ class Settings(BaseSettings):
     # also holds when the link is silent. Keep it above statement_timeout_ms.
     request_deadline_s: float = 3.0
     pool_min_size: int = 1
-    pool_max_size: int = 10
+    pool_max_size: int = 20
 
     # Toxiproxy control API. Left unset, it follows `network`.
     toxiproxy_url: str = TOXIPROXY_URLS["compose"]

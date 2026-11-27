@@ -46,6 +46,9 @@ class Job:
     finished_at: str | None = None
     result: Any = None
     error: str | None = None
+    # a short line on where a running job is (a scenario's phase), for
+    # the Ops view and `rosctl scenario`; None when the work sets none
+    progress: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -57,6 +60,7 @@ class Job:
             "finished_at": self.finished_at,
             "result": self.result,
             "error": self.error,
+            "progress": self.progress,
         }
 
 
@@ -89,6 +93,12 @@ class JobRunner:
         if job is None:
             raise UnknownJobError(job_id)
         return job
+
+    def set_progress(self, job_id: str, text: str) -> None:
+        """Called by a job's own work to say where it is."""
+        job = self._jobs.get(job_id)
+        if job is not None and job.state == "running":
+            job.progress = text
 
     async def wait(self, job_id: str) -> Job:
         task = self._tasks.get(job_id)

@@ -415,7 +415,24 @@ async def _run_start(
     extras: _ControlExtras | None = None
     if control:
         try:
-            extras = _add_control_extras(app, args.config or common.cluster_file, port=args.port)
+            extras = _add_control_extras(
+                app,
+                args.config or common.cluster_file,
+                port=args.port,
+                scenario_engine={
+                    "playback": playback,
+                    "api_base": target,
+                    "default_from_day": from_day,
+                    "last_day": meta.last_day,
+                    "default_speed": sim.playback_speed,
+                    "http_timeout_s": sim.http_timeout_s,
+                    "port": args.port or sim.control_port,
+                    # what this host actually sends: scenarios must not
+                    # run against an engine that filters or bypasses
+                    "engine_region": region,
+                    "edge_target": args.target == "edge",
+                },
+            )
         except (OSError, ValueError) as error:
             print(f"rosctl control: {error}", file=sys.stderr)
             return 1
@@ -662,11 +679,19 @@ class _ControlExtras:
         await self.toxiproxy.aclose()
 
 
-def _add_control_extras(app: Any, cluster_file: Path, *, port: int | None = None) -> _ControlExtras:
+def _add_control_extras(
+    app: Any,
+    cluster_file: Path,
+    *,
+    port: int | None = None,
+    scenario_engine: dict[str, Any] | None = None,
+) -> _ControlExtras:
     """Mount the links, faults, nodes and jobs routes beside the playback
     routes. The cluster file decides the link groups and the nodes - use
     the file bootstrap ran with. `port` is the one the control process
-    listens on: its check and snapshot jobs reach its playback there."""
+    listens on: its check and snapshot jobs reach its playback there.
+    With `scenario_engine` (the playback engine and what the scenarios
+    need to know about it) the scenario routes come too."""
     from restaurantos.common.cluster import link_groups
     from restaurantos.sim.control_api import add_control_routes, add_sim_jobs
     from restaurantos.sim.faults import FaultLayer
@@ -676,8 +701,18 @@ def _add_control_extras(app: Any, cluster_file: Path, *, port: int | None = None
     groups = link_groups(cluster)
     toxiproxy = Toxiproxy()
     jobs = JobRunner()
-    add_control_routes(app, faults=FaultLayer(toxiproxy, groups), nodes=Nodes(cluster), jobs=jobs)
-    add_sim_jobs(app, port=port)
+    faults = FaultLayer(toxiproxy, groups)
+    nodes = Nodes(cluster)
+    add_control_routes(app, faults=faults, nodes=nodes, jobs=jobs)
+    add_sim_jobs(app, port=port, cluster=cluster)
+    if scenario_engine is not None:
+        from restaurantos.sim.control_jobs import add_job_routes
+        from restaurantos.sim.scenarios import default_env
+
+        engine = dict(scenario_engine)
+        engine.pop("port")
+        env = default_env(cluster, cluster_file, faults=faults, nodes=nodes, **engine)
+        add_job_routes(app, jobs=jobs, scenarios=env)
     return _ControlExtras(toxiproxy, jobs, cluster_file, len(groups))
 
 
