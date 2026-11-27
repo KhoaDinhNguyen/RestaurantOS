@@ -45,10 +45,13 @@ async def publish_menu(
         return (await cursor.fetchone())[0]
 
     async def snapshot(conn: AsyncConnection):
-        # One statement selects the full slice and its version from the same
+        # One statement selects the delta and its newest version from the same
         # PostgreSQL snapshot. Keep numeric prices as Decimal, without JSON.
         async with conn.cursor(row_factory=dict_row) as cursor:
-            await cursor.execute(load_query("relay/read_menu_slice"), {"region_id": region_id})
+            await cursor.execute(
+                load_query("relay/read_menu_slice"),
+                {"region_id": region_id, "after_version": current},
+            )
             return await cursor.fetchall()
 
     for attempt in range(2):

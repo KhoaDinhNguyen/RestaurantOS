@@ -21,5 +21,7 @@ INNER JOIN product_dish AS pd
     ON p.vendor_id = pd.vendor_id AND p.product_id = pd.product_id
 INNER JOIN vendors AS v ON p.vendor_id = v.vendor_id
 INNER JOIN region_cells AS rc ON v.geohash = rc.geohash
-WHERE p.origin = 'hq'
+WHERE
+    p.origin = 'hq'
+    AND p.menu_version > %(after_version)s  -- noqa: RF02
 ORDER BY p.vendor_id, p.product_id;
