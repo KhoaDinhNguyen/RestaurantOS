@@ -8,6 +8,7 @@ from psycopg.conninfo import conninfo_to_dict
 
 from restaurantos.common.cluster import Cluster, proxy_for
 from restaurantos.common.errors import RegionUnreachableError, StaleEpochError
+from restaurantos.region import apply_menu_version
 from restaurantos.relay import menu
 
 pytestmark = pytest.mark.integration
@@ -58,7 +59,7 @@ async def menus(hq, outbox, monkeypatch):
     await headquarters.execute(
         "UPDATE products SET name = 'latest', menu_version = 3 WHERE product_id = 'p001'"
     )
-    # p002 remains at version 1 and must still be included in the full slice.
+    # p002 remains at version 1 and must not be resent to this region.
     destinations = []
     real_conninfo = menu.node_conninfo
 
@@ -108,15 +109,15 @@ async def local_state(region):
     return (await version.fetchone())[0], await products.fetchall()
 
 
-async def test_newest_complete_slice_and_promoted_node(menus):
+async def test_newest_delta_and_promoted_node(menus):
     hq, pool, region, settings, destinations = menus
     apply = AtomicMenu()
     await menu.publish_menu(pool, Cluster(regions=2), "r1", settings, apply)
     assert len(apply.calls) == 1
     version, rows, epoch = apply.calls[0]
     assert (version, epoch) == (3, 7)
-    assert [row["product_id"] for row in rows] == ["p001", "p002"]
-    assert [row["menu_version"] for row in rows] == [3, 1]
+    assert [row["product_id"] for row in rows] == ["p001"]
+    assert [row["menu_version"] for row in rows] == [3]
     assert rows[0]["unit_price"] == Decimal("0.1234567890123456789")
     assert rows[0]["dish_id"] == "d001"
     assert rows[0]["multiplier"] == 3
@@ -230,3 +231,67 @@ async def test_stale_epoch_refreshes_target_and_retries(menus):
     await menu.publish_menu(pool, Cluster(regions=2), "r1", settings, promote)
     assert attempts == [7, 8]
     assert [node for node, _ in destinations] == ["r1-standby", "r1-primary"]
+
+
+@pytest.mark.parametrize(
+    "current, expected_products",
+    [(1, ["p001", "p002"]), (2, ["p001"]), (3, [])],
+)
+async def test_delta_from_regions_own_version_with_real_wp1(menus, current, expected_products):
+    hq, pool, region, settings, _ = menus
+    await hq.execute(
+        "UPDATE products SET name = 'second', menu_version = 2 WHERE product_id = 'p002'"
+    )
+    await region.execute("UPDATE node_state SET menu_version = %s", (current,))
+    if current >= 2:
+        await region.execute(
+            "UPDATE products SET name = 'second', menu_version = 2 WHERE product_id = 'p002'"
+        )
+    if current == 3:
+        await region.execute(
+            "UPDATE products SET name = 'latest', menu_version = 3 WHERE product_id = 'p001'"
+        )
+    # HQ can remember delivery to a former primary. The actual node decides
+    # the delta, including both missed versions on a behind promoted standby.
+    await hq.execute("UPDATE region_state SET menu_version = 3 WHERE region_id = 'r1'")
+    calls = []
+
+    async def apply(conn, version, rows, epoch):
+        calls.append((version, rows, epoch))
+        await apply_menu_version(conn, version, rows, epoch)
+
+    await menu.publish_menu(pool, Cluster(regions=2), "r1", settings, apply)
+    if expected_products:
+        assert len(calls) == 1
+        version, rows, epoch = calls[0]
+        assert (version, epoch) == (3, 7)
+        assert [row["product_id"] for row in rows] == expected_products
+        assert all(row["menu_version"] > current for row in rows)
+    else:
+        assert calls == []
+    assert await local_state(region) == (
+        3,
+        [("local", "local menu", 1), ("p001", "latest", 3), ("p002", "second", 2)],
+    )
+    recorded = await hq.execute("SELECT menu_version FROM region_state WHERE region_id = 'r1'")
+    assert await recorded.fetchone() == (3,)
+    await menu.publish_menu(pool, Cluster(regions=2), "r1", settings, apply)
+    assert len(calls) == bool(expected_products)
+
+
+async def test_empty_delta_does_not_apply_or_acknowledge(menus, monkeypatch):
+    hq, pool, region, settings, _ = menus
+    apply = AtomicMenu()
+    real_run_on = menu.run_on
+
+    async def empty_snapshot(pool, work, **kwargs):
+        if work.__name__ == "snapshot":
+            return []
+        return await real_run_on(pool, work, **kwargs)
+
+    monkeypatch.setattr(menu, "run_on", empty_snapshot)
+    await menu.publish_menu(pool, Cluster(regions=2), "r1", settings, apply)
+    assert apply.calls == []
+    assert (await local_state(region))[0] == 1
+    recorded = await hq.execute("SELECT menu_version FROM region_state WHERE region_id = 'r1'")
+    assert await recorded.fetchone() == (1,)
