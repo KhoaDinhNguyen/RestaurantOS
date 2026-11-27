@@ -704,7 +704,7 @@ def _add_control_extras(
     faults = FaultLayer(toxiproxy, groups)
     nodes = Nodes(cluster)
     add_control_routes(app, faults=faults, nodes=nodes, jobs=jobs)
-    add_sim_jobs(app, port=port)
+    add_sim_jobs(app, port=port, cluster=cluster)
     if scenario_engine is not None:
         from restaurantos.sim.control_jobs import add_job_routes
         from restaurantos.sim.scenarios import default_env

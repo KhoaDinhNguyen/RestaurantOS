@@ -1429,6 +1429,37 @@ async def test_restore_names_the_old_shapes_databases_it_leaves(world: World) ->
     result = await restore("snap", ctx, replace_cluster_file=True)
     left = next(w for w in result["warnings"] if "stopped and kept" in w)
     assert "r2-primary" in left and "r2-standby" in left and "r1-primary" not in left
+    # a changed shape also warns: the control process still holds the old one
+    warnings = list(result["warnings"]) + list(result["resume"]["warnings"])
+    restart = next(w for w in warnings if "restart rosctl control" in w)
+    assert "2 regions" in restart and "1 region" in restart
+
+
+async def test_restore_with_an_unchanged_shape_does_not_warn(world: World) -> None:
+    ctx, *_ = world
+    await save("snap", ctx)
+    result = await restore("snap", ctx)
+    warnings = list(result["warnings"]) + list(result["resume"]["warnings"])
+    assert not any("restart rosctl control" in w for w in warnings)
+
+
+async def test_restore_warns_from_the_running_shape_on_a_retry(world: World) -> None:
+    """The retry case: a --replace-cluster-file restore already wrote the
+    file, so it matches the snapshot - only the control process is stale."""
+    ctx, *_ = world
+    await save("snap", ctx)
+    result = await restore("snap", ctx, running_cluster=Cluster(regions=2))
+    warnings = list(result["warnings"]) + list(result["resume"]["warnings"])
+    restart = next(w for w in warnings if "restart rosctl control" in w)
+    assert "2 regions" in restart and "1 region" in restart
+
+
+async def test_restore_with_a_matching_running_shape_does_not_warn(world: World) -> None:
+    ctx, *_ = world
+    await save("snap", ctx)
+    result = await restore("snap", ctx, running_cluster=Cluster(regions=1))
+    warnings = list(result["warnings"]) + list(result["resume"]["warnings"])
+    assert not any("restart rosctl control" in w for w in warnings)
 
 
 async def test_restore_without_a_playback_host_says_how_to_resume(world: World) -> None:

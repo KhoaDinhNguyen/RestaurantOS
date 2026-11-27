@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from restaurantos.common.cluster import Cluster
 from restaurantos.sim.config import get_sim_settings, normalise_origin, parse_allowed_origins
 from restaurantos.sim.faults import FaultError, FaultExistsError, FaultLayer
 from restaurantos.sim.jobs import BusyError, JobRunner, UnknownJobError
@@ -224,7 +225,7 @@ class RestoreSnapshotBody(BaseModel):
     services: Literal["auto", "host", "containers", "none"] = "auto"
 
 
-def add_sim_jobs(app: FastAPI, *, port: int | None = None) -> None:
+def add_sim_jobs(app: FastAPI, *, port: int | None = None, cluster: Cluster | None = None) -> None:
     """Mount the check and snapshot job routes: `rosctl check` and
     `rosctl snapshot save|restore` as jobs on the runner that
     `add_control_routes` left on `app.state` (one job at a time;
@@ -232,7 +233,10 @@ def add_sim_jobs(app: FastAPI, *, port: int | None = None) -> None:
     The jobs run the same code the CLI commands run, against the
     checkout the control process was started from, and reach its own
     playback on `port`: the port it listens on (default
-    ROS_SIM_CONTROL_PORT)."""
+    ROS_SIM_CONTROL_PORT). `cluster` is the shape the control process
+    started with: restore's restart warning compares with it, not with
+    the file (which a --replace-cluster-file restore may already have
+    rewritten)."""
     import asyncio
     from pathlib import Path
 
@@ -335,6 +339,7 @@ def add_sim_jobs(app: FastAPI, *, port: int | None = None) -> None:
                 ctx,
                 replace_cluster_file=options.replace_cluster_file,
                 services=options.services,
+                running_cluster=cluster,
             )
 
         return _submit("restore", name, work)

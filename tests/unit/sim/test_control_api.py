@@ -595,8 +595,10 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
         seen["saved"] = name
         return {"name": name}
 
-    async def fake_restore(name, ctx, *, replace_cluster_file=False, services="auto"):
-        seen["restored"] = (name, replace_cluster_file, services)
+    async def fake_restore(
+        name, ctx, *, replace_cluster_file=False, services="auto", running_cluster=None
+    ):
+        seen["restored"] = (name, replace_cluster_file, services, running_cluster)
         return {"name": name}
 
     def fake_run_check(cluster, run_ids, **kwargs):
@@ -692,10 +694,10 @@ async def test_check_snapshot_and_restore_run_as_jobs(server, monkeypatch, tmp_p
         assert posted.status_code == 202 and posted.json()["kind"] == "restore"
         assert posted.json()["name"] == "day7"
         await done(posted.json()["job_id"])
-        assert seen["restored"] == ("day7", True, "none")
+        assert seen["restored"] == ("day7", True, "none", None)
         posted = await client.post("/sim/snapshots/day7/restore")
         await done(posted.json()["job_id"])
-        assert seen["restored"] == ("day7", False, "auto")  # no body: the defaults
+        assert seen["restored"] == ("day7", False, "auto", None)  # no body: the defaults
         # every job asked the control process's own port, never the default
         assert ports and set(ports) == {8099}
         assert _NoHost.bases and all(base.endswith(":8099") for base in _NoHost.bases)

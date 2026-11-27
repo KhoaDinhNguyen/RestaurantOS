@@ -825,6 +825,9 @@ class Session:
         self.next_steps: list[str] = []
         self.state: dict[str, Any] = {}  # what a script keeps between its phases
         self.check: dict[str, Any] | None = None
+        # kills still in flight: Nodes.kill runs docker compose kill in a
+        # thread, and a cancelled wait must not cancel the kill itself
+        self.pending_kills: dict[str, asyncio.Future] = {}
         self.playback: dict[str, Any] | None = None
         # what the script broke and has not repaired yet: cleaned up on error
         self.live_faults: list[str] = []
@@ -911,7 +914,11 @@ class Session:
         # recorded first: even a kill that raises leaves a node to start,
         # and starting a node that was never killed is harmless
         self.killed_nodes.append(node)
-        answer = await self.env.nodes.kill(node)
+        # shielded: cancelling the scenario (Ctrl-C) cancels only this
+        # wait, not the kill itself; start_nodes waits for it to land
+        task = asyncio.ensure_future(self.env.nodes.kill(node))
+        self.pending_kills[node] = task
+        answer = await asyncio.shield(task)
         if answer.get("running"):
             raise ScenarioError(f"{node} is still running after the kill")
 
@@ -921,6 +928,13 @@ class Session:
         try (T1b fails its own verdict on that list)."""
         failed: list[str] = []
         for node in list(self.killed_nodes):
+            # a kill the scenario stopped waiting for may still be landing;
+            # the start must not race it, and a node leaves killed_nodes
+            # only after its kill finished and the start answered running
+            pending = self.pending_kills.pop(node, None)
+            if pending is not None:
+                with contextlib.suppress(Exception):  # the kill's error is not ours here
+                    await pending
             answer = await self.env.nodes.start(node)
             if answer.get("running"):
                 self.killed_nodes.remove(node)

@@ -1486,8 +1486,16 @@ def _shape_of(cluster: Cluster | None) -> str:
 
 
 async def restore(
-    name: str, ctx: Context, *, replace_cluster_file: bool = False, services: str = "auto"
+    name: str,
+    ctx: Context,
+    *,
+    replace_cluster_file: bool = False,
+    services: str = "auto",
+    running_cluster: Cluster | None = None,
 ) -> dict[str, Any]:
+    """Bring the cluster back to `name`. `running_cluster` is the shape a
+    running control process holds (the job path passes it); without it the
+    terminal's shape comparison stays with the cluster file on disk."""
     if services not in SERVICE_MODES:
         raise SnapshotError(f"services must be one of {', '.join(SERVICE_MODES)}, not {services!r}")
     check_name(name)
@@ -1514,8 +1522,17 @@ async def restore(
     saved = _saved_proxies(name, snap)
     current_cluster = load_cluster(ctx.cluster_file) if current_toml is not None else None
     # the dataclasses, not the text: a comment-only difference changed
-    # nothing the control process cares about
-    shape_changed = current_cluster is None or snapshot_cluster != current_cluster
+    # nothing the control process cares about. With `running_cluster` (the
+    # job path: the shape a running control process holds) the comparison
+    # uses it, not the file: after a --replace-cluster-file restore wrote
+    # the file and then failed, the file already matches the snapshot, and
+    # only the control process still holds the old shape
+    if running_cluster is not None:
+        shape_changed = snapshot_cluster != running_cluster
+        old_shape = running_cluster
+    else:
+        shape_changed = current_cluster is None or snapshot_cluster != current_cluster
+        old_shape = current_cluster
     docker = ctx.docker
     assert docker is not None
 
@@ -1665,7 +1682,7 @@ async def restore(
         # the control process still holds the Cluster it started with;
         # scenarios and faults on it would target a shape that is gone
         warning = (
-            f"the cluster's shape changed ({_shape_of(current_cluster)} -> "
+            f"the cluster's shape changed ({_shape_of(old_shape)} -> "
             f"{_shape_of(snapshot_cluster)}); restart rosctl control before running "
             "scenarios or faults: it still has the old shape"
         )

@@ -715,6 +715,57 @@ async def test_a_kill_that_raises_still_leaves_a_node_to_start(world: World) -> 
     assert world.nodes.log == [("kill", "r1-primary"), ("start", "r1-primary")]
 
 
+async def test_a_cancelled_wait_does_not_cancel_the_kill(world: World) -> None:
+    """Ctrl-C during the kill: the wait stops, the kill keeps landing, and
+    cleanup waits for it before starting the node."""
+    world.probe.promote_at = 45.0
+    kill_entered = asyncio.Event()
+    release_kill = asyncio.Event()
+    kill_landed = asyncio.Event()
+    original_kill = world.nodes.kill
+    original_start = world.nodes.start
+    started: list[str] = []
+
+    async def blocking_kill(node: str) -> dict[str, Any]:
+        kill_entered.set()
+        await release_kill.wait()
+        answer = await original_kill(node)
+        kill_landed.set()
+        return answer
+
+    async def start_only_after_the_kill(node: str) -> dict[str, Any]:
+        assert kill_landed.is_set(), "the start ran before the kill landed"
+        started.append(node)
+        return await original_start(node)
+
+    world.nodes.kill = blocking_kill  # type: ignore[method-assign]
+    world.nodes.start = start_only_after_the_kill  # type: ignore[method-assign]
+    task = asyncio.create_task(run_scenario("T1b", None, world.env))
+    await asyncio.wait_for(kill_entered.wait(), timeout=5)
+    task.cancel()  # the scenario stops waiting; the kill keeps going
+    release_kill.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # cleanup awaited the landing kill, then started the node - once
+    assert started == ["r1-primary"]
+    assert world.nodes.log == [("kill", "r1-primary"), ("start", "r1-primary")]
+
+
+async def test_start_nodes_awaits_a_failed_kill_before_starting(world: World) -> None:
+    async def exploding_kill(node: str) -> dict[str, Any]:
+        raise RuntimeError("docker exploded")
+
+    world.nodes.kill = exploding_kill  # type: ignore[method-assign]
+    spec, params = parse_params("T1b", None, CLUSTER)
+    s = Session(world.env, spec, params, lambda text: None)
+    with pytest.raises(RuntimeError, match="docker exploded"):
+        await s.kill_node("r1-primary")
+    # the failed kill's task is awaited (its error suppressed) and the node starts
+    assert await s.start_nodes() == []
+    assert s.killed_nodes == []
+    assert world.nodes.log == [("start", "r1-primary")]
+
+
 async def test_a_tick_that_overshoots_ends_the_hold_without_sleeping(world: World) -> None:
     spec, params = parse_params("T2", {"fault_s": 30}, CLUSTER)
     s = Session(world.env, spec, params, lambda text: None)

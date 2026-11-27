@@ -944,7 +944,7 @@ Real crashes use `docker kill`. Scenarios T1 to T6 are scripts built from these.
 | `T1` | `cut` on `node:<the region's current primary>` | the standby is promoted, orders commit on it again, the checker passes | 30 |
 | `T1b` | `docker kill` of the current primary, started again at the heal | as T1 | 30 |
 | `T2` | `cut` on `link:<region><->hq` | no failover, the holding queue drains after the heal, the checker passes | 60 |
-| `T3` | T2, then kill -9 of `relay-<region>` and `hq-worker` `kill_after_s` (1) after the heal, both started again after `down_s` (5) | as T2, the relay's and HQ worker's backlogs are not empty right after both are killed (an idle-worker trial fails), and both come back | 60 |
+| `T3` | T2, then kill -9 of `relay-<region>` and `hq-worker` `kill_after_s` (1) after the heal, both started again after `down_s` (5) | as T2; both kills succeed, and right after them the relay's outbox and the HQ worker's holding queue together still hold work (either one may be empty, not both: an idle-worker trial fails); both come back | 60 |
 | `T4` | no fault; the run resends `duplicate_rate` (0.08) of its orders and shuffles delivery (`shuffle`, on) | the checker passes **strictly** (stored-but-unanswered orders fail it): one order per external id | 60 (load) |
 | `T5` | `latency` on `node:<the region's current primary>`, `latency_ms` (100) each way plus `jitter_ms` (0) | no failover, the primary is unchanged, the checker passes | 30 |
 | `T6` | `reset` on `link:<region><->hq` (`reset_timeout_ms`, 200: a connection lives that long), then a menu version is published through `POST /menu/products` | every sample of the region shows the old version or the whole new one, the region reaches the new one after the heal, the checker passes | 20 |
