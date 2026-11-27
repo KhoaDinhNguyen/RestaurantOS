@@ -961,6 +961,15 @@ Measured on a 1-region dev cluster: 1000 ms each way promotes the standby (the c
 - **On an error** the scenario heals the faults it created, starts what it killed, stops its run, writes the partial result (with `error`) and fails the job. It resets Toxiproxy only when no other fault is live: an operator's fault is not ours to wipe.
 - The database reads go straight to the nodes from the host (`host_conninfo`, never through Toxiproxy): a scenario has to read a region it has just cut off.
 
+**Quick runs.** A full scenario at the defaults takes about an hour on the dev cluster, because each order also sends four status events and all of them share the playback's in-flight slots. For iteration:
+
+- start the control process with `--event-sample-rate 0.2` (a fifth of the orders get their events);
+- run scenarios with `--speed 300`, so every scenario fits in one simulated day. The engine cannot keep 1000x anyway, so the lower speed costs no load.
+
+Use full events (`--event-sample-rate 1`, the default) for runs that go into the report: the kitchen working through a cut is part of what T2 and T3 show.
+
+Measured on the dev cluster, wall time per scenario at the quick settings versus the defaults: T2 with `--fault-s 60` 5 min versus 14, T3 5 versus 15, T5 5 versus 70. The pool and in-flight defaults (20 connections per node, 128 requests in flight) come from a three-configuration T4 benchmark: the winning run passed the strict checker with nothing failed or parked, and its connection peaks were 38 on the region's primary and 9 on HQ's against PostgreSQL's 100.
+
 ### 7.4 Snapshot and restore
 
 A snapshot is the state of the whole system at a point in simulated time:
