@@ -66,7 +66,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from restaurantos.common.cluster import HQ_PRIMARY, HQ_STANDBY, Cluster, host_conninfo
+from restaurantos.common.cluster import HQ_PRIMARY, HQ_STANDBY, Cluster, host_conninfo, load_cluster
 from restaurantos.common.simclock import SECONDS_PER_DAY
 from restaurantos.sim.toxiproxy import ToxiproxyError
 
@@ -570,6 +570,13 @@ class ScenarioEnv:
     publish_menu: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
     # why no scenario may run at all (the checker module missing), or None
     ready: Callable[[], str | None] = lambda: None
+    # the file the control process read its Cluster from: a restore with
+    # --replace-cluster-file may have changed it since, which refuses
+    cluster_file: Path | None = None
+    # what this control process actually sends: `rosctl control --region`
+    # pins one region, and --target edge bypasses the gateway entirely
+    engine_region: str | None = None
+    edge_target: bool = False
     runs_dir: Path = Path("runs")
     default_from_day: int = 0
     last_day: int | None = None
@@ -595,6 +602,8 @@ def default_env(
     default_speed: float,
     http_timeout_s: float = 10.0,
     runs_dir: Path = Path("runs"),
+    engine_region: str | None = None,
+    edge_target: bool = False,
 ) -> ScenarioEnv:
     """The control process's scenario environment: its own engine, fault
     layer and nodes, the real databases, the checker and the gateway at
@@ -643,11 +652,38 @@ def default_env(
         check=check,
         publish_menu=publish_menu,
         ready=ready,
+        cluster_file=cluster_file,
+        engine_region=engine_region,
+        edge_target=edge_target,
         runs_dir=runs_dir,
         default_from_day=default_from_day,
         last_day=last_day,
         default_speed=default_speed,
     )
+
+
+def engine_limits(env: ScenarioEnv, params: Params) -> None:
+    """Refuse what this control process cannot replay: a `--target edge`
+    host bypasses the gateway, and a `--region` host sends one region's
+    orders only. Called with the parsed parameters, at the POST and in
+    `run_scenario`."""
+    if env.edge_target:
+        raise ScenarioError(
+            "scenarios need the gateway target; start rosctl control without --target edge"
+        )
+    if env.engine_region is not None and env.engine_region != params.region_id:
+        raise ScenarioParamsError(
+            f"this control process only sends {env.engine_region}'s orders "
+            "(rosctl control --region); pick that region or restart without --region"
+        )
+
+
+# Toxiproxy without its proxies is not heal-all's problem to fix
+MISSING_PROXIES_FIX = (
+    "Toxiproxy lacks proxies; heal-all cannot recreate them - restart it so it "
+    f"reloads proxies.json (docker compose -p restaurantos -f {COMPOSE_FILE} "
+    "restart toxiproxy), or run rosctl bootstrap again"
+)
 
 
 async def refuse_reason(env: ScenarioEnv) -> tuple[int, str, str] | None:
@@ -678,11 +714,9 @@ async def refuse_reason(env: ScenarioEnv) -> tuple[int, str, str] | None:
     try:
         links = await env.faults.links()
     except ToxiproxyError as error:
-        return (
-            getattr(error, "status", 502),
-            "toxiproxy_error",
-            f"Toxiproxy cannot be read: {error}",
-        )
+        # like _toxiproxy_down in control_api: 502 whatever the failure
+        # (no connection included), never a refusal the client could fix
+        return (502, "toxiproxy_error", str(error))
     stray: dict[str, dict[str, list[Any]]] = {}
     for entry in links:
         kinds = {
@@ -696,12 +730,30 @@ async def refuse_reason(env: ScenarioEnv) -> tuple[int, str, str] | None:
             + ", ".join(f"{kind} {_plain(things)}" for kind, things in sorted(kinds.items()))
             for group, kinds in stray.items()
         )
-        return (
-            409,
-            "scenario_refused",
+        kinds_all = {kind for kinds in stray.values() for kind in kinds}
+        fixes = []
+        if kinds_all & {"disabled", "toxics"}:
+            fixes.append("clear it with rosctl fault heal-all")
+        if "missing" in kinds_all:
+            fixes.append(MISSING_PROXIES_FIX)
+        head = (
             f"Toxiproxy holds link state no live fault explains ({named}); "
-            "clear it with rosctl fault heal-all",
+            if kinds_all & {"disabled", "toxics"}
+            else ""
         )
+        return (409, "scenario_refused", head + "; ".join(fixes))
+    if env.cluster_file is not None:
+        try:
+            loaded = await asyncio.to_thread(load_cluster, env.cluster_file)
+        except (OSError, ValueError) as error:
+            return (409, "scenario_refused", f"cannot read {env.cluster_file}: {error}")
+        if loaded != env.cluster:
+            return (
+                409,
+                "scenario_refused",
+                "the cluster file changed since rosctl control started (a restore with "
+                "--replace-cluster-file?); restart rosctl control",
+            )
     return None
 
 
@@ -776,6 +828,10 @@ class Session:
         self.playback: dict[str, Any] | None = None
         # what the script broke and has not repaired yet: cleaned up on error
         self.live_faults: list[str] = []
+        # a heal that failed during act: the fault id is gone (the layer
+        # forgets it even on a half-failed heal), so cleanup cannot retry
+        # it and goes straight to the last resort
+        self.heal_failed = False
         self.killed_nodes: list[str] = []
         self.killed_services: dict[str, str] = {}  # name -> mode
         self.watchers: list[asyncio.Task] = []
@@ -809,19 +865,27 @@ class Session:
         while True:
             left = end - env.monotonic()
             self.progress(f"{label}: {max(left, 0):.0f} s left")
+            if left <= 0:
+                # a fault held for 0 s is still held under load or not at all
+                self._require_live(label, under_load)
+                return
             if tick is not None:
                 # a probe read must not hold the fault past its deadline:
                 # the read may still finish in its thread, the hold does not wait
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(tick(), timeout=max(min(left, 2.0), 0.1))
-            if under_load and env.playback.state not in LIVE_STATES:
-                raise ScenarioError(
-                    f"the run ended ({env.playback.state}) during '{label}'; "
-                    "its window is too short - pick a lower speed"
-                )
+            self._require_live(label, under_load)
+            left = end - env.monotonic()
             if left <= 0:
-                return
+                return  # a tick that ran past the deadline ends the hold here
             await env.sleep(min(env.tick_s, left))
+
+    def _require_live(self, label: str, under_load: bool) -> None:
+        if under_load and self.env.playback.state not in LIVE_STATES:
+            raise ScenarioError(
+                f"the run ended ({self.env.playback.state}) during '{label}'; "
+                "its window is too short - pick a lower speed"
+            )
 
     def watch(self, coro: Awaitable[None]) -> None:
         """A measurement that runs beside the rest of the script."""
@@ -834,22 +898,33 @@ class Session:
 
     async def heal_faults(self) -> None:
         while self.live_faults:
-            await self.env.faults.heal(self.live_faults.pop())
+            fault_id = self.live_faults.pop()
+            try:
+                await self.env.faults.heal(fault_id)
+            except BaseException:
+                # the layer has already forgotten the fault, so a retry
+                # would not find it; remember the failure for cleanup
+                self.heal_failed = True
+                raise
 
     async def kill_node(self, node: str) -> None:
-        answer = await self.env.nodes.kill(node)
+        # recorded first: even a kill that raises leaves a node to start,
+        # and starting a node that was never killed is harmless
         self.killed_nodes.append(node)
+        answer = await self.env.nodes.kill(node)
         if answer.get("running"):
             raise ScenarioError(f"{node} is still running after the kill")
 
     async def start_nodes(self) -> list[str]:
-        """Start the killed nodes again; returns the ones that did not
-        come back (T1b fails its own verdict on that list)."""
+        """Start the killed nodes again, one pass over the list; returns
+        the ones that did not come back, which stay recorded for the next
+        try (T1b fails its own verdict on that list)."""
         failed: list[str] = []
-        while self.killed_nodes:
-            node = self.killed_nodes.pop()
+        for node in list(self.killed_nodes):
             answer = await self.env.nodes.start(node)
-            if not answer.get("running"):
+            if answer.get("running"):
+                self.killed_nodes.remove(node)
+            else:
                 self.warnings.append(f"{node} did not start again")
                 failed.append(node)
         return failed
@@ -963,18 +1038,27 @@ class Session:
         """Repair what the script broke, after an error."""
         for task in self.watchers:
             task.cancel()
+        heal_failed = self.heal_failed
         try:
             await self.heal_faults()
         except Exception as error:  # noqa: BLE001 - a last resort exists for this one
-            # the preflight refused every other live fault, so everything
-            # Toxiproxy still holds here is this scenario's own
+            heal_failed = True
             self.warnings.append(f"could not heal the scenario's faults: {error}")
+        if heal_failed:
+            # the last resort resets Toxiproxy only when the scenario is
+            # alone: another live fault is not ours to wipe
             try:
-                await self.env.faults.heal_all()
+                healed = await self.env.faults.heal_all_if_alone()
             except Exception as heal_error:  # noqa: BLE001
                 self.warnings.append(f"heal-all also failed: {heal_error}")
             else:
-                self.warnings.append("rosctl fault heal-all ran as a last resort")
+                if healed is None:
+                    self.warnings.append(
+                        "other faults are live, so Toxiproxy was not reset; check rosctl "
+                        "links and run rosctl fault heal-all when they are done"
+                    )
+                else:
+                    self.warnings.append("rosctl fault heal-all ran as a last resort")
         steps = (
             ("start the killed nodes", self.start_nodes),
             ("start the killed services", self._restart_services),
@@ -1201,11 +1285,9 @@ class Partition(Script):
                     return
             await s.env.sleep(1.0)
 
-    async def _kill_workers(self, s: Session) -> None:
-        names = (f"relay-{s.params.region_id}", "hq-worker")
-        await s.env.sleep(s.params.kill_after_s)
-        # was there work to interrupt? A T3 that kills an idle pair proves
-        # nothing about the drain; both numbers go into the result
+    async def _read_backlogs(self, s: Session) -> dict[str, int | None]:
+        """The region's two backlogs: HQ's holding queue for it and the
+        outbox on its current primary (the relay's own queue)."""
         holding: int | None = None
         outbox: int | None = None
         with contextlib.suppress(Exception):
@@ -1213,13 +1295,23 @@ class Partition(Script):
         with contextlib.suppress(Exception):
             view = await s.db(s.env.probe.region, s.params.region_id)
             outbox = await s.db(s.env.probe.outbox_left, view["primary"])
-        s.measurements["pending_at_kill"] = {"holding_queue": holding, "outbox": outbox}
+        return {"holding_queue": holding, "outbox": outbox}
+
+    async def _kill_workers(self, s: Session) -> None:
+        names = (f"relay-{s.params.region_id}", "hq-worker")
+        await s.env.sleep(s.params.kill_after_s)
+        # the backlogs before the kill, and again after both kills
+        # returned: only hq-worker drains the holding queue and only the
+        # relay ships the outbox, so with both dead nothing drains, and a
+        # non-empty reading after the kill is real interrupted work
+        s.measurements["pending_before_kill"] = await self._read_backlogs(s)
         kills = []
         for name in names:
             answer = await s.env.services.kill(name)
             kills.append(answer)
             s.killed_services[name] = answer["mode"]
         s.mark("workers_killed_at")
+        s.measurements["pending_at_kill"] = await self._read_backlogs(s)
         await s.hold(s.params.down_s, "relay and HQ worker down", under_load=False)
         starts = []
         for name in names:
@@ -1235,10 +1327,14 @@ class Partition(Script):
         s.mark("workers_started_at")
         s.measurements["workers"] = {"killed": kills, "started": starts}
         pending = s.measurements["pending_at_kill"]
+        before = s.measurements["pending_before_kill"]
         s.condition(
             "work was pending when the workers were killed",
-            (pending["holding_queue"] or 0) + (pending["outbox"] or 0) > 0,
-            f"holding_queue {pending['holding_queue']}, outbox {pending['outbox']}",
+            all(item["ok"] for item in kills)
+            and (pending["holding_queue"] or 0) + (pending["outbox"] or 0) > 0,
+            f"after the kill: holding_queue {pending['holding_queue']}, "
+            f"outbox {pending['outbox']} (before: holding_queue "
+            f"{before['holding_queue']}, outbox {before['outbox']})",
         )
         s.condition(
             "relay and HQ worker killed and started again",
@@ -1428,6 +1524,7 @@ async def run_scenario(
     an error later repairs what the script broke, writes the partial
     result and raises."""
     spec, params = parse_params(name, body, env.cluster)
+    engine_limits(env, params)
     reason = await refuse_reason(env)
     if reason is not None:
         status, code, message = reason
@@ -1443,8 +1540,8 @@ async def run_scenario(
         # the mark and the recheck sit at the injection moment: a failover
         # during the warm-up would break the wrong node, and an event from
         # before it would then count as this run's
-        await script.recheck(s)
         s.state["event_mark"] = await s.db(s.env.probe.last_event_id)
+        await script.recheck(s)
         await script.act(s)
         await s.hold(params.settle_s, "settling after the heal", under_load=False)
         await s.finish_run()

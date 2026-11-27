@@ -20,6 +20,7 @@ from restaurantos.sim.scenarios import (
     ScenarioEnv,
     ScenarioError,
     ScenarioParamsError,
+    Session,
     UnknownScenarioError,
     describe,
     format_result,
@@ -28,6 +29,7 @@ from restaurantos.sim.scenarios import (
     refuse_reason,
     run_scenario,
 )
+from restaurantos.sim.toxiproxy import ToxiproxyError
 
 CLUSTER = Cluster(regions=2)
 DAY = 86_400
@@ -132,6 +134,7 @@ class FakeFaults:
         self.log: list[tuple[str, ...]] = []
         self.links_answer: list[dict[str, Any]] = []
         self.heal_all_calls = 0
+        self.heal_alone_calls = 0
 
     def faults(self) -> list[FakeFault]:
         return list(self.live.values())
@@ -151,6 +154,15 @@ class FakeFaults:
 
     async def heal_all(self) -> int:
         self.heal_all_calls += 1
+        healed = len(self.live)
+        self.live.clear()
+        return healed
+
+    async def heal_all_if_alone(self) -> int | None:
+        # like the real layer: None changes nothing when a fault is live
+        self.heal_alone_calls += 1
+        if self.live:
+            return None
         healed = len(self.live)
         self.live.clear()
         return healed
@@ -401,6 +413,89 @@ async def test_refused_while_the_checker_is_missing(world: World) -> None:
     assert reason is not None and reason[:2] == (501, "not_built")
 
 
+async def test_a_toxiproxy_failure_answers_502(world: World) -> None:
+    async def unreachable() -> list[dict[str, Any]]:
+        raise ToxiproxyError("down")
+
+    world.faults.links = unreachable  # type: ignore[method-assign]
+    reason = await refuse_reason(world.env)
+    assert reason == (502, "toxiproxy_error", "down")
+
+
+async def test_missing_proxies_ask_for_a_toxiproxy_restart(world: World) -> None:
+    world.faults.links_answer = [
+        {
+            "group": "link:r1<->hq",
+            "unexplained": {"disabled": [], "toxics": [], "missing": ["gateway__r1-primary"]},
+        }
+    ]
+    reason = await refuse_reason(world.env)
+    assert reason is not None and reason[:2] == (409, "scenario_refused")
+    assert "lacks proxies" in reason[2] and "restart toxiproxy" in reason[2]
+    assert "heal-all cannot recreate" in reason[2]
+
+
+async def test_missing_and_held_state_name_both_fixes(world: World) -> None:
+    world.faults.links_answer = [
+        {
+            "group": "link:r1<->hq",
+            "unexplained": {
+                "disabled": ["gateway__r1-primary"],
+                "toxics": [],
+                "missing": ["coordinator__r1-primary"],
+            },
+        }
+    ]
+    reason = await refuse_reason(world.env)
+    assert reason is not None
+    assert "clear it with rosctl fault heal-all" in reason[2]
+    assert "restart toxiproxy" in reason[2]
+
+
+async def test_a_changed_cluster_file_refuses_naming_the_restart(
+    world: World, tmp_path: Path
+) -> None:
+    cluster_file = tmp_path / "cluster.toml"
+    cluster_file.write_text("[cluster]\nregions = 1\n", encoding="utf-8")
+    world.env.cluster_file = cluster_file
+    reason = await refuse_reason(world.env)
+    assert reason is not None and reason[:2] == (409, "scenario_refused")
+    assert "restart rosctl control" in reason[2]
+
+
+async def test_an_unchanged_cluster_file_does_not_refuse(world: World, tmp_path: Path) -> None:
+    cluster_file = tmp_path / "cluster.toml"
+    cluster_file.write_text("[cluster]\nregions = 2\nstandbys = true\n", encoding="utf-8")
+    world.env.cluster_file = cluster_file
+    assert await refuse_reason(world.env) is None
+
+
+async def test_an_unreadable_cluster_file_refuses(world: World, tmp_path: Path) -> None:
+    cluster_file = tmp_path / "cluster.toml"
+    cluster_file.write_text("regions = {{{\n", encoding="utf-8")
+    world.env.cluster_file = cluster_file
+    reason = await refuse_reason(world.env)
+    assert reason is not None and reason[:2] == (409, "scenario_refused")
+    assert "cannot read" in reason[2]
+
+
+async def test_an_edge_target_host_refuses_every_scenario(world: World) -> None:
+    world.env.edge_target = True
+    with pytest.raises(ScenarioError, match="gateway target"):
+        await run_scenario("T2", None, world.env)
+    assert world.playback.started is None
+
+
+async def test_a_single_region_host_refuses_another_region(world: World) -> None:
+    world.env.engine_region = "r2"
+    with pytest.raises(ScenarioParamsError, match="only sends r2"):
+        await run_scenario("T2", None, world.env)  # defaults to region r1
+    assert world.playback.started is None
+    # the pinned region itself is fine
+    result = await run_scenario("T2", {"region_id": "r2", "fault_s": 5}, world.env)
+    assert result["passed"] is True
+
+
 async def test_t1_refused_without_a_streaming_standby(world: World) -> None:
     world.probe.streaming_count = 0
     with pytest.raises(ScenarioError, match="rejoin"):
@@ -564,6 +659,81 @@ async def test_t3_with_nothing_pending_fails_saying_why(world: World) -> None:
     assert "work was pending when the workers were killed" in failed
 
 
+async def test_t3_reads_the_backlogs_after_the_kill(world: World) -> None:
+    world.probe.holding = 3
+    original = world.services.kill
+
+    async def drain_on_kill(name: str) -> dict[str, Any]:
+        # the queue empties between the pre-kill reading and the kill
+        answer = await original(name)
+        world.probe.holding = 0
+        world.probe.outbox = 0
+        return answer
+
+    world.services.kill = drain_on_kill  # type: ignore[method-assign]
+    result = await run_scenario("T3", {"region_id": "r2", "fault_s": 10}, world.env)
+    assert result["passed"] is False
+    assert result["measurements"]["pending_before_kill"]["holding_queue"] == 3
+    assert result["measurements"]["pending_at_kill"] == {"holding_queue": 0, "outbox": 0}
+    condition = next(
+        item
+        for item in result["conditions"]
+        if item["name"] == "work was pending when the workers were killed"
+    )
+    assert "(before: holding_queue 3, outbox 0)" in condition["detail"]
+
+
+async def test_a_failed_start_is_retried_on_the_next_call(world: World) -> None:
+    world.nodes.fail_start = True
+    spec, params = parse_params("T1b", None, CLUSTER)
+    s = Session(world.env, spec, params, lambda text: None)
+    s.killed_nodes = ["r1-primary"]
+    failed = await s.start_nodes()
+    assert failed == ["r1-primary"] and s.killed_nodes == ["r1-primary"]
+    assert world.nodes.log.count(("start", "r1-primary")) == 1
+    # the recorded failure is retried once per call
+    assert await s.start_nodes() == ["r1-primary"]
+    assert world.nodes.log.count(("start", "r1-primary")) == 2
+    # a healthy start clears the record
+    world.nodes.fail_start = False
+    assert await s.start_nodes() == []
+    assert s.killed_nodes == []
+
+
+async def test_a_kill_that_raises_still_leaves_a_node_to_start(world: World) -> None:
+    world.probe.promote_at = 45.0
+    original = world.nodes.kill
+
+    async def kill_and_raise(node: str) -> dict[str, Any]:
+        await original(node)
+        raise RuntimeError("docker exploded")
+
+    world.nodes.kill = kill_and_raise  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="docker exploded"):
+        await run_scenario("T1b", None, world.env)
+    # cleanup started the node the failed kill had already recorded
+    assert world.nodes.log == [("kill", "r1-primary"), ("start", "r1-primary")]
+
+
+async def test_a_tick_that_overshoots_ends_the_hold_without_sleeping(world: World) -> None:
+    spec, params = parse_params("T2", {"fault_s": 30}, CLUSTER)
+    s = Session(world.env, spec, params, lambda text: None)
+    slept: list[float] = []
+    original = world.env.sleep
+
+    async def counting_sleep(seconds: float) -> None:
+        slept.append(seconds)
+        await original(seconds)
+
+    world.env.sleep = counting_sleep  # type: ignore[method-assign]
+
+    async def overshoot() -> None:
+        world.clock.t += 100  # well past the 30 s deadline
+
+    await s.hold(30, "the fault", overshoot, under_load=False)
+    assert slept == []  # the hold returned on the recomputed deadline
+
+
 async def test_a_failed_service_restart_warns_and_keeps_the_condition(world: World) -> None:
     world.probe.holding = 3
     world.services.fail_start = {"relay-r2"}
@@ -677,18 +847,52 @@ async def test_cleanup_never_stops_someone_elses_run(world: World) -> None:
     assert world.playback.stopped is False  # run B was left alone
 
 
-async def test_a_failed_heal_runs_heal_all_once(world: World) -> None:
+async def test_a_failed_heal_falls_back_to_heal_all_if_alone(world: World) -> None:
     async def boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
         raise RuntimeError("the gateway is down")
 
     async def unhealable(fault_id: str) -> None:
+        # the real layer forgets the fault even when its heal fails
+        world.faults.live.pop(fault_id, None)
         raise RuntimeError("toxiproxy is gone")
 
     world.env.publish_menu = boom
     world.faults.heal = unhealable  # type: ignore[method-assign]
     with pytest.raises(RuntimeError, match="the gateway is down"):
         await run_scenario("T6", None, world.env)
-    assert world.faults.heal_all_calls == 1
+    assert world.faults.heal_alone_calls == 1 and world.faults.heal_all_calls == 0
+    written = json.loads(next(world.env.runs_dir.glob(f"*/{RESULT_FILE}")).read_text())
+    assert any("heal-all ran as a last resort" in item for item in written["warnings"])
+
+
+async def test_a_failed_heal_leaves_another_fault_alone(world: World) -> None:
+    async def boom(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise RuntimeError("the gateway is down")
+
+    async def unhealable(fault_id: str) -> None:
+        # this layer did NOT forget the fault: someone else's stays live
+        raise RuntimeError("toxiproxy is gone")
+
+    world.env.publish_menu = boom
+    world.faults.heal = unhealable  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="the gateway is down"):
+        await run_scenario("T6", None, world.env)
+    assert world.faults.heal_alone_calls == 1 and world.faults.heal_all_calls == 0
+    written = json.loads(next(world.env.runs_dir.glob(f"*/{RESULT_FILE}")).read_text())
+    assert any("other faults are live" in item for item in written["warnings"])
+
+
+async def test_a_heal_that_failed_in_act_still_falls_back(world: World) -> None:
+    # the fault id is gone once its heal failed mid-act, so cleanup cannot
+    # retry it; the flag from the act failure must reach the fallback
+    async def unhealable(fault_id: str) -> None:
+        world.faults.live.pop(fault_id, None)
+        raise RuntimeError("toxiproxy is gone")
+
+    world.faults.heal = unhealable  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="toxiproxy is gone"):
+        await run_scenario("T2", {"fault_s": 5}, world.env)
+    assert world.faults.heal_alone_calls == 1
     written = json.loads(next(world.env.runs_dir.glob(f"*/{RESULT_FILE}")).read_text())
     assert any("heal-all ran as a last resort" in item for item in written["warnings"])
 

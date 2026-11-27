@@ -427,6 +427,10 @@ async def _run_start(
                     "default_speed": sim.playback_speed,
                     "http_timeout_s": sim.http_timeout_s,
                     "port": args.port or sim.control_port,
+                    # what this host actually sends: scenarios must not
+                    # run against an engine that filters or bypasses
+                    "engine_region": region,
+                    "edge_target": args.target == "edge",
                 },
             )
         except (OSError, ValueError) as error:

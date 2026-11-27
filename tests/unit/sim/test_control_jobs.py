@@ -4,6 +4,8 @@ world of test_scenarios. The snapshot, restore and check routes are
 
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -78,6 +80,57 @@ async def test_refused_with_501_while_the_checker_is_missing(setup) -> None:
     world.env.ready = lambda: "the checker is not on this branch (sim/checker.py, PR #33)"
     answer = await client.post("/sim/scenarios/T2")
     assert answer.status_code == 501 and answer.json()["error"] == "not_built"
+
+
+async def test_t1_without_a_streaming_standby_refuses_at_the_post(setup) -> None:
+    world, _jobs, client = setup
+    world.probe.streaming_count = 0
+    answer = await client.post("/sim/scenarios/T1")
+    assert answer.status_code == 409 and answer.json()["error"] == "scenario_refused"
+    assert "rejoin" in answer.json()["message"]
+    # nothing was accepted: no run and no job
+    assert world.playback.started is None
+
+
+async def test_a_probe_that_cannot_read_still_accepts_the_scenario(setup) -> None:
+    world, jobs, client = setup
+    original = world.probe.region
+    calls = {"count": 0}
+
+    def flaky(region_id: str) -> dict[str, Any]:
+        calls["count"] += 1
+        if calls["count"] == 1:  # only the POST's pre-start check fails
+            raise RuntimeError("the databases are busy")
+        return original(region_id)
+
+    world.probe.region = flaky  # type: ignore[method-assign]
+    answer = await client.post("/sim/scenarios/T5", json={"fault_s": 5})
+    assert answer.status_code == 202
+    done = await jobs.wait(answer.json()["job_id"])
+    assert done.state == "done", done.error
+    assert done.result["passed"] is True
+
+
+async def test_a_changed_cluster_file_refuses_naming_the_restart(setup, tmp_path) -> None:
+    world, _jobs, client = setup
+    cluster_file = tmp_path / "cluster.toml"
+    cluster_file.write_text("[cluster]\nregions = 1\n", encoding="utf-8")
+    world.env.cluster_file = cluster_file
+    answer = await client.post("/sim/scenarios/T2")
+    assert answer.status_code == 409 and answer.json()["error"] == "scenario_refused"
+    assert "restart rosctl control" in answer.json()["message"]
+    assert world.playback.started is None
+
+
+async def test_an_unchanged_cluster_file_does_not_refuse(setup, tmp_path) -> None:
+    world, jobs, client = setup
+    cluster_file = tmp_path / "cluster.toml"
+    cluster_file.write_text("[cluster]\nregions = 2\nstandbys = true\n", encoding="utf-8")
+    world.env.cluster_file = cluster_file
+    answer = await client.post("/sim/scenarios/T2", json={"fault_s": 5})
+    assert answer.status_code == 202
+    done = await jobs.wait(answer.json()["job_id"])
+    assert done.state == "done" and done.result["passed"] is True
 
 
 async def test_one_job_at_a_time(setup) -> None:
