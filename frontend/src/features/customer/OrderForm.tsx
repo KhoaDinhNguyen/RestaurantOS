@@ -56,7 +56,8 @@ export function OrderForm({
       [productId]: { name, quantity },
     }));
   // An item typed by product id, for when the menu cannot be loaded (the
-  // gateway cannot reach the region): the order is then parked, not lost.
+  // gateway cannot reach the region): if the region is still cut off when it
+  // is sent, the order is parked (202), not lost; if it is back, stored (201).
   const [typed, setTyped] = useState({ productId: "", quantity: "" });
   const [sent, setSent] = useState<OrderRequest | null>(null);
   const [answer, setAnswer] = useState<ApiResult<OrderResponse> | null>(null);
