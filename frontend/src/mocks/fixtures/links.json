@@ -1,0 +1,43 @@
+[
+  {
+    "group": "link:r1<->hq",
+    "proxies": ["gateway__r1-primary", "gateway__r1-standby"],
+    "faults": [],
+    "preexisting_disabled": [],
+    "unexplained": { "disabled": [], "toxics": [], "missing": [] }
+  },
+  {
+    "group": "link:r2<->hq",
+    "proxies": ["gateway__r2-primary", "gateway__r2-standby"],
+    "faults": [
+      {
+        "fault_id": "f1",
+        "target": "link:r2<->hq",
+        "fault": "cut",
+        "params": {},
+        "proxies": ["gateway__r2-primary", "gateway__r2-standby"],
+        "created_at": "2026-11-23T09:59:40Z"
+      }
+    ],
+    "preexisting_disabled": [],
+    "unexplained": { "disabled": [], "toxics": [], "missing": [] }
+  },
+  {
+    "group": "node:r1-primary",
+    "proxies": ["gateway__r1-primary", "relay-r1__r1-primary"],
+    "faults": [],
+    "preexisting_disabled": [],
+    "unexplained": {
+      "disabled": [],
+      "toxics": [
+        {
+          "proxy": "relay-r1__r1-primary",
+          "name": "f9-latency-up",
+          "type": "latency",
+          "stream": "upstream"
+        }
+      ],
+      "missing": []
+    }
+  }
+]

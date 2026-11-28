@@ -1,0 +1,30 @@
+[
+  {
+    "dish_id": "0a1b2c3d4e5f",
+    "dish_name": "mock noodle soup",
+    "example_name": "Mock Noodle Soup",
+    "scope": "global",
+    "n_vendors": 2
+  },
+  {
+    "dish_id": "1c2d3e4f5a6b",
+    "dish_name": "mock chicken rice",
+    "example_name": "Mock Chicken Rice",
+    "scope": "global",
+    "n_vendors": 1
+  },
+  {
+    "dish_id": "2d3e4f5a6b7c",
+    "dish_name": "mock chicken rice",
+    "example_name": "Chain Chicken Rice",
+    "scope": "chain:c0042",
+    "n_vendors": 1
+  },
+  {
+    "dish_id": "0003e4f5a6b7",
+    "dish_name": null,
+    "example_name": "Mock Mango Pudding",
+    "scope": "global",
+    "n_vendors": 1
+  }
+]
