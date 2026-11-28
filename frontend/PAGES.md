@@ -67,7 +67,7 @@ Switching a product on can still answer "unavailable (stock)" when there is not 
 2. Under **Restaurants in my cell**, press **Search** (the button names the cell), optionally with a cuisine or product name. Only that one cell is searched, not its neighbours.
 3. Press **Open menu** on a restaurant. Its button then reads "selected".
 4. In **Menu of ...**, enter quantities and press **Place order**. The order carries the simulated day and time. The button stays greyed out until at least one quantity is filled in and there is a simulated day (before the first run, pick one in the header). The menu refreshes every 5 seconds.
-   - When the menu cannot be loaded (an amber `503`: the gateway cannot reach the region), a **product id** and **quantity** box appear instead. An order typed there is parked (`202`) and delivered once the region is back.
+   - When the menu cannot be loaded (an amber `503`: the gateway cannot reach the region), a **product id** and **quantity** box appear instead. An order typed there is parked (`202`) and delivered once the region is back. If the menu stops loading after you typed quantities, those lines stay on screen under **Already in this order** and can still be changed: what is sent is exactly what is shown.
 5. **My order** appears once the order has an id, and follows its status every 2 seconds.
 
 Every order goes through the gateway. The possible answers:

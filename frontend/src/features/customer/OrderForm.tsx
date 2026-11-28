@@ -45,7 +45,16 @@ export function OrderForm({
     () => getMenu(gatewayApi, vendorId),
     5000,
   );
-  const [quantities, setQuantities] = useState<Record<string, string>>({});
+  // The quantity typed per product, with the product's name, so the line can
+  // still be shown (and changed) if the menu stops loading mid-draft.
+  const [quantities, setQuantities] = useState<
+    Record<string, { name: string; quantity: string }>
+  >({});
+  const setQuantity = (productId: string, name: string, quantity: string) =>
+    setQuantities((current) => ({
+      ...current,
+      [productId]: { name, quantity },
+    }));
   // An item typed by product id, for when the menu cannot be loaded (the
   // gateway cannot reach the region): the order is then parked, not lost.
   const [typed, setTyped] = useState({ productId: "", quantity: "" });
@@ -64,16 +73,26 @@ export function OrderForm({
       onPlaced({ vendorId, orderId: body.order_id, day: body.order_day });
   };
 
-  // The lines of the order: every filled-in quantity, plus the typed item.
-  // An order needs at least one (POST /orders refuses an empty one).
+  // The lines of the order are exactly the rows on screen: the menu's rows,
+  // or, while the menu cannot be loaded, the quantities already typed plus
+  // the typed item. An order needs at least one (POST /orders refuses an
+  // empty one).
   const wanted = (q: string) => /^\d+$/.test(q) && Number(q) > 0;
-  /** The typed item's row is shown, and counts, only while there is no menu. */
-  const menuMissing = menu.result !== null && menu.result.data === null;
+  const menuRows = menu.result?.data ?? null;
+  const menuMissing = menu.result !== null && menuRows === null;
+  const shownIds = menuRows
+    ? menuRows.map((m) => m.product_id)
+    : menuMissing
+      ? Object.keys(quantities)
+      : [];
   const typedId = menuMissing ? typed.productId.trim() : "";
   const items = [
-    ...Object.entries(quantities)
-      .filter(([, q]) => wanted(q))
-      .map(([product_id, q]) => ({ product_id, quantity: Number(q) })),
+    ...shownIds
+      .filter((id) => wanted(quantities[id]?.quantity ?? ""))
+      .map((id) => ({
+        product_id: id,
+        quantity: Number(quantities[id].quantity),
+      })),
     ...(typedId && wanted(typed.quantity)
       ? [{ product_id: typedId, quantity: Number(typed.quantity) }]
       : []),
@@ -136,12 +155,44 @@ export function OrderForm({
                     className={`${inputClass} w-16`}
                     inputMode="numeric"
                     disabled={sent !== null}
-                    value={quantities[m.product_id] ?? ""}
+                    value={quantities[m.product_id]?.quantity ?? ""}
                     onChange={(e) =>
-                      setQuantities({
-                        ...quantities,
-                        [m.product_id]: e.target.value,
-                      })
+                      setQuantity(m.product_id, m.name, e.target.value)
+                    }
+                  />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+      {menuMissing && shownIds.length > 0 && (
+        <table className={tableClass}>
+          <caption className="text-left text-xs text-slate-600">
+            Already in this order
+          </caption>
+          <thead>
+            <tr>
+              <th className={thClass}>product</th>
+              <th className={thClass}>quantity</th>
+            </tr>
+          </thead>
+          <tbody>
+            {shownIds.map((id) => (
+              <tr key={id}>
+                <td className={tdClass}>
+                  {quantities[id].name}{" "}
+                  <span className="font-mono text-xs text-slate-400">{id}</span>
+                </td>
+                <td className={tdClass}>
+                  <input
+                    aria-label={`quantity of ${quantities[id].name}`}
+                    className={`${inputClass} w-16`}
+                    inputMode="numeric"
+                    disabled={sent !== null}
+                    value={quantities[id].quantity}
+                    onChange={(e) =>
+                      setQuantity(id, quantities[id].name, e.target.value)
                     }
                   />
                 </td>

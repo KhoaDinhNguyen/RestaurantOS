@@ -48,6 +48,10 @@ export function usePolling<T>(
       loaded.current.tick === tick
     )
       return;
+    // A new load is asked for: the last finished one no longer stands for
+    // what is shown. Without this, going A, then B, then back to A before B
+    // answers would find "A loaded" and skip the load.
+    loaded.current = null;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const run = async () => {
